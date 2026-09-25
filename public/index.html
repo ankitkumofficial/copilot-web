@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>Copilot Web</title>
+    <link
+      id="app-favicon"
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='9' fill='%23e5b75c'/%3E%3Ccircle cx='16' cy='16' r='14' fill='none' stroke='%23e5b75c' stroke-opacity='.2' stroke-width='3'/%3E%3C/svg%3E"
+    >
+    <script>
+      (() => {
+        let preference = "system";
+        try {
+          const stored = localStorage.getItem("copilot-web-theme");
+          if (stored === "light" || stored === "dark") {
+            preference = stored;
+          }
+        } catch {
+          preference = "system";
+        }
+        try {
+          if (localStorage.getItem("copilot-web-sidebar-collapsed") === "true") {
+            document.documentElement.dataset.sidebarCollapsed = "true";
+          }
+        } catch {
+          document.documentElement.dataset.sidebarCollapsed = "false";
+        }
+        const theme = preference === "system"
+          ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+          : preference;
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.dataset.themePreference = preference;
+      })();
+    </script>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-copy">
+            <div id="brand-mark" class="brand-mark">C</div>
+            <div>
+              <strong id="brand-name">Copilot Web</strong>
+              <span>Local CLI interface</span>
+            </div>
+          </div>
+          <div class="brand-actions">
+            <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Theme: System">◐</button>
+            <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="Collapse sidebar" aria-expanded="true">‹</button>
+          </div>
+        </div>
+
+        <button id="new-chat" class="new-chat" type="button">
+          <span class="new-chat-icon" aria-hidden="true">+</span>
+          <span class="new-chat-label">New conversation</span>
+        </button>
+
+        <label class="search-label" for="session-search">Conversation history</label>
+        <input id="session-search" class="session-search" type="search" placeholder="Filter conversations">
+        <div id="session-list" class="session-list" aria-live="polite"></div>
+        <div class="sidebar-footer">
+          <span id="connection-status" class="status-dot status-connecting"></span>
+          <span id="connection-label">Connecting...</span>
+        </div>
+      </aside>
+
+      <main class="conversation">
+        <section id="messages" class="messages" aria-live="polite">
+          <div id="empty-state" class="empty-state">
+            <div class="empty-icon">✦</div>
+            <h2>How can I help?</h2>
+            <p>Start a new local Copilot conversation or select one from the history.</p>
+          </div>
+        </section>
+
+        <form id="composer" class="composer">
+          <textarea id="prompt-input" rows="1" placeholder="Message Copilot..." aria-label="Message Copilot"></textarea>
+          <div id="attachment-list" class="attachment-list" aria-live="polite"></div>
+          <div id="drop-hint" class="drop-hint" hidden>Drop images or PDF files here</div>
+          <div class="composer-footer">
+            <span id="composer-hint" class="visually-hidden" aria-live="polite"></span>
+            <div class="composer-settings" aria-label="Model settings">
+              <label class="setting-control composer-setting">
+                <span>Model</span>
+                <select id="model-select" disabled>
+                  <option value="">Start a conversation</option>
+                </select>
+              </label>
+              <label class="setting-control composer-setting">
+                <span>Context</span>
+                <select id="context-select">
+                  <option value="default">Default</option>
+                  <option value="long_context">Long context</option>
+                </select>
+              </label>
+              <label class="setting-control composer-setting">
+                <span>Reasoning</span>
+                <select id="reasoning-select" disabled>
+                  <option value="">Start a conversation</option>
+                </select>
+              </label>
+              <div id="usage-summary" class="usage-summary" hidden aria-live="polite">
+                <span class="usage-label">AIC</span>
+                <span id="usage-aic" class="usage-value usage-aic">— used</span>
+              </div>
+            </div>
+            <div class="composer-actions" aria-label="Conversation actions">
+              <button id="attach-files" class="secondary-button icon-button" type="button" aria-label="Attach images or PDF files" title="Attach images or PDF files">
+                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="m20.5 11.5-8.1 8.1a5 5 0 0 1-7.1-7.1l8.5-8.5a3.5 3.5 0 0 1 5 5l-8.5 8.5a2 2 0 0 1-2.8-2.8l7.8-7.8"></path>
+                </svg>
+              </button>
+              <input id="file-input" type="file" accept="image/*,.pdf,application/pdf" multiple hidden>
+              <button id="cancel-prompt" class="secondary-button icon-button" type="button" aria-label="Cancel current prompt" title="Cancel current prompt" disabled>
+                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="m6 6 12 12M18 6 6 18"></path>
+                </svg>
+              </button>
+              <button id="send-prompt" class="send-button icon-button" type="submit" aria-label="Send prompt" title="Send prompt">
+                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M5 19 19 5M8 5h11v11"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </form>
+      </main>
+    </div>
+
+    <dialog id="permission-dialog" class="permission-dialog">
+      <form method="dialog">
+        <h2 id="permission-title">Permission requested</h2>
+        <p id="permission-description">Copilot wants to use a tool.</p>
+        <div id="permission-options" class="permission-options"></div>
+        <button id="permission-cancel" class="secondary-button" value="cancel" type="submit">Cancel</button>
+      </form>
+    </dialog>
+
+    <dialog id="delete-dialog" class="delete-dialog">
+      <form method="dialog">
+        <h2 id="delete-title">Delete conversation?</h2>
+        <p id="delete-description">This permanently removes the saved conversation data.</p>
+        <div class="delete-dialog-actions">
+          <button id="delete-cancel" class="secondary-button" value="cancel" type="submit">Cancel</button>
+          <button id="delete-confirm" class="danger-button" value="confirm" type="submit">Delete</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="rename-dialog" class="rename-dialog">
+      <form method="dialog">
+        <h2 id="rename-title">Rename conversation</h2>
+        <label class="rename-field" for="rename-input">
+          <span>Conversation title</span>
+          <input id="rename-input" class="rename-input" type="text" maxlength="120" autocomplete="off" required>
+        </label>
+        <div class="rename-dialog-actions">
+          <button class="secondary-button" value="cancel" type="submit">Cancel</button>
+          <button class="send-button" value="confirm" type="submit">Rename</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="image-preview-dialog" class="image-preview-dialog" aria-label="Image preview">
+      <form method="dialog" class="image-preview-content">
+        <button class="image-preview-close" type="submit" value="close" aria-label="Close image preview" title="Close image preview">×</button>
+        <img id="image-preview-image" class="image-preview-image" alt="">
+      </form>
+    </dialog>
+  </body>
+</html>
