@@ -1,0 +1,17 @@
+{
+  "name": "copilot-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A localhost browser interface for GitHub Copilot CLI sessions.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "test": "npm run build && node --test dist/*.test.js",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.4.0",
+    "typescript": "^5.9.2"
+  }
+}
