@@ -87,8 +87,11 @@ loaded using their recorded working directory.
 
 Custom conversation titles are stored in
 `~/.copilot-web/session-titles.json`. Cumulative conversation AI-credit usage is
-stored in `~/.copilot-web/session-usage.json`. These are web-interface
-metadata and do not modify the underlying Copilot session transcript.
+stored in `~/.copilot-web/session-usage.json`, and last-activity timestamps used
+for sidebar ordering are stored in `~/.copilot-web/session-activity.json`.
+These are web-interface metadata and do not modify the underlying Copilot
+session transcript. Selecting or loading a conversation does not update its
+last-activity timestamp.
 
 The server binds to loopback only and does not enable `--allow-all`,
 `--allow-all-paths`, or `--allow-all-urls`. Tool permission requests are
