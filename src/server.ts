@@ -99,6 +99,7 @@ interface SessionUsage {
 }
 
 type SessionTitleOverrides = Map<string, string>;
+type SessionActivityCache = Map<string, string>;
 
 class HttpError extends Error {
   public readonly status: number;
@@ -516,6 +517,77 @@ async function saveSessionUsage(
   await rename(temporaryPath, filePath);
 }
 
+function timestampValue(value: string | undefined): number {
+  if (typeof value !== "string") {
+    return Number.NaN;
+  }
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : Number.NaN;
+}
+
+function latestTimestamp(...values: Array<string | undefined>): string | undefined {
+  const validValues = values
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => ({ value, timestamp: timestampValue(value) }))
+    .filter((entry) => Number.isFinite(entry.timestamp));
+  if (validValues.length === 0) {
+    return undefined;
+  }
+  return validValues.reduce((latest, entry) => (
+    entry.timestamp > latest.timestamp ? entry : latest
+  )).value;
+}
+
+function parsePersistedSessionActivity(
+  value: unknown,
+  filePath: string,
+  sessionId: string
+): string {
+  if (typeof value !== "string" || !Number.isFinite(timestampValue(value))) {
+    throw new Error(`Session activity at ${filePath} contains an invalid entry for ${sessionId}`);
+  }
+  return value;
+}
+
+async function loadSessionActivity(filePath: string): Promise<SessionActivityCache> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(filePath, "utf8")) as unknown;
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") {
+      return new Map();
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to read session activity at ${filePath}: ${message}`);
+  }
+  if (!isRecord(parsed)) {
+    throw new Error(`Session activity at ${filePath} is not a JSON object`);
+  }
+
+  const activity = new Map<string, string>();
+  for (const [sessionId, value] of Object.entries(parsed)) {
+    if (!validSessionId(sessionId)) {
+      throw new Error(`Session activity at ${filePath} contains an invalid session id`);
+    }
+    activity.set(
+      sessionId,
+      parsePersistedSessionActivity(value, filePath, sessionId)
+    );
+  }
+  return activity;
+}
+
+async function saveSessionActivity(
+  filePath: string,
+  activity: SessionActivityCache
+): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const serialized = JSON.stringify(Object.fromEntries(activity), null, 2) + "\n";
+  const temporaryPath = `${filePath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  await writeFile(temporaryPath, serialized, "utf8");
+  await rename(temporaryPath, filePath);
+}
+
 function parseOptionalPromptId(value: unknown, fieldName: string): string | undefined {
   if (value === undefined) {
     return undefined;
@@ -564,6 +636,23 @@ function updateSessionUsage(usage: SessionUsage, event: JsonObject): boolean {
   }
 
   return false;
+}
+
+function isSessionUpdateActivity(params: JsonObject): boolean {
+  const update = isRecord(params.update) ? params.update : undefined;
+  const sessionUpdate = update?.sessionUpdate;
+  return sessionUpdate === "user_message_chunk" ||
+    sessionUpdate === "agent_message_chunk" ||
+    sessionUpdate === "agent_thought_chunk" ||
+    sessionUpdate === "tool_call" ||
+    sessionUpdate === "tool_call_update" ||
+    sessionUpdate === "plan" ||
+    sessionUpdate === "usage_update";
+}
+
+function isSessionEventActivity(params: JsonObject): boolean {
+  return params.type === "assistant.usage" ||
+    params.type === "session.usage_checkpoint";
 }
 
 function parseContext(value: unknown): ContextTier {
@@ -781,8 +870,14 @@ async function main(): Promise<void> {
     ".copilot-web",
     "session-usage.json"
   );
+  const sessionActivityPath = path.join(
+    os.homedir(),
+    ".copilot-web",
+    "session-activity.json"
+  );
   const sessionTitleOverrides = await loadSessionTitleOverrides(sessionTitlesPath);
   const sessionUsageCache = await loadSessionUsage(sessionUsagePath);
+  const sessionActivityCache = await loadSessionActivity(sessionActivityPath);
 
   const acp = new AcpConnectionManager({
     command: copilotCommand,
@@ -807,6 +902,7 @@ async function main(): Promise<void> {
   const sessionCache = new Map<string, SessionInfo>();
   const sessionReplayCache = new Map<string, JsonObject[]>();
   let sessionUsageWrite: Promise<void> = Promise.resolve();
+  let sessionActivityWrite: Promise<void> = Promise.resolve();
   const replayingSessions = new Set<string>();
   const busySessions = new Map<string, BusyPrompt>();
   const sseClients = new Set<SseClient>();
@@ -827,6 +923,18 @@ async function main(): Promise<void> {
     return write;
   };
 
+  const queueSessionActivitySave = (): Promise<void> => {
+    const snapshot = new Map(sessionActivityCache);
+    const write = sessionActivityWrite.then(() => (
+      saveSessionActivity(sessionActivityPath, snapshot)
+    ));
+    sessionActivityWrite = write.catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[server] Unable to persist session activity: ${message}`);
+    });
+    return write;
+  };
+
   const publish = (event: string, data: unknown, sessionId?: string): void => {
     const encoded = sseEvent(event, data);
     for (const client of sseClients) {
@@ -837,8 +945,29 @@ async function main(): Promise<void> {
     }
   };
 
+  const touchSessionActivity = (
+    sessionId: string,
+    activityAt = new Date().toISOString()
+  ): void => {
+    const latest = latestTimestamp(sessionActivityCache.get(sessionId), activityAt);
+    if (!latest || latest === sessionActivityCache.get(sessionId)) {
+      return;
+    }
+    sessionActivityCache.set(sessionId, latest);
+    void queueSessionActivitySave().catch(() => {});
+    publish("session-activity", {
+      sessionId,
+      lastActivityAt: latest
+    }, sessionId);
+  };
+
   const cacheSessions = (sessions: SessionInfo[]): void => {
+    let activityChanged = false;
     for (const session of sessions) {
+      if (!sessionActivityCache.has(session.sessionId) && session.updatedAt) {
+        sessionActivityCache.set(session.sessionId, session.updatedAt);
+        activityChanged = true;
+      }
       const customTitle = sessionTitleOverrides.get(session.sessionId);
       sessionCache.set(
         session.sessionId,
@@ -846,6 +975,9 @@ async function main(): Promise<void> {
           ? session
           : { ...session, title: customTitle, customTitle }
       );
+    }
+    if (activityChanged) {
+      void queueSessionActivitySave().catch(() => {});
     }
   };
 
@@ -874,6 +1006,14 @@ async function main(): Promise<void> {
       replay.push(event.params);
       sessionReplayCache.set(sessionId, replay);
     }
+    if (
+      sessionId &&
+      !replayingSessions.has(sessionId) &&
+      !busySessions.has(sessionId) &&
+      isSessionUpdateActivity(event.params)
+    ) {
+      touchSessionActivity(sessionId);
+    }
     publish(
       "session-update",
       replayingSessions.has(sessionId ?? "")
@@ -896,6 +1036,12 @@ async function main(): Promise<void> {
         sessionUsageCache.set(sessionId, usage);
         void queueSessionUsageSave().catch(() => {});
       }
+      if (
+        !busySessions.has(sessionId) &&
+        isSessionEventActivity(event.params)
+      ) {
+        touchSessionActivity(sessionId);
+      }
     }
     publish("session-event", event.params, sessionId);
   });
@@ -903,6 +1049,9 @@ async function main(): Promise<void> {
     const sessionId = typeof event.params.sessionId === "string"
       ? event.params.sessionId
       : undefined;
+    if (sessionId && !busySessions.has(sessionId)) {
+      touchSessionActivity(sessionId);
+    }
     publish("permission-request", {
       requestId: event.requestId,
       context: event.context,
@@ -1049,8 +1198,11 @@ async function main(): Promise<void> {
           const cachedSession = sessionCache.get(session.sessionId) ?? session;
           const context = acp.getSessionContext(session.sessionId);
           const busyPrompt = busySessions.get(session.sessionId);
+          const lastActivityAt = sessionActivityCache.get(session.sessionId) ??
+            cachedSession.updatedAt;
           return {
             ...cachedSession,
+            ...(lastActivityAt ? { lastActivityAt } : {}),
             ...(context ? { context } : {}),
             busy: busyPrompt !== undefined,
             ...(busyPrompt ? { promptId: busyPrompt.promptId } : {})
@@ -1074,6 +1226,7 @@ async function main(): Promise<void> {
       if (newSessionDefaults.reasoningEffort) {
         configOverrides.reasoning_effort = newSessionDefaults.reasoningEffort;
       }
+      const createdAt = new Date().toISOString();
       const setup = await acp.newSession(
         projectsDirectory,
         context,
@@ -1083,10 +1236,16 @@ async function main(): Promise<void> {
         sessionId: setup.sessionId,
         cwd: projectsDirectory,
         title: "New conversation",
-        updatedAt: new Date().toISOString()
+        updatedAt: createdAt
       };
       sessionCache.set(setup.sessionId, session);
-      const sessionView = { ...session, context };
+      sessionActivityCache.set(setup.sessionId, createdAt);
+      void queueSessionActivitySave().catch(() => {});
+      const sessionView = {
+        ...session,
+        context,
+        lastActivityAt: createdAt
+      };
       publish("session-created", sessionView, setup.sessionId);
       jsonResponse(response, 201, {
         session: sessionView,
@@ -1137,6 +1296,9 @@ async function main(): Promise<void> {
       }
       sessionCache.delete(sessionId);
       sessionReplayCache.delete(sessionId);
+      if (sessionActivityCache.delete(sessionId)) {
+        await queueSessionActivitySave();
+      }
       if (sessionUsageCache.delete(sessionId)) {
         await queueSessionUsageSave();
       }
@@ -1211,7 +1373,11 @@ async function main(): Promise<void> {
           replayingSessions.delete(sessionId);
         }
       }
-      const sessionView = { ...session, context };
+      const sessionView = {
+        ...session,
+        context,
+        lastActivityAt: sessionActivityCache.get(sessionId) ?? session.updatedAt
+      };
       if (!busy) {
         publish("session-loaded", {
           session: sessionView,
@@ -1271,6 +1437,7 @@ async function main(): Promise<void> {
         busyPrompt.clientPromptId = clientPromptId;
       }
       busySessions.set(sessionId, busyPrompt);
+      touchSessionActivity(sessionId);
       let stopReason: string | undefined;
       let errorMessage: string | undefined;
       try {
@@ -1283,6 +1450,7 @@ async function main(): Promise<void> {
         if (busySessions.get(sessionId)?.promptId === promptId) {
           busySessions.delete(sessionId);
         }
+        touchSessionActivity(sessionId);
         const completion: JsonObject = {
           sessionId,
           promptId
