@@ -839,6 +839,42 @@ function relativeTime(value) {
   return date.toLocaleDateString();
 }
 
+function timestampValue(value) {
+  if (typeof value !== "string") {
+    return Number.NaN;
+  }
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : Number.NaN;
+}
+
+function latestTimestamp(...values) {
+  const validValues = values
+    .filter((value) => typeof value === "string")
+    .map((value) => ({ value, timestamp: timestampValue(value) }))
+    .filter((entry) => Number.isFinite(entry.timestamp));
+  if (validValues.length === 0) {
+    return undefined;
+  }
+  return validValues.reduce((latest, entry) => (
+    entry.timestamp > latest.timestamp ? entry : latest
+  )).value;
+}
+
+function sessionActivityAt(session) {
+  return session.lastActivityAt ?? session.updatedAt;
+}
+
+function touchSessionActivity(sessionId, activityAt = new Date().toISOString()) {
+  const session = state.sessions.find((item) => item.sessionId === sessionId);
+  if (!session) {
+    return;
+  }
+  session.lastActivityAt = latestTimestamp(
+    session.lastActivityAt,
+    activityAt
+  ) ?? activityAt;
+}
+
 function renderConnectionStatus() {
   const conversation = activeConversation();
   const loading = conversation?.loading === true && state.connectionStatus === "connected";
@@ -1289,7 +1325,15 @@ function renderSessionList() {
         session.sessionId
       ].filter(Boolean).join(" ").toLowerCase().includes(filter);
     })
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+    .sort((left, right) => {
+      const rightActivity = timestampValue(sessionActivityAt(right));
+      const leftActivity = timestampValue(sessionActivityAt(left));
+      if (Number.isFinite(rightActivity) && Number.isFinite(leftActivity)) {
+        return rightActivity - leftActivity;
+      }
+      return String(sessionActivityAt(right) ?? "")
+        .localeCompare(String(sessionActivityAt(left) ?? ""));
+    });
 
   elements.sessionList.replaceChildren();
   if (sessions.length === 0) {
@@ -1315,7 +1359,7 @@ function renderSessionList() {
     button.dataset.sessionId = session.sessionId;
     button.innerHTML = `
       <span class="session-title">${escapeHtml(session.title || "Untitled conversation")}</span>
-      <span class="session-meta">${escapeHtml(relativeTime(session.updatedAt))}</span>
+      <span class="session-meta">${escapeHtml(relativeTime(sessionActivityAt(session)))}</span>
       ${working
         ? `<span class="session-status">Working${queued > 0 ? ` · ${queued} queued` : ""}</span>`
         : queued > 0
@@ -1984,6 +2028,7 @@ function setBusy(value, conversation = activeConversation()) {
   if (!conversation) {
     return;
   }
+  touchSessionActivity(conversation.sessionId);
   conversation.busy = value;
   if (!value) {
     conversation.activePromptKey = null;
@@ -2618,6 +2663,7 @@ async function refreshSessions() {
   const result = await api("/api/sessions");
   const sessions = Array.isArray(result.sessions) ? result.sessions : [];
   state.sessions = sessions.map((session) => {
+    const previousSession = state.sessions.find((item) => item.sessionId === session.sessionId);
     const conversation = conversationState(session.sessionId, false);
     if (typeof session.customTitle === "string" && session.customTitle.length > 0) {
       if (conversation) {
@@ -2627,6 +2673,11 @@ async function refreshSessions() {
     }
     return {
       ...session,
+      lastActivityAt: latestTimestamp(
+        previousSession?.lastActivityAt,
+        session.lastActivityAt ?? session.updatedAt,
+        session.busy === true ? new Date().toISOString() : undefined
+      ),
       ...(conversation?.activeSessionTitleOverride
         ? { title: conversation.activeSessionTitleOverride }
         : conversation?.activeSessionIsNew
@@ -3267,6 +3318,26 @@ function connectEvents() {
   source.addEventListener("server-error", (event) => {
     const data = JSON.parse(event.data);
     showError(new Error(data.message ?? "The local Copilot bridge reported an error"));
+  });
+  source.addEventListener("session-activity", (event) => {
+    const data = JSON.parse(event.data);
+    if (
+      !data ||
+      typeof data.sessionId !== "string" ||
+      typeof data.lastActivityAt !== "string"
+    ) {
+      return;
+    }
+    const session = state.sessions.find((item) => item.sessionId === data.sessionId);
+    if (!session) {
+      void refreshSessions().catch(showError);
+      return;
+    }
+    session.lastActivityAt = latestTimestamp(
+      session.lastActivityAt,
+      data.lastActivityAt
+    ) ?? data.lastActivityAt;
+    renderSessionList();
   });
   source.addEventListener("session-created", (event) => {
     if (!upsertSession(JSON.parse(event.data))) {
