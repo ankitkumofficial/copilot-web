@@ -177,6 +177,7 @@ const elements = {
   usageAic: document.querySelector("#usage-aic"),
   messages: document.querySelector("#messages"),
   emptyState: document.querySelector("#empty-state"),
+  loadingState: document.querySelector("#loading-state"),
   composer: document.querySelector("#composer"),
   input: document.querySelector("#prompt-input"),
   attachmentList: document.querySelector("#attachment-list"),
@@ -1960,6 +1961,16 @@ function renderMessages(conversation = activeConversation()) {
   const previousScrollLeft = elements.messages.scrollLeft;
   const panelScrollPositions = captureMessagePanelScroll(conversation);
   elements.messages.replaceChildren();
+  if (conversation?.loading === true) {
+    elements.loadingState.hidden = false;
+    elements.messages.append(elements.loadingState);
+    elements.emptyState.hidden = true;
+    elements.messages.setAttribute("aria-busy", "true");
+    return;
+  }
+
+  elements.loadingState.hidden = true;
+  elements.messages.setAttribute("aria-busy", "false");
   if (!conversation || conversation.messages.length === 0) {
     elements.messages.append(elements.emptyState);
     elements.emptyState.hidden = false;
@@ -2193,6 +2204,7 @@ function setLoading(value, conversation = activeConversation()) {
     elements.cancel.disabled = !promptIsActive(conversation);
     updateAttachmentControls();
     renderConversationControls();
+    renderMessages(conversation);
   }
 }
 
@@ -2917,7 +2929,6 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
   conversation.configOptions = [];
   setLoading(true, conversation);
   setStatus("Loading conversation...", conversation);
-  renderMessages(conversation);
 
   try {
     const result = await api(`/api/sessions/${encodeURIComponent(sessionId)}/load`, {
@@ -2965,7 +2976,6 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
     } else {
       resetRecoveredPrompt(conversation);
     }
-    renderMessages(conversation);
     if (
       !conversation.recoveredPrompt &&
       !(completionHandled && typeof pendingCompletion?.error === "string")

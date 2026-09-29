@@ -537,6 +537,44 @@ button:disabled {
   line-height: 1.5;
 }
 
+.loading-state {
+  display: grid;
+  max-width: 500px;
+  min-height: 100%;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  margin: auto;
+  text-align: center;
+}
+
+.loading-spinner {
+  width: 30px;
+  height: 30px;
+  margin-bottom: 4px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: loading-spin 800ms linear infinite;
+}
+
+.loading-state h2 {
+  margin: 0;
+  font-size: 1.35rem;
+}
+
+.loading-state p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+@keyframes loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .message {
   max-width: 920px;
   margin: 0 auto 23px;
