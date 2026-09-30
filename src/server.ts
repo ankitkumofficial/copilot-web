@@ -981,10 +981,25 @@ async function main(): Promise<void> {
     }
   };
 
-  const findSession = async (sessionId: string): Promise<SessionInfo> => {
+  const findSession = async (
+    sessionId: string,
+    allowKnownContextFallback = false
+  ): Promise<SessionInfo> => {
     const cached = sessionCache.get(sessionId);
     if (cached) {
       return cached;
+    }
+
+    if (allowKnownContextFallback && acp.getSessionContext(sessionId)) {
+      const customTitle = sessionTitleOverrides.get(sessionId);
+      const knownSession: SessionInfo = {
+        sessionId,
+        cwd: projectsDirectory,
+        title: customTitle ?? "New conversation",
+        ...(customTitle ? { customTitle } : {})
+      };
+      sessionCache.set(sessionId, knownSession);
+      return knownSession;
     }
 
     const sessions = await acp.listSessions();
@@ -1263,7 +1278,7 @@ async function main(): Promise<void> {
       throw new HttpError(404, "API route not found");
     }
     const subroute = subrouteFromPath(requestUrl.pathname);
-    const session = await findSession(sessionId);
+    const session = await findSession(sessionId, subroute === "config");
 
     if (request.method === "DELETE" && subroute === undefined) {
       const acpSupportsDelete = acp.getCapabilities().sessionCapabilities.delete;
