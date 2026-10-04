@@ -81,7 +81,8 @@ Open the URL printed by the server, normally:
 http://127.0.0.1:8765
 ```
 
-New browser conversations start in `~/projects`. Existing ACP sessions are
+New browser conversations stay out of session history until the first message is
+sent; the Copilot session then starts in `~/projects`. Existing ACP sessions are
 listed across all workspaces visible to the current Copilot CLI account and are
 loaded using their recorded working directory.
 
@@ -91,7 +92,12 @@ stored in `~/.copilot-web/session-usage.json`, and last-activity timestamps used
 for sidebar ordering are stored in `~/.copilot-web/session-activity.json`.
 These are web-interface metadata and do not modify the underlying Copilot
 session transcript. Selecting or loading a conversation does not update its
-last-activity timestamp.
+last-activity timestamp. Writes to each metadata file are serialized and replace
+the file atomically; graceful shutdown waits for pending writes. Deleting a
+conversation also removes its metadata, and the API reports any metadata
+cleanup failures to the browser. These guarantees apply within one server
+process. Multiple server processes using the same home directory are not
+coordinated, so run only one instance at a time.
 
 The server binds to loopback only and does not enable `--allow-all`,
 `--allow-all-paths`, or `--allow-all-urls`. Tool permission requests are

@@ -29,6 +29,7 @@ import {
   type SessionSetup,
   type SessionInfo
 } from "./acp.js";
+import { SerialTaskQueue } from "./persistence.js";
 
 const applicationVersion = "0.1.0";
 const defaultBrandName = "Copilot Web";
@@ -901,12 +902,65 @@ async function main(): Promise<void> {
 
   const sessionCache = new Map<string, SessionInfo>();
   const sessionReplayCache = new Map<string, JsonObject[]>();
-  let sessionUsageWrite: Promise<void> = Promise.resolve();
-  let sessionActivityWrite: Promise<void> = Promise.resolve();
+  const sessionTitleWrites = new SerialTaskQueue();
+  const sessionUsageWrites = new SerialTaskQueue();
+  const sessionActivityWrites = new SerialTaskQueue();
   const replayingSessions = new Set<string>();
   const busySessions = new Map<string, BusyPrompt>();
+  const deletingSessions = new Set<string>();
+  const deletedSessions = new Set<string>();
+  const activeSessionOperations = new Map<string, number>();
+  const sessionOperationWaiters = new Map<string, Set<() => void>>();
   const sseClients = new Set<SseClient>();
   const browserToken = randomBytes(32).toString("hex");
+
+  const ensureSessionAvailable = (sessionId: string): void => {
+    if (deletedSessions.has(sessionId)) {
+      throw new HttpError(404, "Conversation not found");
+    }
+    if (deletingSessions.has(sessionId)) {
+      throw new HttpError(409, "Conversation is being deleted");
+    }
+  };
+
+  const withSessionOperation = async <T>(
+    sessionId: string,
+    operation: () => Promise<T>
+  ): Promise<T> => {
+    ensureSessionAvailable(sessionId);
+    activeSessionOperations.set(
+      sessionId,
+      (activeSessionOperations.get(sessionId) ?? 0) + 1
+    );
+    try {
+      return await operation();
+    } finally {
+      const activeCount = (activeSessionOperations.get(sessionId) ?? 1) - 1;
+      if (activeCount > 0) {
+        activeSessionOperations.set(sessionId, activeCount);
+      } else {
+        activeSessionOperations.delete(sessionId);
+        const waiters = sessionOperationWaiters.get(sessionId);
+        if (waiters) {
+          sessionOperationWaiters.delete(sessionId);
+          for (const resolve of waiters) {
+            resolve();
+          }
+        }
+      }
+    }
+  };
+
+  const waitForSessionOperations = (sessionId: string): Promise<void> => {
+    if (!activeSessionOperations.has(sessionId)) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      const waiters = sessionOperationWaiters.get(sessionId) ?? new Set();
+      waiters.add(resolve);
+      sessionOperationWaiters.set(sessionId, waiters);
+    });
+  };
 
   const queueSessionUsageSave = (): Promise<void> => {
     const snapshot = new Map(
@@ -915,25 +969,56 @@ async function main(): Promise<void> {
         { ...usage }
       ])
     );
-    const write = sessionUsageWrite.then(() => saveSessionUsage(sessionUsagePath, snapshot));
-    sessionUsageWrite = write.catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error(`[server] Unable to persist session usage: ${message}`);
-    });
-    return write;
+    return sessionUsageWrites.enqueue(() => saveSessionUsage(sessionUsagePath, snapshot))
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[server] Unable to persist session usage: ${message}`);
+        throw error;
+      });
   };
 
   const queueSessionActivitySave = (): Promise<void> => {
     const snapshot = new Map(sessionActivityCache);
-    const write = sessionActivityWrite.then(() => (
+    return sessionActivityWrites.enqueue(() => (
       saveSessionActivity(sessionActivityPath, snapshot)
-    ));
-    sessionActivityWrite = write.catch((error) => {
+    )).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`[server] Unable to persist session activity: ${message}`);
+      throw error;
     });
-    return write;
   };
+
+  const persistSessionTitleOverride = (
+    sessionId: string,
+    title: string | undefined,
+    rollbackOnFailure = true,
+    forceSave = false
+  ): Promise<void> => sessionTitleWrites.enqueue(async () => {
+    const snapshot = new Map(sessionTitleOverrides);
+    const previousTitle = snapshot.get(sessionId);
+    const hadPreviousTitle = snapshot.has(sessionId);
+    if (title === undefined) {
+      snapshot.delete(sessionId);
+    } else {
+      snapshot.set(sessionId, title);
+    }
+    if (!forceSave && hadPreviousTitle === (title !== undefined) && previousTitle === title) {
+      return;
+    }
+
+    try {
+      await saveSessionTitleOverrides(sessionTitlesPath, snapshot);
+    } catch (error) {
+      if (!rollbackOnFailure) {
+        sessionTitleOverrides.delete(sessionId);
+      }
+      throw error;
+    }
+    sessionTitleOverrides.clear();
+    for (const [id, value] of snapshot) {
+      sessionTitleOverrides.set(id, value);
+    }
+  });
 
   const publish = (event: string, data: unknown, sessionId?: string): void => {
     const encoded = sseEvent(event, data);
@@ -949,6 +1034,9 @@ async function main(): Promise<void> {
     sessionId: string,
     activityAt = new Date().toISOString()
   ): void => {
+    if (deletedSessions.has(sessionId)) {
+      return;
+    }
     const latest = latestTimestamp(sessionActivityCache.get(sessionId), activityAt);
     if (!latest || latest === sessionActivityCache.get(sessionId)) {
       return;
@@ -964,6 +1052,9 @@ async function main(): Promise<void> {
   const cacheSessions = (sessions: SessionInfo[]): void => {
     let activityChanged = false;
     for (const session of sessions) {
+      if (deletedSessions.has(session.sessionId)) {
+        continue;
+      }
       if (!sessionActivityCache.has(session.sessionId) && session.updatedAt) {
         sessionActivityCache.set(session.sessionId, session.updatedAt);
         activityChanged = true;
@@ -1016,6 +1107,9 @@ async function main(): Promise<void> {
       return;
     }
     const sessionId = typeof event.params.sessionId === "string" ? event.params.sessionId : undefined;
+    if (sessionId && deletedSessions.has(sessionId)) {
+      return;
+    }
     if (sessionId) {
       const replay = sessionReplayCache.get(sessionId) ?? [];
       replay.push(event.params);
@@ -1042,6 +1136,9 @@ async function main(): Promise<void> {
       return;
     }
     const sessionId = typeof event.params.sessionId === "string" ? event.params.sessionId : undefined;
+    if (sessionId && deletedSessions.has(sessionId)) {
+      return;
+    }
     if (sessionId) {
       const usage = sessionUsageCache.get(sessionId) ?? {
         aicNano: null,
@@ -1064,6 +1161,9 @@ async function main(): Promise<void> {
     const sessionId = typeof event.params.sessionId === "string"
       ? event.params.sessionId
       : undefined;
+    if (sessionId && deletedSessions.has(sessionId)) {
+      return;
+    }
     if (sessionId && !busySessions.has(sessionId)) {
       touchSessionActivity(sessionId);
     }
@@ -1209,20 +1309,25 @@ async function main(): Promise<void> {
       const newSessionDefaults = await readCopilotDefaults();
       cacheSessions(sessions);
       jsonResponse(response, 200, {
-        sessions: sessions.map((session) => {
-          const cachedSession = sessionCache.get(session.sessionId) ?? session;
-          const context = acp.getSessionContext(session.sessionId);
-          const busyPrompt = busySessions.get(session.sessionId);
-          const lastActivityAt = sessionActivityCache.get(session.sessionId) ??
-            cachedSession.updatedAt;
-          return {
-            ...cachedSession,
-            ...(lastActivityAt ? { lastActivityAt } : {}),
-            ...(context ? { context } : {}),
-            busy: busyPrompt !== undefined,
-            ...(busyPrompt ? { promptId: busyPrompt.promptId } : {})
-          };
-        }),
+        sessions: sessions
+          .filter((session) => (
+            !deletingSessions.has(session.sessionId) &&
+            !deletedSessions.has(session.sessionId)
+          ))
+          .map((session) => {
+            const cachedSession = sessionCache.get(session.sessionId) ?? session;
+            const context = acp.getSessionContext(session.sessionId);
+            const busyPrompt = busySessions.get(session.sessionId);
+            const lastActivityAt = sessionActivityCache.get(session.sessionId) ??
+              cachedSession.updatedAt;
+            return {
+              ...cachedSession,
+              ...(lastActivityAt ? { lastActivityAt } : {}),
+              ...(context ? { context } : {}),
+              busy: busyPrompt !== undefined,
+              ...(busyPrompt ? { promptId: busyPrompt.promptId } : {})
+            };
+          }),
         capabilities: browserCapabilities(),
         contexts: contextOptions,
         newSessionDefaults
@@ -1234,12 +1339,26 @@ async function main(): Promise<void> {
       const body = await readJsonBody(request);
       const newSessionDefaults = await readCopilotDefaults();
       const context = parseContext(body.context ?? newSessionDefaults.context);
-      const configOverrides: Record<string, string> = {};
+      const configOverrides: Record<string, string | boolean> = {};
       if (newSessionDefaults.model) {
         configOverrides.model = newSessionDefaults.model;
       }
       if (newSessionDefaults.reasoningEffort) {
         configOverrides.reasoning_effort = newSessionDefaults.reasoningEffort;
+      }
+      if (body.configOverrides !== undefined) {
+        if (!isRecord(body.configOverrides)) {
+          throw new HttpError(400, "Configuration overrides must be an object");
+        }
+        for (const [configId, value] of Object.entries(body.configOverrides)) {
+          if (configId !== "model" && configId !== "reasoning_effort") {
+            throw new HttpError(400, `Unsupported new conversation setting: ${configId}`);
+          }
+          if (typeof value !== "string" && typeof value !== "boolean") {
+            throw new HttpError(400, `Invalid value for new conversation setting: ${configId}`);
+          }
+          configOverrides[configId] = value;
+        }
       }
       const createdAt = new Date().toISOString();
       const setup = await acp.newSession(
@@ -1253,6 +1372,7 @@ async function main(): Promise<void> {
         title: "New conversation",
         updatedAt: createdAt
       };
+      deletedSessions.delete(setup.sessionId);
       sessionCache.set(setup.sessionId, session);
       sessionActivityCache.set(setup.sessionId, createdAt);
       void queueSessionActivitySave().catch(() => {});
@@ -1278,74 +1398,116 @@ async function main(): Promise<void> {
       throw new HttpError(404, "API route not found");
     }
     const subroute = subrouteFromPath(requestUrl.pathname);
-    const session = await findSession(sessionId, subroute === "config");
+    const deleteRequest = request.method === "DELETE" && subroute === undefined;
+    if (deletedSessions.has(sessionId)) {
+      throw new HttpError(404, "Conversation not found");
+    }
+    if (deletingSessions.has(sessionId)) {
+      throw new HttpError(409, "Conversation is being deleted");
+    }
+    if (deleteRequest && busySessions.has(sessionId)) {
+      throw new HttpError(409, "Cannot delete a conversation while it is processing a prompt");
+    }
+    if (deleteRequest) {
+      deletingSessions.add(sessionId);
+    }
 
-    if (request.method === "DELETE" && subroute === undefined) {
-      const acpSupportsDelete = acp.getCapabilities().sessionCapabilities.delete;
-      if (!acpSupportsDelete && !nativeSessionDelete) {
-        throw new HttpError(409, "This Copilot CLI does not support session deletion");
+    let session: SessionInfo;
+    try {
+      session = await findSession(sessionId, subroute === "config");
+    } catch (error) {
+      if (deleteRequest) {
+        deletingSessions.delete(sessionId);
       }
-      if (acpSupportsDelete) {
-        await acp.deleteSession(sessionId);
-      } else {
-        if (acp.getSessionContext(sessionId)) {
-          await acp.closeSession(sessionId);
+      throw error;
+    }
+    if (!deleteRequest) {
+      ensureSessionAvailable(sessionId);
+    }
+
+    if (deleteRequest) {
+      try {
+        await waitForSessionOperations(sessionId);
+        const acpSupportsDelete = acp.getCapabilities().sessionCapabilities.delete;
+        if (!acpSupportsDelete && !nativeSessionDelete) {
+          throw new HttpError(409, "This Copilot CLI does not support session deletion");
         }
-        if (copilotSdkPath) {
-          await deleteSessionWithCopilotSdk(
-            copilotSdkPath,
-            copilotExecutable,
-            projectsDirectory,
-            sessionId,
-            allowAll
-          );
+        if (acpSupportsDelete) {
+          await acp.deleteSession(sessionId);
         } else {
-          await deleteSessionWithNativeCli(
-            copilotCommand,
-            projectsDirectory,
-            sessionId,
-            allowAll
-          );
+          if (acp.getSessionContext(sessionId)) {
+            await acp.closeSession(sessionId);
+          }
+          if (copilotSdkPath) {
+            await deleteSessionWithCopilotSdk(
+              copilotSdkPath,
+              copilotExecutable,
+              projectsDirectory,
+              sessionId,
+              allowAll
+            );
+          } else {
+            await deleteSessionWithNativeCli(
+              copilotCommand,
+              projectsDirectory,
+              sessionId,
+              allowAll
+            );
+          }
+          acp.forgetSession(sessionId);
         }
-        acp.forgetSession(sessionId);
+        deletedSessions.add(sessionId);
+        sessionCache.delete(sessionId);
+        sessionReplayCache.delete(sessionId);
+        busySessions.delete(sessionId);
+        replayingSessions.delete(sessionId);
+        sessionActivityCache.delete(sessionId);
+        sessionUsageCache.delete(sessionId);
+
+        const cleanupLabels = ["session usage", "session activity", "custom titles"];
+        const cleanupResults = await Promise.allSettled([
+          queueSessionUsageSave(),
+          queueSessionActivitySave(),
+          persistSessionTitleOverride(sessionId, undefined, false, true)
+        ]);
+        const persistenceWarnings: string[] = [];
+        cleanupResults.forEach((result, index) => {
+          if (result.status === "rejected") {
+            const message = result.reason instanceof Error
+              ? result.reason.message
+              : String(result.reason);
+            persistenceWarnings.push(`${cleanupLabels[index]}: ${message}`);
+            if (index === 2) {
+              console.error(`[server] Unable to clean deleted conversation title: ${message}`);
+            }
+          }
+        });
+        sessionCache.delete(sessionId);
+        sessionReplayCache.delete(sessionId);
+        publish("session-deleted", { sessionId }, sessionId);
+        jsonResponse(response, 200, {
+          deleted: true,
+          ...(persistenceWarnings.length > 0 ? { persistenceWarnings } : {})
+        });
+        return true;
+      } finally {
+        deletingSessions.delete(sessionId);
       }
-      sessionCache.delete(sessionId);
-      sessionReplayCache.delete(sessionId);
-      if (sessionActivityCache.delete(sessionId)) {
-        await queueSessionActivitySave();
-      }
-      if (sessionUsageCache.delete(sessionId)) {
-        await queueSessionUsageSave();
-      }
-      if (sessionTitleOverrides.delete(sessionId)) {
-        await saveSessionTitleOverrides(sessionTitlesPath, sessionTitleOverrides);
-      }
-      publish("session-deleted", { sessionId }, sessionId);
-      jsonResponse(response, 200, { deleted: true });
-      return true;
     }
 
     if (request.method === "POST" && subroute === "title") {
       const body = await readJsonBody(request);
       const title = parseSessionTitle(body.title);
-      const previousTitle = sessionTitleOverrides.get(sessionId);
-      sessionTitleOverrides.set(sessionId, title);
-      try {
-        await saveSessionTitleOverrides(sessionTitlesPath, sessionTitleOverrides);
-      } catch (error) {
-        if (previousTitle === undefined) {
-          sessionTitleOverrides.delete(sessionId);
-        } else {
-          sessionTitleOverrides.set(sessionId, previousTitle);
-        }
-        throw error;
-      }
+      await withSessionOperation(sessionId, () => (
+        persistSessionTitleOverride(sessionId, title)
+      ));
 
       const renamedSession: SessionInfo = {
         ...session,
         title,
         customTitle: title
       };
+      ensureSessionAvailable(sessionId);
       sessionCache.set(sessionId, renamedSession);
       publish("session-renamed", {
         sessionId,
@@ -1378,15 +1540,18 @@ async function main(): Promise<void> {
           configOptions: acp.getConfigOptions(sessionId)
         };
       } else {
-        if (previousContext && previousContext !== context) {
-          sessionReplayCache.delete(sessionId);
-        }
-        replayingSessions.add(sessionId);
-        try {
-          setup = await acp.loadSession(session, context);
-        } finally {
-          replayingSessions.delete(sessionId);
-        }
+        setup = await withSessionOperation(sessionId, async () => {
+          if (previousContext && previousContext !== context) {
+            sessionReplayCache.delete(sessionId);
+          }
+          replayingSessions.add(sessionId);
+          try {
+            return await acp.loadSession(session, context);
+          } finally {
+            replayingSessions.delete(sessionId);
+          }
+        });
+        ensureSessionAvailable(sessionId);
       }
       const sessionView = {
         ...session,
@@ -1429,6 +1594,7 @@ async function main(): Promise<void> {
         throw new HttpError(409, "Conversation is already processing a prompt");
       }
       const body = await readJsonBody(request);
+      ensureSessionAvailable(sessionId);
       const context = acp.getSessionContext(sessionId) ?? "default";
       const prompt = parsePrompt(body, acp.getCapabilities(context));
       const clientPromptId = parseOptionalPromptId(body.clientPromptId, "Client prompt id");
@@ -1494,7 +1660,8 @@ async function main(): Promise<void> {
         jsonResponse(response, 202, { cancelled: false });
         return true;
       }
-      await acp.cancel(sessionId);
+      await withSessionOperation(sessionId, () => acp.cancel(sessionId));
+      ensureSessionAvailable(sessionId);
       jsonResponse(response, 202, {
         cancelled: true,
         promptId: busyPrompt.promptId
@@ -1513,14 +1680,19 @@ async function main(): Promise<void> {
       if (typeof body.value !== "string" && typeof body.value !== "boolean") {
         throw new HttpError(400, "Configuration value must be a string or boolean");
       }
+      const configId = body.configId;
+      const configValue = body.value;
 
       const option = acp.getConfigOptions(sessionId)
-        .find((candidate) => candidate.id === body.configId);
+        .find((candidate) => candidate.id === configId);
       if (!option || !isModelConfigOption(option)) {
         throw new HttpError(400, "That configuration option cannot be changed here");
       }
 
-      const configOptions = await acp.setConfigOption(session, body.configId, body.value);
+      const configOptions = await withSessionOperation(sessionId, () => (
+        acp.setConfigOption(session, configId, configValue)
+      ));
+      ensureSessionAvailable(sessionId);
       jsonResponse(response, 200, {
         context: acp.getSessionContext(sessionId) ?? "default",
         configOptions
@@ -1530,21 +1702,32 @@ async function main(): Promise<void> {
 
     if (request.method === "POST" && subroute === "permissions") {
       const body = await readJsonBody(request);
-      if (!isJsonRpcId(body.requestId)) {
+      const requestId = body.requestId;
+      if (!isJsonRpcId(requestId)) {
         throw new HttpError(400, "Permission requestId is required");
       }
 
       const context = parseContext(body.context);
+      const optionId = body.optionId;
       if (body.cancelled === true) {
-        await acp.respondToPermission(context, body.requestId, { outcome: "cancelled" });
-      } else if (typeof body.optionId === "string" && body.optionId.length > 0) {
-        await acp.respondToPermission(context, body.requestId, {
-          outcome: "selected",
-          optionId: body.optionId
-        });
+        await withSessionOperation(sessionId, () => acp.respondToPermission(
+          context,
+          requestId,
+          { outcome: "cancelled" }
+        ));
+      } else if (typeof optionId === "string" && optionId.length > 0) {
+        await withSessionOperation(sessionId, () => acp.respondToPermission(
+          context,
+          requestId,
+          {
+            outcome: "selected",
+            optionId
+          }
+        ));
       } else {
         throw new HttpError(400, "Permission optionId or cancelled is required");
       }
+      ensureSessionAvailable(sessionId);
       jsonResponse(response, 200, { accepted: true });
       return true;
     }
@@ -1592,8 +1775,17 @@ async function main(): Promise<void> {
       client.response.end();
     }
     sseClients.clear();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    await acp.stop();
+    const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
+    try {
+      await acp.stop();
+    } finally {
+      await serverClosed;
+      await Promise.all([
+        sessionTitleWrites.flush(),
+        sessionUsageWrites.flush(),
+        sessionActivityWrites.flush()
+      ]);
+    }
   };
 
   process.once("SIGINT", () => {
