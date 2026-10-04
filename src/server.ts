@@ -1263,9 +1263,16 @@ async function main(): Promise<void> {
     }
 
     if (request.method === "GET" && requestUrl.pathname === "/api/config") {
-      const context = parseContext(requestUrl.searchParams.get("context") ?? undefined);
-      const setup = await acp.discoverConfig(context);
       const newSessionDefaults = await readCopilotDefaults();
+      const context = parseContext(
+        requestUrl.searchParams.get("context") ?? newSessionDefaults.context
+      );
+      const requestedModel = requestUrl.searchParams.get("model");
+      if (requestedModel !== null && requestedModel.trim().length === 0) {
+        throw new HttpError(400, "Model must be a non-empty string");
+      }
+      const model = requestedModel?.trim() ?? newSessionDefaults.model;
+      const setup = await acp.discoverConfig(context, model);
       jsonResponse(response, 200, {
         brandName: branding.brandName,
         brandInitial: branding.brandInitial,
@@ -1340,11 +1347,13 @@ async function main(): Promise<void> {
       const newSessionDefaults = await readCopilotDefaults();
       const context = parseContext(body.context ?? newSessionDefaults.context);
       const configOverrides: Record<string, string | boolean> = {};
+      const fallbackConfigIds = new Set<string>();
       if (newSessionDefaults.model) {
         configOverrides.model = newSessionDefaults.model;
       }
       if (newSessionDefaults.reasoningEffort) {
         configOverrides.reasoning_effort = newSessionDefaults.reasoningEffort;
+        fallbackConfigIds.add("reasoning_effort");
       }
       if (body.configOverrides !== undefined) {
         if (!isRecord(body.configOverrides)) {
@@ -1358,13 +1367,15 @@ async function main(): Promise<void> {
             throw new HttpError(400, `Invalid value for new conversation setting: ${configId}`);
           }
           configOverrides[configId] = value;
+          fallbackConfigIds.delete(configId);
         }
       }
       const createdAt = new Date().toISOString();
       const setup = await acp.newSession(
         projectsDirectory,
         context,
-        Object.keys(configOverrides).length > 0 ? configOverrides : undefined
+        Object.keys(configOverrides).length > 0 ? configOverrides : undefined,
+        fallbackConfigIds
       );
       const session: SessionInfo = {
         sessionId: setup.sessionId,
