@@ -75,6 +75,7 @@ function createConversationState(sessionId = null) {
     currentToolGroupKey: null,
     toolGroupCounter: 0,
     configOptions: [],
+    configOverrides: {},
     sessionContext: null,
     activeSessionIsNew: false,
     activeSessionTitleOverride: null,
@@ -82,6 +83,7 @@ function createConversationState(sessionId = null) {
       aicNano: null,
       aicLimit: null
     },
+    usageRevision: 0,
     status: "Ready",
     busy: false,
     activePromptKey: null,
@@ -195,8 +197,10 @@ const elements = {
   deleteTitle: document.querySelector("#delete-title"),
   deleteDescription: document.querySelector("#delete-description"),
   renameDialog: document.querySelector("#rename-dialog"),
+  renameForm: document.querySelector("#rename-form"),
   renameTitle: document.querySelector("#rename-title"),
   renameInput: document.querySelector("#rename-input"),
+  renameConfirm: document.querySelector("#rename-confirm"),
   imagePreviewDialog: document.querySelector("#image-preview-dialog"),
   imagePreviewImage: document.querySelector("#image-preview-image")
 };
@@ -409,9 +413,37 @@ function applyNewSessionDefaults(configOptions, defaults) {
   });
 }
 
+function applyNewSessionConfigOverrides(configOptions, overrides) {
+  return configOptions.map((option) => {
+    const value = overrides[option.id];
+    if (
+      value !== undefined &&
+      configOptionValues(option).some((candidate) => candidate.value === value)
+    ) {
+      return { ...option, currentValue: value };
+    }
+    return option;
+  });
+}
+
+function selectedNewSessionConfigOverrides(conversation) {
+  return Object.fromEntries(
+    ["model", "reasoning_effort"].flatMap((configId) => {
+      const value = conversation.configOverrides[configId];
+      const option = conversation.configOptions.find((candidate) => (
+        candidate.id === configId
+      ));
+      return typeof value === "string" &&
+        configOptionValues(option).some((candidate) => candidate.value === value)
+        ? [[configId, value]]
+        : [];
+    })
+  );
+}
+
 function renderConfigurationControls() {
-  const conversation = activeConversation();
-  const configuration = conversation ?? state.composer;
+  const conversation = activeConversation() ?? state.composer;
+  const configuration = conversation;
   const model = findConfigOption(["model"], "model", configuration);
   const reasoning = findConfigOption(["reasoning_effort"], "thought_level", configuration);
   renderConfigSelect(elements.modelSelect, model, "Unavailable", conversation);
@@ -431,7 +463,12 @@ function applySessionSetup(result, context, conversation = activeConversation() 
 
 async function loadContextDefaults(context) {
   const requestId = ++defaultsRequestId;
-  state.composer.configOptions = [];
+  const composer = state.composer;
+  const loadingComposerDefaults = !state.activeSessionId;
+  composer.configOptions = [];
+  if (loadingComposerDefaults) {
+    composer.configurationBusy = true;
+  }
   renderConfigurationControls();
   try {
     const result = await api(`/api/config?context=${encodeURIComponent(context)}`);
@@ -443,14 +480,29 @@ async function loadContextDefaults(context) {
       return;
     }
     state.newSessionDefaults = result.newSessionDefaults ?? state.newSessionDefaults;
-    state.composer.configOptions = applyNewSessionDefaults(
-      Array.isArray(result.configOptions) ? result.configOptions : [],
-      state.newSessionDefaults
+    state.composer.configOptions = applyNewSessionConfigOverrides(
+      applyNewSessionDefaults(
+        Array.isArray(result.configOptions) ? result.configOptions : [],
+        state.newSessionDefaults
+      ),
+      state.composer.configOverrides
     );
     renderConfigurationControls();
   } catch (error) {
     if (requestId === defaultsRequestId && !state.activeSessionId) {
       showError(error);
+    }
+  } finally {
+    if (
+      loadingComposerDefaults &&
+      requestId === defaultsRequestId &&
+      state.composer === composer
+    ) {
+      composer.configurationBusy = false;
+      elements.send.disabled = composer.loading ||
+        composer.configurationBusy ||
+        composer.attachmentBusy;
+      renderConfigurationControls();
     }
   }
 }
@@ -994,13 +1046,20 @@ function resetUsage(conversation = activeConversation() ?? state.composer) {
     aicNano: null,
     aicLimit: null
   };
+  conversation.usageRevision += 1;
   if (conversation === activeConversation()) {
     renderUsage(conversation);
   }
 }
 
-function applySessionUsage(value, conversation) {
+function applySessionUsage(value, conversation, expectedRevision) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return;
+  }
+  if (
+    expectedRevision !== undefined &&
+    conversation.usageRevision !== expectedRevision
+  ) {
     return;
   }
   conversation.usage = {
@@ -2403,6 +2462,7 @@ function handleRawSessionEvent(params) {
     return;
   }
   const conversation = conversationState(params.sessionId);
+  let usageChanged = false;
 
   if (params.type === "assistant.usage") {
     const totalNanoAiu = params.data.copilotUsage &&
@@ -2411,6 +2471,7 @@ function handleRawSessionEvent(params) {
       : undefined;
     if (typeof totalNanoAiu === "number" && Number.isFinite(totalNanoAiu)) {
       conversation.usage.aicNano = (conversation.usage.aicNano ?? 0) + totalNanoAiu;
+      usageChanged = true;
     }
   } else if (params.type === "session.usage_checkpoint") {
     if (
@@ -2418,6 +2479,7 @@ function handleRawSessionEvent(params) {
       Number.isFinite(params.data.totalNanoAiu)
     ) {
       conversation.usage.aicNano = params.data.totalNanoAiu;
+      usageChanged = true;
     }
   } else if (params.type === "session.session_limits_changed") {
     const maxAiCredits = params.data.sessionLimits &&
@@ -2428,6 +2490,10 @@ function handleRawSessionEvent(params) {
       Number.isFinite(maxAiCredits)
       ? maxAiCredits * 1_000_000_000
       : null;
+    usageChanged = true;
+  }
+  if (usageChanged) {
+    conversation.usageRevision += 1;
   }
   renderUsage(conversation);
 }
@@ -2646,28 +2712,45 @@ async function deleteConversation(sessionId) {
 
   state.deletingSessionId = sessionId;
   renderSessionList();
+  let activeConversationDeleted = false;
+  let deleteError;
+  let persistenceWarnings = [];
   try {
-    await api(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    const result = await api(`/api/sessions/${encodeURIComponent(sessionId)}`, {
       method: "DELETE"
     });
+    persistenceWarnings = Array.isArray(result.persistenceWarnings)
+      ? result.persistenceWarnings.filter((warning) => typeof warning === "string")
+      : [];
     state.conversations.delete(sessionId);
     if (sessionId === state.activeSessionId) {
-      state.activeSessionId = null;
-      clearActiveSessionId();
-      state.composer = createConversationState();
-      elements.input.value = "";
-      resizePromptInput();
-      renderAttachmentList();
-      renderMessages();
-      renderConversationControls();
+      activeConversationDeleted = true;
+      startNewConversation({ discardDraft: true });
     }
     await refreshSessions();
-    setStatus("Ready", activeConversation() ?? state.composer);
+    if (!activeConversationDeleted && persistenceWarnings.length === 0) {
+      setStatus("Ready", activeConversation() ?? state.composer);
+    }
   } catch (error) {
-    showError(error, conversation ?? state.composer);
+    deleteError = error;
   } finally {
     state.deletingSessionId = null;
     renderSessionList();
+  }
+
+  const errorConversation = activeConversation() ?? state.composer;
+  if (deleteError) {
+    showError(
+      deleteError,
+      activeConversationDeleted ? errorConversation : conversation ?? state.composer
+    );
+  }
+  if (persistenceWarnings.length > 0) {
+    showError(new Error(
+      `Conversation deleted, but metadata cleanup was incomplete: ${
+        persistenceWarnings.join("; ")
+      }`
+    ), errorConversation);
   }
 }
 
@@ -2797,6 +2880,58 @@ function activateConversation(sessionId) {
   renderConnectionStatus();
 }
 
+function activateComposerConversation(conversation = state.composer) {
+  state.activeSessionId = null;
+  clearActiveSessionId();
+  elements.input.value = conversation.draft;
+  resizePromptInput();
+  renderSessionList();
+  renderConversationControls();
+  renderAttachmentList();
+  renderUsage(conversation);
+  renderMessages(conversation);
+  setStatus(conversation.status ?? "Ready", conversation);
+  elements.input.disabled = conversation.loading;
+  elements.send.disabled = conversation.loading ||
+    conversation.configurationBusy ||
+    conversation.attachmentBusy;
+  updateAttachmentControls();
+  updateSendPromptAction(conversation);
+  elements.cancel.disabled = !promptIsActive(conversation);
+  renderConnectionStatus();
+}
+
+function startNewConversation({ discardDraft = false } = {}) {
+  if (state.deletingSessionId && !discardDraft) {
+    return;
+  }
+  if (!discardDraft) {
+    persistComposerDraft();
+  }
+
+  const pendingDraft = discardDraft
+    ? ""
+    : state.activeSessionId
+      ? state.composer.draft
+      : elements.input.value;
+  const pendingAttachments = discardDraft
+    ? []
+    : state.composer.attachments.map((attachment) => ({ ...attachment }));
+  const configOverrides = discardDraft
+    ? {}
+    : { ...state.composer.configOverrides };
+  state.composer = createConversationState();
+  state.composer.draft = pendingDraft;
+  state.composer.attachments = pendingAttachments;
+  state.composer.configOverrides = configOverrides;
+  state.composer.loaded = true;
+  state.composer.sessionContext = state.selectedContext;
+  state.composer.activeSessionIsNew = true;
+  activateComposerConversation();
+  void loadContextDefaults(state.selectedContext);
+  elements.input.focus();
+}
+
 function applyFallbackConversationTitle(queuedPrompt, conversation) {
   if (!conversation.activeSessionIsNew || conversation.activeSessionTitleOverride) {
     return;
@@ -2822,7 +2957,7 @@ function applyFallbackConversationTitle(queuedPrompt, conversation) {
   renderSessionList();
 }
 
-async function createConversation() {
+async function createServerConversation() {
   if (state.deletingSessionId) {
     return null;
   }
@@ -2831,10 +2966,16 @@ async function createConversation() {
   const pendingAttachments = state.activeSessionId
     ? []
     : state.composer.attachments.map((attachment) => ({ ...attachment }));
+  const configOverrides = state.activeSessionId
+    ? {}
+    : selectedNewSessionConfigOverrides(state.composer);
   try {
     const result = await api("/api/sessions", {
       method: "POST",
-      body: JSON.stringify({ context: state.selectedContext })
+      body: JSON.stringify({
+        context: state.selectedContext,
+        configOverrides
+      })
     });
     const session = result.session;
     upsertSession(session);
@@ -2853,6 +2994,7 @@ async function createConversation() {
     state.newSessionDefaults = result.newSessionDefaults ?? state.newSessionDefaults;
     applySessionSetup(result, state.selectedContext, conversation);
     state.composer = createConversationState();
+    state.activeSessionId = session.sessionId;
     activateConversation(session.sessionId);
     setStatus("Ready", conversation);
     elements.input.focus();
@@ -2926,6 +3068,7 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
   conversation.promptQueue = [];
   resetStreamTracking(conversation);
   resetUsage(conversation);
+  const usageRevision = conversation.usageRevision;
   conversation.configOptions = [];
   setLoading(true, conversation);
   setStatus("Loading conversation...", conversation);
@@ -2945,7 +3088,7 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
       conversation.activeSessionIsNew = false;
       session.title = result.session.customTitle;
     }
-    applySessionUsage(result.usage, conversation);
+    applySessionUsage(result.usage, conversation, usageRevision);
     const replayUpdates = Array.isArray(result.replayUpdates)
       ? result.replayUpdates
       : [];
@@ -2999,7 +3142,9 @@ async function changeContext(value) {
   state.selectedContext = value;
   saveContextPreference(value);
   const conversation = activeConversation();
-  if (!conversation) {
+  if (!conversation.sessionId) {
+    state.composer.sessionContext = value;
+    setStatus("The selected context will apply to your first message", conversation);
     void loadContextDefaults(value);
     renderConfigurationControls();
     return;
@@ -3024,7 +3169,7 @@ async function changeContext(value) {
 }
 
 async function changeConfigOption(configId, value) {
-  const conversation = activeConversation();
+  const conversation = activeConversation() ?? state.composer;
   if (
     !conversation ||
     conversation.busy ||
@@ -3033,6 +3178,25 @@ async function changeConfigOption(configId, value) {
     typeof value !== "string" ||
     value.length === 0
   ) {
+    return;
+  }
+
+  if (!conversation.sessionId) {
+    const option = conversation.configOptions.find((candidate) => candidate.id === configId);
+    if (
+      !option ||
+      !configOptionValues(option).some((candidate) => candidate.value === value)
+    ) {
+      return;
+    }
+    conversation.configOverrides[configId] = value;
+    conversation.configOptions = conversation.configOptions.map((candidate) => (
+      candidate.id === configId
+        ? { ...candidate, currentValue: value }
+        : candidate
+    ));
+    renderConfigurationControls();
+    setStatus("This setting will apply to your first message", conversation);
     return;
   }
 
@@ -3170,13 +3334,13 @@ async function sendPrompt(event) {
   }
 
   if (!state.activeSessionId) {
-    conversation = await createConversation() ?? activeConversation();
+    conversation = await createServerConversation() ?? activeConversation();
   }
   if (!conversation?.sessionId) {
     return;
   }
   if (conversation.messages.length === 0 && conversation.sessionContext !== state.selectedContext) {
-    conversation = await createConversation() ?? activeConversation();
+    conversation = await createServerConversation() ?? activeConversation();
   }
   if (!conversation?.sessionId) {
     return;
@@ -3406,7 +3570,16 @@ function connectEvents() {
 }
 
 elements.newChat.addEventListener("click", () => {
-  void createConversation();
+  startNewConversation();
+});
+elements.renameInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") {
+    return;
+  }
+  event.preventDefault();
+  if (!event.isComposing) {
+    elements.renameForm.requestSubmit(elements.renameConfirm);
+  }
 });
 elements.sessionList.addEventListener("click", (event) => {
   const button = event.target.closest("button.session-item");
