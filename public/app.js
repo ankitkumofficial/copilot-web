@@ -194,6 +194,8 @@ const elements = {
   permissionOptions: document.querySelector("#permission-options"),
   permissionCancel: document.querySelector("#permission-cancel"),
   deleteDialog: document.querySelector("#delete-dialog"),
+  deleteForm: document.querySelector("#delete-form"),
+  deleteConfirm: document.querySelector("#delete-confirm"),
   deleteTitle: document.querySelector("#delete-title"),
   deleteDescription: document.querySelector("#delete-description"),
   renameDialog: document.querySelector("#rename-dialog"),
@@ -428,8 +430,11 @@ function applyNewSessionConfigOverrides(configOptions, overrides) {
 
 function selectedNewSessionConfigOverrides(conversation) {
   return Object.fromEntries(
-    ["model", "reasoning_effort"].flatMap((configId) => {
-      const value = conversation.configOverrides[configId];
+    [
+      ["model", elements.modelSelect],
+      ["reasoning_effort", elements.reasoningSelect]
+    ].flatMap(([configId, select]) => {
+      const value = select.value;
       const option = conversation.configOptions.find((candidate) => (
         candidate.id === configId
       ));
@@ -448,7 +453,9 @@ function renderConfigurationControls() {
   const reasoning = findConfigOption(["reasoning_effort"], "thought_level", configuration);
   renderConfigSelect(elements.modelSelect, model, "Unavailable", conversation);
   renderConfigSelect(elements.reasoningSelect, reasoning, "Unavailable", conversation);
-  elements.contextSelect.value = conversation?.sessionContext ?? state.selectedContext;
+  elements.contextSelect.value = conversation?.messages.length === 0
+    ? state.selectedContext
+    : conversation?.sessionContext ?? state.selectedContext;
   elements.contextSelect.disabled = Boolean(
     conversation &&
     (conversation.busy || conversation.loading || conversation.configurationBusy)
@@ -461,37 +468,73 @@ function applySessionSetup(result, context, conversation = activeConversation() 
   renderConfigurationControls();
 }
 
-async function loadContextDefaults(context) {
+async function loadContextDefaults(context, resetToCopilotDefaults = false) {
   const requestId = ++defaultsRequestId;
   const composer = state.composer;
+  const previousConfigOptions = composer.configOptions;
   const loadingComposerDefaults = !state.activeSessionId;
+  const selectedModel = composer.configOverrides.model ?? state.newSessionDefaults?.model;
+  const query = resetToCopilotDefaults
+    ? ""
+    : `?context=${encodeURIComponent(context)}${
+        typeof selectedModel === "string" && selectedModel.length > 0
+          ? `&model=${encodeURIComponent(selectedModel)}`
+          : ""
+      }`;
   composer.configOptions = [];
   if (loadingComposerDefaults) {
     composer.configurationBusy = true;
+    elements.send.disabled = composer.loading ||
+      composer.configurationBusy ||
+      composer.attachmentBusy;
   }
   renderConfigurationControls();
   try {
-    const result = await api(`/api/config?context=${encodeURIComponent(context)}`);
+    const result = await api(`/api/config${query}`);
     if (
       requestId !== defaultsRequestId ||
       state.activeSessionId ||
-      state.selectedContext !== context
+      (!resetToCopilotDefaults && state.selectedContext !== context)
     ) {
-      return;
+      return false;
     }
     state.newSessionDefaults = result.newSessionDefaults ?? state.newSessionDefaults;
-    state.composer.configOptions = applyNewSessionConfigOverrides(
+    const effectiveContext = resetToCopilotDefaults ? result.context : context;
+    if (!contextPreferences.includes(effectiveContext)) {
+      throw new Error("Copilot returned an invalid context profile");
+    }
+    if (resetToCopilotDefaults) {
+      state.selectedContext = effectiveContext;
+      composer.sessionContext = effectiveContext;
+      saveContextPreference(effectiveContext);
+    }
+    const configOptions = Array.isArray(result.configOptions) ? result.configOptions : [];
+    for (const configId of ["model", "reasoning_effort"]) {
+      const value = composer.configOverrides[configId];
+      const option = configOptions.find((candidate) => candidate.id === configId);
+      if (
+        typeof value === "string" &&
+        !configOptionValues(option).some((candidate) => candidate.value === value)
+      ) {
+        delete composer.configOverrides[configId];
+      }
+    }
+    composer.configOptions = applyNewSessionConfigOverrides(
       applyNewSessionDefaults(
-        Array.isArray(result.configOptions) ? result.configOptions : [],
+        configOptions,
         state.newSessionDefaults
       ),
-      state.composer.configOverrides
+      composer.configOverrides
     );
     renderConfigurationControls();
+    return true;
   } catch (error) {
     if (requestId === defaultsRequestId && !state.activeSessionId) {
+      composer.configOptions = previousConfigOptions;
+      renderConfigurationControls();
       showError(error);
     }
+    return false;
   } finally {
     if (
       loadingComposerDefaults &&
@@ -2917,18 +2960,14 @@ function startNewConversation({ discardDraft = false } = {}) {
   const pendingAttachments = discardDraft
     ? []
     : state.composer.attachments.map((attachment) => ({ ...attachment }));
-  const configOverrides = discardDraft
-    ? {}
-    : { ...state.composer.configOverrides };
   state.composer = createConversationState();
   state.composer.draft = pendingDraft;
   state.composer.attachments = pendingAttachments;
-  state.composer.configOverrides = configOverrides;
   state.composer.loaded = true;
   state.composer.sessionContext = state.selectedContext;
   state.composer.activeSessionIsNew = true;
   activateComposerConversation();
-  void loadContextDefaults(state.selectedContext);
+  void loadContextDefaults(state.selectedContext, true);
   elements.input.focus();
 }
 
@@ -3145,8 +3184,13 @@ async function changeContext(value) {
   if (!conversation.sessionId) {
     state.composer.sessionContext = value;
     setStatus("The selected context will apply to your first message", conversation);
-    void loadContextDefaults(value);
-    renderConfigurationControls();
+    const updated = await loadContextDefaults(value);
+    if (!updated && state.composer === conversation && !state.activeSessionId) {
+      state.selectedContext = previousContext;
+      saveContextPreference(previousContext);
+      conversation.sessionContext = previousContext;
+      renderConfigurationControls();
+    }
     return;
   }
   if (conversation.sessionContext === value) {
@@ -3182,6 +3226,8 @@ async function changeConfigOption(configId, value) {
   }
 
   if (!conversation.sessionId) {
+    const previousConfigOptions = conversation.configOptions;
+    const previousConfigOverrides = { ...conversation.configOverrides };
     const option = conversation.configOptions.find((candidate) => candidate.id === configId);
     if (
       !option ||
@@ -3196,7 +3242,19 @@ async function changeConfigOption(configId, value) {
         : candidate
     ));
     renderConfigurationControls();
-    setStatus("This setting will apply to your first message", conversation);
+    if (configId === "model") {
+      setStatus("Updating settings for the selected model...", conversation);
+      const updated = await loadContextDefaults(state.selectedContext);
+      if (updated && state.composer === conversation && !state.activeSessionId) {
+        setStatus("This setting will apply to your first message", conversation);
+      } else if (state.composer === conversation && !state.activeSessionId) {
+        conversation.configOptions = previousConfigOptions;
+        conversation.configOverrides = previousConfigOverrides;
+        renderConfigurationControls();
+      }
+    } else {
+      setStatus("This setting will apply to your first message", conversation);
+    }
     return;
   }
 
@@ -3580,6 +3638,13 @@ elements.renameInput.addEventListener("keydown", (event) => {
   if (!event.isComposing) {
     elements.renameForm.requestSubmit(elements.renameConfirm);
   }
+});
+elements.deleteDialog.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.isComposing) {
+    return;
+  }
+  event.preventDefault();
+  elements.deleteForm.requestSubmit(elements.deleteConfirm);
 });
 elements.sessionList.addEventListener("click", (event) => {
   const button = event.target.closest("button.session-item");
