@@ -276,6 +276,7 @@ export class AcpConnection {
 
     await this.sendRequest("session/close", { sessionId });
     this.activeSessions.delete(sessionId);
+    this.sessionConfigOptions.delete(sessionId);
   }
 
   public async prompt(
@@ -749,32 +750,84 @@ export class AcpConnectionManager {
     return connection.listSessions();
   }
 
-  public async discoverConfig(context: ContextTier): Promise<SessionSetup> {
+  public async discoverConfig(context: ContextTier, model?: string): Promise<SessionSetup> {
     const cached = this.profileDefaults.get(context);
-    if (cached) {
+    if (cached && model === undefined) {
       return cached;
     }
 
     const connection = await this.getConnection(context);
-    const setup = await connection.newSession(this.cwd);
-    if (connection.getCapabilities().sessionCapabilities.close) {
-      await connection.closeSession(setup.sessionId);
+    const canCloseSession = connection.getCapabilities().sessionCapabilities.close;
+    const reuseCachedSession = !canCloseSession && cached !== undefined;
+    const setup = reuseCachedSession
+      ? cached
+      : await connection.newSession(this.cwd);
+    if (!cached) {
+      this.profileDefaults.set(context, setup);
     }
-    this.profileDefaults.set(context, setup);
-    return setup;
+    const initialModel = setup.configOptions.find((option) => option.id === "model");
+    let configOptions = setup.configOptions;
+    let modelChanged = false;
+    try {
+      if (model !== undefined) {
+        if (!initialModel) {
+          throw new AcpError("Copilot does not expose the model session option");
+        }
+        if (!configOptionAcceptsValue(initialModel, model)) {
+          throw new AcpError(`Copilot does not support model=${model}`);
+        }
+        if (initialModel.currentValue !== model) {
+          if (!canCloseSession && typeof initialModel.currentValue !== "string") {
+            throw new AcpError("Copilot cannot safely preview a model without its current value");
+          }
+          modelChanged = true;
+          configOptions = await connection.setConfigOption(setup.sessionId, "model", model);
+        }
+      }
+      return {
+        ...setup,
+        configOptions
+      };
+    } finally {
+      if (canCloseSession && !reuseCachedSession) {
+        await connection.closeSession(setup.sessionId);
+      } else if (
+        modelChanged &&
+        typeof initialModel?.currentValue === "string"
+      ) {
+        await connection.setConfigOption(
+          setup.sessionId,
+          "model",
+          initialModel.currentValue
+        );
+      }
+    }
   }
 
   public async newSession(
     cwd: string,
     context: ContextTier,
-    configOverrides?: Readonly<Record<string, string | boolean>>
+    configOverrides?: Readonly<Record<string, string | boolean>>,
+    fallbackConfigIds: ReadonlySet<string> = new Set()
   ): Promise<SessionSetup> {
     const connection = await this.getConnection(context);
     const setup = await connection.newSession(cwd);
-    const configuredSetup = await this.applySessionConfig(connection, setup, configOverrides);
-    this.rememberSessionConfig(configuredSetup.sessionId, configuredSetup.configOptions);
-    this.sessionContexts.set(configuredSetup.sessionId, context);
-    return configuredSetup;
+    try {
+      const configuredSetup = await this.applySessionConfig(
+        connection,
+        setup,
+        configOverrides,
+        fallbackConfigIds
+      );
+      this.rememberSessionConfig(configuredSetup.sessionId, configuredSetup.configOptions);
+      this.sessionContexts.set(configuredSetup.sessionId, context);
+      return configuredSetup;
+    } catch (error) {
+      if (connection.getCapabilities().sessionCapabilities.close) {
+        await connection.closeSession(setup.sessionId);
+      }
+      throw error;
+    }
   }
 
   public async loadSession(session: SessionInfo, context: ContextTier): Promise<SessionSetup> {
@@ -925,7 +978,8 @@ export class AcpConnectionManager {
   private async applySessionConfig(
     connection: AcpConnection,
     setup: SessionSetup,
-    configOverrides?: Readonly<Record<string, string | boolean>>
+    configOverrides?: Readonly<Record<string, string | boolean>>,
+    fallbackConfigIds: ReadonlySet<string> = new Set()
   ): Promise<SessionSetup> {
     let configOptions = setup.configOptions;
     const requestedValues = configOverrides
@@ -940,15 +994,24 @@ export class AcpConnectionManager {
         })
         .filter((entry): entry is readonly [string, string | boolean] => entry !== undefined);
 
+    requestedValues.sort(([leftId], [rightId]) => (
+      leftId === "model" ? -1 : rightId === "model" ? 1 : 0
+    ));
     for (const [configId, value] of requestedValues) {
       const option = configOptions.find((candidate) => candidate.id === configId);
       if (!option) {
+        if (fallbackConfigIds.has(configId)) {
+          continue;
+        }
         if (configOverrides) {
           throw new AcpError(`Copilot does not expose the ${configId} session option`);
         }
         continue;
       }
       if (!configOptionAcceptsValue(option, value)) {
+        if (fallbackConfigIds.has(configId)) {
+          continue;
+        }
         throw new AcpError(`Copilot does not support ${configId}=${String(value)}`);
       }
       configOptions = await connection.setConfigOption(
