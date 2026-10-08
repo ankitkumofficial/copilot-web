@@ -83,6 +83,10 @@ function createConversationState(sessionId = null) {
       aicNano: null,
       aicLimit: null
     },
+    contextUsage: {
+      used: null,
+      size: null
+    },
     usageRevision: 0,
     status: "Ready",
     busy: false,
@@ -176,7 +180,10 @@ const elements = {
   contextSelect: document.querySelector("#context-select"),
   reasoningSelect: document.querySelector("#reasoning-select"),
   usageSummary: document.querySelector("#usage-summary"),
+  usageAicMetric: document.querySelector("#usage-aic-metric"),
   usageAic: document.querySelector("#usage-aic"),
+  usageContextMetric: document.querySelector("#usage-context-metric"),
+  usageContext: document.querySelector("#usage-context"),
   messages: document.querySelector("#messages"),
   emptyState: document.querySelector("#empty-state"),
   loadingState: document.querySelector("#loading-state"),
@@ -1060,6 +1067,15 @@ function formatAic(nanoAiu) {
   return credits.toFixed(2).replace(/\.?0+$/, "");
 }
 
+const contextTokenFormatter = new Intl.NumberFormat(undefined, {
+  notation: "compact",
+  maximumFractionDigits: 1
+});
+
+function formatContextTokens(tokens) {
+  return contextTokenFormatter.format(tokens);
+}
+
 function renderUsage(conversation = activeConversation()) {
   if (conversation !== activeConversation()) {
     return;
@@ -1068,20 +1084,37 @@ function renderUsage(conversation = activeConversation()) {
     aicNano: null,
     aicLimit: null
   };
+  const { used, size } = conversation?.contextUsage ?? {
+    used: null,
+    size: null
+  };
   const hasAicUsage = Number.isFinite(aicNano);
-  if (!hasAicUsage) {
-    elements.usageSummary.hidden = true;
-    return;
-  }
+  const hasContextUsage = Number.isFinite(used) &&
+    used >= 0 &&
+    Number.isFinite(size) &&
+    size > 0;
 
-  elements.usageSummary.hidden = false;
-  elements.usageAic.textContent = hasAicUsage
-    ? `${formatAic(aicNano)} used${
+  elements.usageAicMetric.hidden = !hasAicUsage;
+  elements.usageContextMetric.hidden = !hasContextUsage;
+  elements.usageSummary.hidden = !hasAicUsage && !hasContextUsage;
+  if (hasAicUsage) {
+    elements.usageAic.textContent = `${formatAic(aicNano)} used${
       Number.isFinite(aicLimit) ? ` / ${formatAic(aicLimit)}` : ""
-    }`
-    : "";
+    }`;
+  }
+  if (hasContextUsage) {
+    elements.usageContext.textContent =
+      `${formatContextTokens(used)} / ${formatContextTokens(size)} tokens`;
+  }
   elements.usageSummary.title =
-    "AI credits used in the current conversation. Account-level quota is not included.";
+    "AIC is cumulative AI credit usage for this conversation; account-level quota is not included. Context shows the latest ACP-reported token usage.";
+}
+
+function resetContextUsage(conversation) {
+  conversation.contextUsage = {
+    used: null,
+    size: null
+  };
 }
 
 function resetUsage(conversation = activeConversation() ?? state.composer) {
@@ -1089,6 +1122,7 @@ function resetUsage(conversation = activeConversation() ?? state.composer) {
     aicNano: null,
     aicLimit: null
   };
+  resetContextUsage(conversation);
   conversation.usageRevision += 1;
   if (conversation === activeConversation()) {
     renderUsage(conversation);
@@ -1113,6 +1147,26 @@ function applySessionUsage(value, conversation, expectedRevision) {
       ? value.aicLimit
       : null
   };
+  if (conversation === activeConversation()) {
+    renderUsage(conversation);
+  }
+}
+
+function applyContextUsage(update, conversation) {
+  const used = update.used;
+  const size = update.size;
+  if (
+    typeof used !== "number" ||
+    !Number.isFinite(used) ||
+    used < 0 ||
+    typeof size !== "number" ||
+    !Number.isFinite(size) ||
+    size <= 0
+  ) {
+    return;
+  }
+
+  conversation.contextUsage = { used, size };
   if (conversation === activeConversation()) {
     renderUsage(conversation);
   }
@@ -2422,7 +2476,7 @@ function handleSessionUpdate(params, expectedSessionId = null) {
       addMessage("system", "Copilot is preparing a plan.", "plan", [], conversation);
       break;
     case "usage_update":
-      renderUsage(conversation);
+      applyContextUsage(update, conversation);
       setStatus("Copilot is working...", conversation);
       break;
     case "config_option_update":
@@ -3238,6 +3292,10 @@ async function changeConfigOption(configId, value) {
     conversation.configOptions = Array.isArray(result.configOptions)
       ? result.configOptions
       : [];
+    if (configId === "model") {
+      resetContextUsage(conversation);
+      renderUsage(conversation);
+    }
     setStatus("Ready", conversation);
   } catch (error) {
     showError(error, conversation);

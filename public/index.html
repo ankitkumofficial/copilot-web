@@ -111,8 +111,14 @@
                 </select>
               </label>
               <div id="usage-summary" class="usage-summary" hidden aria-live="polite">
-                <span class="usage-label">AIC</span>
-                <span id="usage-aic" class="usage-value usage-aic">— used</span>
+                <div id="usage-aic-metric" class="usage-metric" hidden>
+                  <span class="usage-label">AIC</span>
+                  <span id="usage-aic" class="usage-value usage-aic"></span>
+                </div>
+                <div id="usage-context-metric" class="usage-metric" hidden>
+                  <span class="usage-label">Context</span>
+                  <span id="usage-context" class="usage-value"></span>
+                </div>
               </div>
             </div>
             <div class="composer-actions" aria-label="Conversation actions">
