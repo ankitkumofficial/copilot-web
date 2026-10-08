@@ -48,16 +48,20 @@ navigate to repositories below that directory when prompted. Resumed sessions
 use the working directory recorded with the original session.
 
 Every click on **New conversation** reloads the Copilot CLI defaults from
-`~/.copilot/settings.json`: `model`, `contextTier`, and `effortLevel`. Browser
-settings from the previous conversation do not carry over. The backend applies
-these defaults to the ACP session before the first prompt. After starting a
-conversation, changes to model, context, or reasoning apply to its next prompt.
+`$COPILOT_HOME/settings.json` (default: `~/.copilot/settings.json`): `model`,
+`contextTier`, and `effortLevel`. Browser settings from the previous
+conversation do not carry over. The backend applies these defaults to the ACP
+session before the first prompt. After starting a conversation, changes to
+model, context, or reasoning apply to its next prompt.
 The model and reasoning controls use the options advertised by the installed
 Copilot CLI. Changing the model refreshes the available reasoning options using
 the selected context profile; an unsupported reasoning default falls back to
-the value advertised for that model. Context is implemented with Copilot's
-`default` and `long_context` process profiles. Switching context for an existing
-conversation reloads it through the selected local profile.
+the value advertised for that model. Context is passed explicitly to the CLI
+as `--context default` or `--context long_context`, and switching context for an
+existing conversation reloads it through the selected profile. However, some
+Copilot CLI releases do not apply the requested tier to ACP sessions; the
+context meter shows the actual size reported by ACP. See
+https://github.com/github/copilot-cli/issues/4275 for the upstream ACP issue.
 
 The theme control cycles through **System**, **Light**, and **Dark**. System
 follows the browser's `prefers-color-scheme` setting; an explicit light or dark
@@ -163,6 +167,7 @@ commands, MCP servers, and tool execution remain in the local CLI process.
 | --- | --- | --- |
 | `COPILOT_WEB_USER` | unset | User name used to derive the browser title, sidebar brand, brand mark, and ACP client title |
 | `PORT` | `8765` | Local HTTP port |
+| `COPILOT_HOME` | `~/.copilot` | Copilot CLI configuration directory; used to read `settings.json` |
 | `COPILOT_PROJECTS_DIR` | `~/projects` | Starting directory for new conversations |
 | `COPILOT_BIN` | `copilot` | Copilot CLI executable |
 | `COPILOT_ALLOW_ALL` | `false` | Pass `--allow-all` to the Copilot ACP process |
