@@ -41,7 +41,7 @@
   </head>
   <body>
     <div class="app-shell">
-      <aside class="sidebar">
+      <aside id="conversation-history-sidebar" class="sidebar">
         <div class="brand">
           <div class="brand-copy">
             <div id="brand-mark" class="brand-mark">C</div>
@@ -69,6 +69,17 @@
           <span id="connection-label">Connecting...</span>
         </div>
       </aside>
+      <div
+        id="sidebar-resizer"
+        class="sidebar-resizer"
+        role="separator"
+        aria-label="Resize conversation history"
+        aria-controls="conversation-history-sidebar"
+        aria-orientation="vertical"
+        aria-valuemin="220"
+        tabindex="0"
+        title="Drag or use the arrow keys to resize conversation history"
+      ></div>
 
       <main class="conversation">
         <section id="messages" class="messages" aria-live="polite">

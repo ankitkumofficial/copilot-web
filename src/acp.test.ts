@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,9 +7,15 @@ import test from "node:test";
 import { AcpConnectionManager, isRecord } from "./acp.js";
 
 const fakeCopilot = `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
 const readline = require("node:readline");
 const sessions = new Map();
 let nextSessionId = 0;
+fs.writeFileSync(
+  path.join(process.cwd(), "copilot-args.json"),
+  JSON.stringify(process.argv.slice(2))
+);
 
 function configOptions(session) {
   const codex = session.model === "gpt-5.3-codex";
@@ -86,9 +92,10 @@ input.on("line", (line) => {
 });
 `;
 
-test("previews model-specific reasoning options and falls back only for defaults", async () => {
+test("passes context tiers to the CLI and previews model-specific reasoning options", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-acp-test-"));
   const command = path.join(directory, "copilot-fake");
+  const argsFile = path.join(directory, "copilot-args.json");
   await writeFile(command, fakeCopilot);
   await chmod(command, 0o700);
 
@@ -99,6 +106,10 @@ test("previews model-specific reasoning options and falls back only for defaults
   });
   try {
     const preview = await acp.discoverConfig("default", "gpt-5.3-codex");
+    assert.deepEqual(
+      JSON.parse(await readFile(argsFile, "utf8")),
+      ["--acp", "--no-color"]
+    );
     const reasoning = preview.configOptions.find((option) => option.id === "reasoning_effort");
     assert.equal(reasoning?.currentValue, "high");
     const reasoningOptions = Array.isArray(reasoning?.options) ? reasoning.options : [];
@@ -107,6 +118,12 @@ test("previews model-specific reasoning options and falls back only for defaults
         .filter(isRecord)
         .map((option) => option.value),
       ["low", "high"]
+    );
+
+    await acp.discoverConfig("long_context", "gpt-6-luna");
+    assert.deepEqual(
+      JSON.parse(await readFile(argsFile, "utf8")),
+      ["--acp", "--no-color", "--context", "long_context"]
     );
 
     const configured = await acp.newSession(
