@@ -1208,6 +1208,10 @@ function renderUsage(conversation = activeConversation()) {
   elements.usageAicMetric.hidden = !hasAicUsage;
   elements.usageContextMetric.hidden = !hasContextUsage;
   elements.usageSummary.hidden = !hasAicUsage && !hasContextUsage;
+  elements.usageAicMetric.title =
+    "Cumulative AI credit usage for this conversation; account-level quota is not included.";
+  elements.usageContextMetric.title =
+    "Latest ACP-reported context usage: tokens used / total context-window size.";
   if (hasAicUsage) {
     elements.usageAic.textContent = `${formatAic(aicNano)} used${
       Number.isFinite(aicLimit) ? ` / ${formatAic(aicLimit)}` : ""
@@ -1217,8 +1221,6 @@ function renderUsage(conversation = activeConversation()) {
     elements.usageContext.textContent =
       `${formatContextTokens(used)} / ${formatContextTokens(size)} tokens`;
   }
-  elements.usageSummary.title =
-    "AIC is cumulative AI credit usage for this conversation; account-level quota is not included. Context shows the latest ACP-reported token usage.";
 }
 
 function resetContextUsage(conversation) {
@@ -1947,7 +1949,7 @@ function upsertThinking(update, conversation = activeConversation() ?? state.com
   }
   const group = ensureToolGroup(conversation);
   group.thinkingText = `${group.thinkingText ?? ""}${thought}`;
-  scheduleMessagesRender(conversation);
+  scheduleMessagesRender(conversation, group);
 }
 
 function upsertToolActivity(update, conversation = activeConversation() ?? state.composer) {
@@ -1980,7 +1982,19 @@ function upsertToolActivity(update, conversation = activeConversation() ?? state
   if (detail.length > 0) {
     activity.detail = detail;
   }
-  scheduleMessagesRender(conversation);
+  scheduleMessagesRender(conversation, group);
+}
+
+const renderedThinkingText = new WeakMap();
+
+function updateScrollableContent(element, update) {
+  const previousScrollTop = element.scrollTop;
+  const previousScrollLeft = element.scrollLeft;
+  const stickToBottom = element.clientHeight > 0 &&
+    element.scrollHeight - previousScrollTop - element.clientHeight <= 8;
+  update();
+  element.scrollLeft = previousScrollLeft;
+  element.scrollTop = stickToBottom ? element.scrollHeight : previousScrollTop;
 }
 
 function renderToolActivities(body, message) {
@@ -1988,91 +2002,196 @@ function renderToolActivities(body, message) {
   const thinkingText = typeof message.thinkingText === "string"
     ? message.thinkingText
     : "";
-  if (thinkingText.length > 0) {
-    const thinking = document.createElement("details");
-    thinking.className = "thinking-content";
-    thinking.open = message.thinkingExpanded === true;
-    thinking.addEventListener("toggle", () => {
-      message.thinkingExpanded = thinking.open;
-    });
-    const thinkingSummary = document.createElement("summary");
-    thinkingSummary.textContent = "Reasoning";
-    thinking.append(thinkingSummary);
-    const thinkingBody = document.createElement("div");
-    thinkingBody.className = "thinking-content-text";
-    thinkingBody.innerHTML = renderMarkdown(thinkingText);
-    thinking.append(thinkingBody);
-    body.append(thinking);
+  if (
+    !body.querySelector(".thinking-content, .tool-activity-panel") &&
+    (thinkingText.length > 0 || activities.length > 0)
+  ) {
+    body.replaceChildren();
   }
 
-  if (activities.length === 0) {
-    if (thinkingText.length === 0) {
-      body.textContent = "Copilot is working...";
+  let thinking = body.querySelector(".thinking-content");
+  if (thinkingText.length > 0) {
+    if (!thinking) {
+      thinking = document.createElement("details");
+      thinking.className = "thinking-content";
+      thinking.open = message.thinkingExpanded === true;
+      const thinkingSummary = document.createElement("summary");
+      thinkingSummary.textContent = "Reasoning";
+      const thinkingBody = document.createElement("div");
+      thinkingBody.className = "thinking-content-text";
+      thinking.append(thinkingSummary, thinkingBody);
+      thinking.addEventListener("toggle", () => {
+        message.thinkingExpanded = thinking.open;
+      });
+      const activityPanel = body.querySelector(".tool-activity-panel");
+      body.insertBefore(thinking, activityPanel);
     }
+    const thinkingBody = thinking.querySelector(".thinking-content-text");
+    if (
+      thinkingBody &&
+      renderedThinkingText.get(thinkingBody) !== thinkingText
+    ) {
+      updateScrollableContent(thinkingBody, () => {
+        thinkingBody.innerHTML = renderMarkdown(thinkingText);
+      });
+      renderedThinkingText.set(thinkingBody, thinkingText);
+    }
+  } else {
+    thinking?.remove();
+  }
+
+  let activityPanel = body.querySelector(".tool-activity-panel");
+  if (activities.length > 0) {
+    if (!activityPanel) {
+      activityPanel = document.createElement("details");
+      activityPanel.className = "tool-activity-panel";
+      activityPanel.open = message.toolActivitiesExpanded === true;
+      const summary = document.createElement("summary");
+      const list = document.createElement("ul");
+      list.className = "tool-activity-list";
+      activityPanel.append(summary, list);
+      activityPanel.addEventListener("toggle", () => {
+        message.toolActivitiesExpanded = activityPanel.open;
+      });
+      body.append(activityPanel);
+    }
+
+    const activeCount = activities.filter((activity) => (
+      activity.status === "pending" || activity.status === "in_progress"
+    )).length;
+    const summary = activityPanel.querySelector("summary");
+    const summaryText = activeCount > 0
+      ? `Activities (${activities.length}) · In progress`
+      : `Activities (${activities.length})`;
+    if (summary.textContent !== summaryText) {
+      summary.textContent = summaryText;
+    }
+
+    const list = activityPanel.querySelector(".tool-activity-list");
+    updateScrollableContent(list, () => {
+      const existingItems = new Map(
+        Array.from(list.children).map((item) => [item.dataset.activityId, item])
+      );
+      activities.forEach((activity, index) => {
+        let item = existingItems.get(activity.id);
+        if (!item) {
+          item = document.createElement("li");
+          item.dataset.activityId = activity.id;
+          const status = document.createElement("span");
+          status.className = "tool-activity-status";
+          const title = document.createElement("span");
+          title.className = "tool-activity-title";
+          item.append(status, title);
+        }
+        const itemClass = `tool-activity-item tool-status-${toolStatusClass(activity.status)}`;
+        if (item.className !== itemClass) {
+          item.className = itemClass;
+        }
+        const status = item.querySelector(".tool-activity-status");
+        const statusText = toolStatusLabel(activity.status);
+        if (status.textContent !== statusText) {
+          status.textContent = statusText;
+        }
+        const title = item.querySelector(".tool-activity-title");
+        if (title.textContent !== activity.title) {
+          title.textContent = activity.title;
+        }
+
+        let detail = item.querySelector(".tool-activity-detail");
+        if (typeof activity.detail === "string" && activity.detail.length > 0) {
+          if (!detail) {
+            detail = document.createElement("span");
+            detail.className = "tool-activity-detail";
+            item.append(detail);
+          }
+          if (detail.textContent !== activity.detail) {
+            updateScrollableContent(detail, () => {
+              detail.textContent = activity.detail;
+            });
+          }
+        } else {
+          detail?.remove();
+        }
+
+        const currentItem = list.children[index];
+        if (currentItem !== item) {
+          list.insertBefore(item, currentItem ?? null);
+        }
+        existingItems.delete(activity.id);
+      });
+      for (const item of existingItems.values()) {
+        item.remove();
+      }
+    });
+  } else {
+    activityPanel?.remove();
+  }
+
+  if (!body.querySelector(".thinking-content, .tool-activity-panel")) {
+    body.textContent = "Copilot is working...";
+  }
+}
+
+function renderMessageBody(body, message) {
+  if (message.role === "tool") {
+    renderToolActivities(body, message);
     return;
   }
 
-  const activeCount = activities.filter((activity) => (
-    activity.status === "pending" || activity.status === "in_progress"
-  )).length;
-  const details = document.createElement("details");
-  details.className = "tool-activity-panel";
-  details.open = message.toolActivitiesExpanded === true;
-  details.addEventListener("toggle", () => {
-    message.toolActivitiesExpanded = details.open;
-  });
-
-  const summary = document.createElement("summary");
-  summary.textContent = activeCount > 0
-    ? `Activities (${activities.length}) · In progress`
-    : `Activities (${activities.length})`;
-  details.append(summary);
-
-  const list = document.createElement("ul");
-  list.className = "tool-activity-list";
-  for (const activity of activities) {
-    const item = document.createElement("li");
-    item.className = `tool-activity-item tool-status-${toolStatusClass(activity.status)}`;
-
-    const status = document.createElement("span");
-    status.className = "tool-activity-status";
-    status.textContent = toolStatusLabel(activity.status);
-
-    const title = document.createElement("span");
-    title.className = "tool-activity-title";
-    title.textContent = activity.title;
-    item.append(status, title);
-
-    if (typeof activity.detail === "string" && activity.detail.length > 0) {
-      const detail = document.createElement("span");
-      detail.className = "tool-activity-detail";
-      detail.textContent = activity.detail;
-      item.append(detail);
+  body.replaceChildren();
+  if (message.role === "assistant") {
+    body.innerHTML = renderMarkdown(message.text);
+  } else {
+    if (message.text) {
+      const text = document.createElement("div");
+      text.className = "message-text";
+      text.textContent = message.text;
+      body.append(text);
     }
-    list.append(item);
+    renderMessageAttachments(body, message.attachments);
   }
-  details.append(list);
-  body.append(details);
 }
 
 let messagesRenderScheduled = false;
+const pendingMessageUpdates = new Map();
 
-function scheduleMessagesRender(conversation = activeConversation()) {
+function scheduleMessagesRender(conversation = activeConversation(), message = null) {
   if (!isActiveConversation(conversation)) {
     return;
   }
-  if (messagesRenderScheduled) {
-    return;
+  let pending = pendingMessageUpdates.get(conversation);
+  if (!pending) {
+    pending = { fullRender: false, messages: new Set() };
+    pendingMessageUpdates.set(conversation, pending);
   }
-  messagesRenderScheduled = true;
-  const render = () => {
-    messagesRenderScheduled = false;
-    renderMessages();
-  };
-  if (typeof window.requestAnimationFrame === "function") {
-    window.requestAnimationFrame(render);
+  if (message) {
+    pending.messages.add(message);
   } else {
-    window.setTimeout(render, 0);
+    pending.fullRender = true;
+  }
+  if (!messagesRenderScheduled) {
+    messagesRenderScheduled = true;
+    const render = () => {
+      messagesRenderScheduled = false;
+      const updates = Array.from(pendingMessageUpdates.entries());
+      pendingMessageUpdates.clear();
+      for (const [targetConversation, update] of updates) {
+        if (!isActiveConversation(targetConversation)) {
+          continue;
+        }
+        if (
+          update.fullRender ||
+          !updateMessagesInPlace(targetConversation, update.messages)
+        ) {
+          renderMessages(targetConversation);
+        }
+      }
+    };
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(render);
+    } else {
+      window.setTimeout(render, 0);
+    }
   }
 }
 
@@ -2146,10 +2265,25 @@ function renderMessageAttachments(body, attachments) {
   }
 }
 
+function messagePanelScrollKey(panel) {
+  if (panel.classList.contains("thinking-content-text")) {
+    return "thinking";
+  }
+  if (panel.classList.contains("tool-activity-list")) {
+    return "activities";
+  }
+  if (panel.classList.contains("tool-activity-detail")) {
+    const activityId = panel.closest(".tool-activity-item")?.dataset.activityId;
+    return typeof activityId === "string" ? `activity-detail:${activityId}` : null;
+  }
+  return null;
+}
+
 function captureMessagePanelScroll(conversation) {
   const positions = new Map();
   const messageElements = elements.messages.querySelectorAll(".message");
-  messageElements.forEach((article, index) => {
+  messageElements.forEach((article) => {
+    const index = Number(article.dataset.messageIndex);
     const message = conversation.messages[index];
     if (!message) {
       return;
@@ -2160,11 +2294,19 @@ function captureMessagePanelScroll(conversation) {
     if (panels.length === 0) {
       return;
     }
-    positions.set(message, Array.from(panels).map((panel) => ({
-      scrollLeft: panel.scrollLeft,
-      scrollTop: panel.scrollTop,
-      stickToBottom: panel.scrollHeight - panel.scrollTop - panel.clientHeight <= 8
-    })));
+    const panelPositions = new Map();
+    panels.forEach((panel) => {
+      const key = messagePanelScrollKey(panel);
+      if (key) {
+        panelPositions.set(key, {
+          scrollLeft: panel.scrollLeft,
+          scrollTop: panel.scrollTop,
+          stickToBottom: panel.clientHeight > 0 &&
+            panel.scrollHeight - panel.scrollTop - panel.clientHeight <= 8
+        });
+      }
+    });
+    positions.set(message, panelPositions);
   });
   return positions;
 }
@@ -2177,8 +2319,9 @@ function restoreMessagePanelScroll(article, message, positions) {
   const panels = article.querySelectorAll(
     ".thinking-content-text, .tool-activity-list, .tool-activity-detail"
   );
-  panels.forEach((panel, index) => {
-    const saved = savedPositions[index];
+  panels.forEach((panel) => {
+    const key = messagePanelScrollKey(panel);
+    const saved = key ? savedPositions.get(key) : null;
     if (!saved) {
       return;
     }
@@ -2187,6 +2330,41 @@ function restoreMessagePanelScroll(article, message, positions) {
       ? panel.scrollHeight
       : saved.scrollTop;
   });
+}
+
+function updateMessagesInPlace(conversation, messages) {
+  const articlesByIndex = new Map();
+  elements.messages.querySelectorAll(".message").forEach((article) => {
+    const index = Number(article.dataset.messageIndex);
+    if (Number.isInteger(index)) {
+      articlesByIndex.set(index, article);
+    }
+  });
+  const updates = Array.from(messages, (message) => {
+    const index = conversation.messages.indexOf(message);
+    const article = articlesByIndex.get(index);
+    const body = article?.querySelector(".message-body");
+    return body ? { body, message } : null;
+  });
+  if (updates.some((update) => !update)) {
+    return false;
+  }
+
+  const wasAtBottom = elements.messages.scrollHeight -
+    elements.messages.scrollTop -
+    elements.messages.clientHeight < 80;
+  const previousScrollTop = elements.messages.scrollTop;
+  const previousScrollLeft = elements.messages.scrollLeft;
+  for (const update of updates) {
+    renderMessageBody(update.body, update.message);
+  }
+  if (wasAtBottom) {
+    elements.messages.scrollTop = elements.messages.scrollHeight;
+  } else {
+    elements.messages.scrollTop = previousScrollTop;
+    elements.messages.scrollLeft = previousScrollLeft;
+  }
+  return true;
 }
 
 function renderMessages(conversation = activeConversation()) {
@@ -2217,9 +2395,10 @@ function renderMessages(conversation = activeConversation()) {
   }
 
   elements.emptyState.hidden = true;
-  for (const message of conversation.messages) {
+  for (const [index, message] of conversation.messages.entries()) {
     const article = document.createElement("article");
     article.className = `message ${message.role}`;
+    article.dataset.messageIndex = String(index);
     const header = document.createElement("div");
     header.className = "message-header";
     const label = document.createElement("div");
@@ -2249,19 +2428,7 @@ function renderMessages(conversation = activeConversation()) {
     }
     const body = document.createElement("div");
     body.className = "message-body";
-    if (message.role === "assistant") {
-      body.innerHTML = renderMarkdown(message.text);
-    } else if (message.role === "tool") {
-      renderToolActivities(body, message);
-    } else {
-      if (message.text) {
-        const text = document.createElement("div");
-        text.className = "message-text";
-        text.textContent = message.text;
-        body.append(text);
-      }
-      renderMessageAttachments(body, message.attachments);
-    }
+    renderMessageBody(body, message);
     article.append(header, body);
     elements.messages.append(article);
     restoreMessagePanelScroll(article, message, panelScrollPositions);
@@ -2478,7 +2645,7 @@ function addMessage(
       if (attachments.length > 0) {
         message.attachments = [...(message.attachments ?? []), ...attachments];
       }
-      scheduleMessagesRender(conversation);
+      scheduleMessagesRender(conversation, message);
       return;
     }
   }
@@ -2489,7 +2656,7 @@ function addMessage(
   if (key) {
     conversation.messageKeys.set(key, index);
   }
-  scheduleMessagesRender(conversation);
+  scheduleMessagesRender(conversation, message);
 }
 
 function contentText(content) {
