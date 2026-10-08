@@ -1773,43 +1773,13 @@ function updateContentText(update) {
   return typeof update.text === "string" ? update.text : "";
 }
 
-function appendThinkingChunk(previous, chunk) {
-  if (!previous || !chunk) {
-    return `${previous}${chunk}`;
-  }
-  if (/\s$/.test(previous)) {
-    return `${previous}${chunk}`;
-  }
-
-  const leadingWhitespace = chunk.match(/^\s*/)?.[0] ?? "";
-  const nextChunk = chunk.slice(leadingWhitespace.length);
-  const startsWithBoldTitle = /^(?:\*\*|__)(?=\S)/.test(nextChunk);
-  const previousEndsThought = /[.!?:](?:["')\]]*)$/.test(previous);
-  if (startsWithBoldTitle && previousEndsThought) {
-    return `${previous}\n${nextChunk}`;
-  }
-  if (/^\s/.test(chunk)) {
-    return `${previous}${chunk}`;
-  }
-
-  const nextVisibleCharacter = chunk.match(/^(?:[*_~`>#-]+\s*)*([A-Za-z])/);
-  if (
-    /[A-Za-z0-9]$/.test(previous) &&
-    nextVisibleCharacter &&
-    /[A-Z]/.test(nextVisibleCharacter[1])
-  ) {
-    return `${previous}\n${chunk}`;
-  }
-  return `${previous}${chunk}`;
-}
-
 function upsertThinking(update, conversation = activeConversation() ?? state.composer) {
   const thought = updateContentText(update);
   if (thought.length === 0) {
     return;
   }
   const group = ensureToolGroup(conversation);
-  group.thinkingText = appendThinkingChunk(group.thinkingText ?? "", thought);
+  group.thinkingText = `${group.thinkingText ?? ""}${thought}`;
   scheduleMessagesRender(conversation);
 }
 
