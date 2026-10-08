@@ -12,6 +12,7 @@ const path = require("node:path");
 const readline = require("node:readline");
 const sessions = new Map();
 let nextSessionId = 0;
+const configCallsFile = path.join(process.cwd(), "copilot-config-calls.jsonl");
 fs.writeFileSync(
   path.join(process.cwd(), "copilot-args.json"),
   JSON.stringify(process.argv.slice(2))
@@ -73,6 +74,13 @@ input.on("line", (line) => {
     }
     case "session/set_config_option": {
       const session = sessions.get(request.params.sessionId);
+      fs.appendFileSync(
+        configCallsFile,
+        JSON.stringify({
+          configId: request.params.configId,
+          value: request.params.value
+        }) + "\\n"
+      );
       if (request.params.configId === "model") {
         session.model = request.params.value;
         session.reasoningEffort = undefined;
@@ -96,6 +104,7 @@ test("passes context tiers to the CLI and previews model-specific reasoning opti
   const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-acp-test-"));
   const command = path.join(directory, "copilot-fake");
   const argsFile = path.join(directory, "copilot-args.json");
+  const configCallsFile = path.join(directory, "copilot-config-calls.jsonl");
   await writeFile(command, fakeCopilot);
   await chmod(command, 0o700);
 
@@ -108,7 +117,7 @@ test("passes context tiers to the CLI and previews model-specific reasoning opti
     const preview = await acp.discoverConfig("default", "gpt-5.3-codex");
     assert.deepEqual(
       JSON.parse(await readFile(argsFile, "utf8")),
-      ["--acp", "--no-color"]
+      ["--context", "default", "--acp", "--no-color"]
     );
     const reasoning = preview.configOptions.find((option) => option.id === "reasoning_effort");
     assert.equal(reasoning?.currentValue, "high");
@@ -123,8 +132,15 @@ test("passes context tiers to the CLI and previews model-specific reasoning opti
     await acp.discoverConfig("long_context", "gpt-6-luna");
     assert.deepEqual(
       JSON.parse(await readFile(argsFile, "utf8")),
-      ["--acp", "--no-color", "--context", "long_context"]
+      ["--context", "long_context", "--acp", "--no-color"]
     );
+
+    await writeFile(configCallsFile, "");
+    await acp.newSession(directory, "default", {
+      model: "gpt-6-luna",
+      reasoning_effort: "max"
+    });
+    assert.equal(await readFile(configCallsFile, "utf8"), "");
 
     const configured = await acp.newSession(
       directory,

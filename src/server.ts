@@ -69,7 +69,7 @@ const contextOptions = [
   {
     value: "default",
     name: "Default",
-    description: "Use Copilot's configured default context profile."
+    description: "Use Copilot's default context tier."
   },
   {
     value: "long_context",
@@ -815,7 +815,10 @@ function isModelConfigOption(option: JsonObject): boolean {
 }
 
 async function readCopilotDefaults(): Promise<NewSessionDefaults> {
-  const settingsPath = path.join(os.homedir(), ".copilot", "settings.json");
+  const copilotHome = process.env.COPILOT_HOME
+    ? expandHome(process.env.COPILOT_HOME)
+    : path.join(os.homedir(), ".copilot");
+  const settingsPath = path.join(path.resolve(copilotHome), "settings.json");
   let parsed: unknown;
   try {
     parsed = JSON.parse(await readFile(settingsPath, "utf8")) as unknown;
