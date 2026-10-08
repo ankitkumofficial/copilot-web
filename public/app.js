@@ -870,6 +870,18 @@ function renderTable(header, alignments, rows) {
   `;
 }
 
+function splitAttachedBoldTitle(line) {
+  const match = line.match(/^(.+[.!?])(\*\*|__)([A-Z][^*\n]*?)\2[ \t]*$/);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    paragraph: match[1],
+    title: `${match[2]}${match[3]}${match[2]}`
+  };
+}
+
 function renderMarkdown(value) {
   const lines = String(value).replace(/\r\n?/g, "\n").split("\n");
   const blocks = [];
@@ -996,6 +1008,15 @@ function renderMarkdown(value) {
         index += 1;
       }
       blocks.push(`<ol>${items.join("")}</ol>`);
+      continue;
+    }
+
+    const attachedTitle = splitAttachedBoldTitle(line);
+    if (attachedTitle) {
+      paragraph.push(attachedTitle.paragraph);
+      flushParagraph();
+      blocks.push(`<p>${renderInlineMarkdown(attachedTitle.title)}</p>`);
+      index += 1;
       continue;
     }
 
