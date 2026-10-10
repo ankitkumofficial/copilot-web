@@ -176,6 +176,7 @@ const elements = {
   themeToggle: document.querySelector("#theme-toggle"),
   sidebarToggle: document.querySelector("#sidebar-toggle"),
   appShell: document.querySelector(".app-shell"),
+  sidebarResizer: document.querySelector("#sidebar-resizer"),
   modelSelect: document.querySelector("#model-select"),
   contextSelect: document.querySelector("#context-select"),
   reasoningSelect: document.querySelector("#reasoning-select"),
@@ -253,9 +254,14 @@ function renderStatusFavicon(status) {
 
 const themeStorageKey = "copilot-web-theme";
 const sidebarCollapsedStorageKey = "copilot-web-sidebar-collapsed";
+const sidebarWidthStorageKey = "copilot-web-sidebar-width";
+const defaultSidebarWidth = 320;
+const minimumSidebarWidth = 220;
 const themePreferenceNames = ["system", "light", "dark"];
 let themePreference = readThemePreference();
 let sidebarCollapsed = readSidebarCollapsed();
+let preferredSidebarWidth = readSidebarWidth();
+let sidebarWidth = clampSidebarWidth(preferredSidebarWidth);
 const systemThemeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
 function readThemePreference() {
@@ -277,6 +283,111 @@ function readSidebarCollapsed() {
   } catch {
     return false;
   }
+}
+
+function readSidebarWidth() {
+  try {
+    const storedWidth = window.localStorage.getItem(sidebarWidthStorageKey);
+    const width = Number(storedWidth);
+    return storedWidth && Number.isFinite(width) && width >= minimumSidebarWidth
+      ? width
+      : defaultSidebarWidth;
+  } catch {
+    return defaultSidebarWidth;
+  }
+}
+
+function maximumSidebarWidth() {
+  return Math.max(
+    minimumSidebarWidth,
+    Math.floor(document.documentElement.clientWidth / 2)
+  );
+}
+
+function clampSidebarWidth(width) {
+  return Math.min(
+    maximumSidebarWidth(),
+    Math.max(minimumSidebarWidth, Math.round(width))
+  );
+}
+
+function applySidebarWidth(width) {
+  sidebarWidth = clampSidebarWidth(width);
+  elements.appShell.style.setProperty("--sidebar-width", `${sidebarWidth}px`);
+  elements.sidebarResizer.setAttribute("aria-valuenow", String(sidebarWidth));
+  elements.sidebarResizer.setAttribute("aria-valuemax", String(maximumSidebarWidth()));
+  elements.sidebarResizer.setAttribute("aria-valuetext", `${sidebarWidth} pixels`);
+}
+
+function saveSidebarWidth() {
+  preferredSidebarWidth = sidebarWidth;
+  try {
+    window.localStorage.setItem(sidebarWidthStorageKey, String(sidebarWidth));
+  } catch {
+    setStatus("Sidebar width could not be saved");
+  }
+}
+
+let sidebarResizeStart = null;
+
+function startSidebarResize(event) {
+  if (sidebarCollapsed || event.button !== 0 || event.isPrimary === false) {
+    return;
+  }
+
+  event.preventDefault();
+  sidebarResizeStart = {
+    pointerId: event.pointerId,
+    x: event.clientX,
+    width: sidebarWidth
+  };
+  elements.appShell.classList.add("sidebar-resizing");
+  elements.sidebarResizer.setPointerCapture(event.pointerId);
+}
+
+function updateSidebarResize(event) {
+  if (!sidebarResizeStart || event.pointerId !== sidebarResizeStart.pointerId) {
+    return;
+  }
+  applySidebarWidth(
+    sidebarResizeStart.width + event.clientX - sidebarResizeStart.x
+  );
+}
+
+function finishSidebarResize(event) {
+  if (
+    !sidebarResizeStart ||
+    (event?.pointerId !== undefined && event.pointerId !== sidebarResizeStart.pointerId)
+  ) {
+    return;
+  }
+  sidebarResizeStart = null;
+  elements.appShell.classList.remove("sidebar-resizing");
+  saveSidebarWidth();
+}
+
+function handleSidebarResizerKeydown(event) {
+  let nextWidth;
+  switch (event.key) {
+    case "ArrowLeft":
+      nextWidth = sidebarWidth - 16;
+      break;
+    case "ArrowRight":
+      nextWidth = sidebarWidth + 16;
+      break;
+    case "Home":
+      nextWidth = minimumSidebarWidth;
+      break;
+    case "End":
+      nextWidth = maximumSidebarWidth();
+      break;
+    default:
+      return;
+  }
+
+  event.preventDefault();
+  applySidebarWidth(nextWidth);
+  saveSidebarWidth();
 }
 
 function applySidebarState(collapsed) {
@@ -1467,6 +1578,7 @@ function attachmentCapabilityError(attachments) {
 }
 
 applyTheme(themePreference);
+applySidebarWidth(preferredSidebarWidth);
 applySidebarState(sidebarCollapsed);
 
 function renderSessionList() {
@@ -1504,6 +1616,7 @@ function renderSessionList() {
   for (const session of sessions) {
     const row = document.createElement("div");
     const conversation = conversationState(session.sessionId, false);
+    const title = session.title || "Untitled conversation";
     const working = session.busy === true ||
       conversation?.busy ||
       conversation?.recoveredPrompt;
@@ -1515,7 +1628,7 @@ function renderSessionList() {
     button.className = `session-item${session.sessionId === state.activeSessionId ? " active" : ""}`;
     button.dataset.sessionId = session.sessionId;
     button.innerHTML = `
-      <span class="session-title">${escapeHtml(session.title || "Untitled conversation")}</span>
+      <span class="session-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
       <span class="session-meta">${escapeHtml(relativeTime(sessionActivityAt(session)))}</span>
       ${working
         ? `<span class="session-status">Working${queued > 0 ? ` · ${queued} queued` : ""}</span>`
@@ -3692,6 +3805,15 @@ elements.themeToggle.addEventListener("click", () => {
 elements.sidebarToggle.addEventListener("click", () => {
   applySidebarState(!sidebarCollapsed);
   saveSidebarState(sidebarCollapsed);
+});
+elements.sidebarResizer.addEventListener("pointerdown", startSidebarResize);
+elements.sidebarResizer.addEventListener("pointermove", updateSidebarResize);
+elements.sidebarResizer.addEventListener("pointerup", finishSidebarResize);
+elements.sidebarResizer.addEventListener("pointercancel", finishSidebarResize);
+elements.sidebarResizer.addEventListener("lostpointercapture", finishSidebarResize);
+elements.sidebarResizer.addEventListener("keydown", handleSidebarResizerKeydown);
+window.addEventListener("resize", () => {
+  applySidebarWidth(preferredSidebarWidth);
 });
 elements.modelSelect.addEventListener("change", () => {
   void changeConfigOption("model", elements.modelSelect.value);

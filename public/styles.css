@@ -107,13 +107,13 @@ button:disabled {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width, 320px) 1px minmax(0, 1fr);
   height: 100%;
   transition: grid-template-columns 180ms ease;
 }
 
 .app-shell.sidebar-collapsed {
-  grid-template-columns: 72px minmax(0, 1fr);
+  grid-template-columns: 72px 0 minmax(0, 1fr);
 }
 
 .sidebar {
@@ -124,7 +124,44 @@ button:disabled {
   overflow: hidden;
   padding: 22px 16px 16px;
   background: var(--surface);
-  border-right: 1px solid var(--border);
+}
+
+.sidebar-resizer {
+  position: relative;
+  z-index: 1;
+  width: 9px;
+  justify-self: center;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.sidebar-resizer::after {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 4px;
+  width: 1px;
+  background: var(--border);
+  content: "";
+  transition: background 140ms ease, box-shadow 140ms ease;
+}
+
+.sidebar-resizer:hover::after,
+.sidebar-resizer:focus-visible::after {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(139, 124, 255, 0.16);
+}
+
+.app-shell.sidebar-resizing {
+  cursor: col-resize;
+  transition: none;
+}
+
+.app-shell.sidebar-resizing * {
+  user-select: none;
+}
+
+.app-shell.sidebar-collapsed .sidebar-resizer {
+  display: none;
 }
 
 .brand {
@@ -451,6 +488,7 @@ button:disabled {
 
 .conversation {
   display: grid;
+  grid-column: 3;
   grid-template-rows: minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
@@ -1470,6 +1508,15 @@ button:disabled {
   .app-shell.sidebar-collapsed {
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .conversation {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .sidebar-resizer {
+    display: none;
   }
 
   .sidebar {
