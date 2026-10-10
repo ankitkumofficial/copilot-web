@@ -860,6 +860,7 @@ button:disabled {
   max-height: 220px;
   overflow-y: auto;
   overflow-x: hidden;
+  overflow-anchor: none;
   color: var(--tool-text);
   line-height: 1.45;
   white-space: normal;
@@ -912,6 +913,7 @@ button:disabled {
   padding: 0;
   overflow-y: auto;
   overflow-x: hidden;
+  overflow-anchor: none;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
   list-style: none;
@@ -943,6 +945,7 @@ button:disabled {
   max-height: 220px;
   overflow-y: auto;
   overflow-x: hidden;
+  overflow-anchor: none;
   color: var(--muted);
   font-size: 0.77rem;
   line-height: 1.35;
