@@ -366,12 +366,9 @@ export class AcpConnection {
 
   private async startInternal(): Promise<void> {
     this.stopping = false;
-    const args = ["--acp", "--no-color"];
+    const args = ["--context", this.context, "--acp", "--no-color"];
     if (this.allowAll) {
       args.push("--allow-all");
-    }
-    if (this.context === "long_context") {
-      args.push("--context", "long_context");
     }
     const child = spawn(this.command, args, {
       cwd: this.spawnCwd,
@@ -1013,6 +1010,9 @@ export class AcpConnectionManager {
           continue;
         }
         throw new AcpError(`Copilot does not support ${configId}=${String(value)}`);
+      }
+      if (option.currentValue === value) {
+        continue;
       }
       configOptions = await connection.setConfigOption(
         setup.sessionId,
