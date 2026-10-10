@@ -1198,10 +1198,12 @@ button:disabled {
 }
 
 .usage-summary {
-  display: grid;
-  min-width: 132px;
+  display: flex;
+  min-width: max-content;
+  flex: 0 0 auto;
   align-self: end;
-  gap: 2px;
+  align-items: end;
+  gap: 14px;
   padding: 0 2px;
   color: var(--muted);
   font-size: 0.68rem;
@@ -1210,6 +1212,15 @@ button:disabled {
 }
 
 .usage-summary[hidden] {
+  display: none;
+}
+
+.usage-metric {
+  display: grid;
+  gap: 2px;
+}
+
+.usage-metric[hidden] {
   display: none;
 }
 
