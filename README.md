@@ -29,8 +29,26 @@ keeps the model, tools, authentication, and workspace local.
   sequentially.
 - Show cumulative conversation AI-credit usage when the Copilot CLI exposes it
   through ACP.
+- Keep usage metrics beside the model settings when space permits; selectors
+  shrink first, and narrow layouts wrap without overlapping action buttons.
 - Show Copilot reasoning text when the ACP stream exposes thought chunks.
 - Display tool activity while Copilot works.
+- Toggle **Keep awake** using the coffee-cup button immediately before
+  **Reconnect tools** in the message bar. It uses the browser's Screen Wake Lock
+  API to prevent the display from sleeping and normal display-sleep-triggered
+  locking while this tab is visible, without starting a native process or video.
+  The button is highlighted while the wake lock is active. It pauses when the
+  tab is hidden or the browser releases the lock, and automatically requests a
+  new lock when you return to the tab. Request failures are shown below the
+  message bar; toggle Off and On to retry a browser-released lock.
+  Keep awake defaults to Off until enabled. Your On/Off choice is stored in the
+  browser and restored after a page reload, requesting a new wake lock once the
+  tab is visible. It remains independent of the selected conversation and
+  releases the current lock on navigation or closing the tab.
+  Browser request or release failures do not change your saved choice. If On,
+  returning to the tab or refreshing retries a failed request.
+  It requires a supported browser and HTTPS or localhost; unsupported browsers
+  show a disabled button. Manual and company-enforced locks are unaffected.
 - Reload MCP connections using **Reconnect tools**, even when Copilot says a
   tool is unavailable without attempting a call, or after refreshing the page.
   This uses the native `/mcp reload` ACP command without restarting the CLI,

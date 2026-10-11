@@ -2,6 +2,7 @@ const defaultBrandName = "Copilot Web";
 const defaultBrandInitial = "C";
 const contextStorageKey = "copilot-web-context";
 const activeSessionStorageKey = "copilot-web-active-session";
+const screenWakeLockStorageKey = "copilot-web-keep-awake";
 const contextPreferences = ["default", "long_context"];
 const maximumAttachmentCount = 10;
 const maximumAttachmentBytes = 8 * 1024 * 1024;
@@ -201,6 +202,8 @@ const elements = {
   dropHint: document.querySelector("#drop-hint"),
   attachFiles: document.querySelector("#attach-files"),
   fileInput: document.querySelector("#file-input"),
+  keepAwake: document.querySelector("#keep-awake"),
+  keepAwakeStatus: document.querySelector("#keep-awake-status"),
   reconnectTools: document.querySelector("#reconnect-tools"),
   send: document.querySelector("#send-prompt"),
   cancel: document.querySelector("#cancel-prompt"),
@@ -222,6 +225,105 @@ const elements = {
   imagePreviewDialog: document.querySelector("#image-preview-dialog"),
   imagePreviewImage: document.querySelector("#image-preview-image")
 };
+
+const screenWakeLock = {
+  enabled: typeof navigator.wakeLock?.request === "function" && readScreenWakeLockPreference(),
+  sentinel: null,
+  busy: false,
+  pageActive: true,
+  error: null
+};
+
+function readScreenWakeLockPreference() {
+  try {
+    return window.localStorage.getItem(screenWakeLockStorageKey) === "true";
+  } catch (error) {
+    console.warn("Unable to restore the keep-awake preference", error);
+    return false;
+  }
+}
+
+function setScreenWakeLockEnabled(enabled) {
+  screenWakeLock.enabled = enabled;
+  try {
+    window.localStorage.setItem(screenWakeLockStorageKey, String(enabled));
+  } catch (error) {
+    console.warn("Unable to save the keep-awake preference; it may reset after a refresh", error);
+  }
+}
+
+function shouldKeepScreenAwake() {
+  return screenWakeLock.enabled && screenWakeLock.pageActive &&
+    document.visibilityState === "visible";
+}
+
+function renderScreenWakeLock() {
+  const supported = typeof navigator.wakeLock?.request === "function";
+  const active = screenWakeLock.sentinel !== null && !screenWakeLock.sentinel.released;
+  const status = screenWakeLock.error ? "error"
+    : active ? "on" : screenWakeLock.enabled ? "paused" : "off";
+  const label = !supported ? "Keep awake: Unavailable in this browser"
+    : screenWakeLock.error ? `Keep awake: ${screenWakeLock.error}`
+    : screenWakeLock.busy ? "Keep awake: Updating..."
+    : active ? "Keep awake: On"
+    : screenWakeLock.enabled ? "Keep awake: On (paused)" : "Keep awake: Off";
+  const message = !supported ? "Screen Wake Lock requires a supported browser and HTTPS or localhost."
+    : screenWakeLock.error ?? (screenWakeLock.busy ? "Updating screen wake lock..."
+      : active ? "Keep awake is on while this tab is visible."
+      : screenWakeLock.enabled
+        ? "Keep awake is paused. Return to this tab to resume, or toggle Off and On to retry."
+        : "Keep awake is off.");
+  elements.keepAwake.disabled = !supported || screenWakeLock.busy;
+  elements.keepAwake.dataset.status = status;
+  elements.keepAwake.setAttribute("aria-pressed", String(screenWakeLock.enabled));
+  elements.keepAwake.setAttribute("aria-label", label);
+  elements.keepAwake.title = label;
+  elements.keepAwakeStatus.textContent = message;
+  elements.keepAwakeStatus.dataset.error = String(screenWakeLock.error !== null);
+  elements.keepAwakeStatus.classList.toggle(
+    "visually-hidden",
+    !screenWakeLock.error && (status !== "paused" || screenWakeLock.busy)
+  );
+}
+
+async function updateScreenWakeLock() {
+  if (screenWakeLock.busy) {
+    return;
+  }
+  const shouldHold = shouldKeepScreenAwake();
+  const active = screenWakeLock.sentinel !== null && !screenWakeLock.sentinel.released;
+  if (shouldHold === active) {
+    renderScreenWakeLock();
+    return;
+  }
+  screenWakeLock.busy = true;
+  screenWakeLock.error = null;
+  renderScreenWakeLock();
+  try {
+    if (shouldHold) {
+      const sentinel = await navigator.wakeLock.request("screen");
+      screenWakeLock.sentinel = sentinel;
+      sentinel.addEventListener("release", () => {
+        if (screenWakeLock.sentinel === sentinel) {
+          screenWakeLock.sentinel = null;
+          renderScreenWakeLock();
+        }
+      });
+    } else {
+      await screenWakeLock.sentinel.release();
+      screenWakeLock.sentinel = null;
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    screenWakeLock.error = `Unable to ${shouldHold ? "enable" : "disable"} keep awake: ${detail}`;
+  } finally {
+    screenWakeLock.busy = false;
+    renderScreenWakeLock();
+    if (!screenWakeLock.error && shouldHold !== shouldKeepScreenAwake()) {
+      void updateScreenWakeLock();
+    }
+  }
+}
 
 function initialFromBrandName(name) {
   const firstCharacter = Array.from(name)[0] ?? defaultBrandInitial;
@@ -4398,6 +4500,22 @@ elements.cancel.addEventListener("click", () => {
   void cancelPrompt();
 });
 elements.reconnectTools.addEventListener("click", reconnectTools);
+elements.keepAwake.addEventListener("click", () => {
+  setScreenWakeLockEnabled(!screenWakeLock.enabled);
+  screenWakeLock.error = null;
+  void updateScreenWakeLock();
+});
+document.addEventListener("visibilitychange", () => {
+  void updateScreenWakeLock();
+});
+window.addEventListener("pagehide", () => {
+  screenWakeLock.pageActive = false;
+  void updateScreenWakeLock();
+});
+window.addEventListener("pageshow", () => {
+  screenWakeLock.pageActive = true;
+  void updateScreenWakeLock();
+});
 elements.permissionCancel.addEventListener("click", (event) => {
   event.preventDefault();
   elements.permissionDialog.close();
@@ -4428,4 +4546,5 @@ renderUsage();
 resizePromptInput();
 renderMessages();
 renderConnectionStatus();
+void updateScreenWakeLock();
 connectEvents();

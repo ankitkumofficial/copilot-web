@@ -1260,6 +1260,7 @@ button:disabled {
 
 .composer-footer {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 14px;
   margin-top: 8px;
@@ -1268,7 +1269,7 @@ button:disabled {
 .composer-settings {
   display: flex;
   min-width: 0;
-  flex: 1 1 auto;
+  flex: 1 1 min-content;
   flex-wrap: wrap;
   align-items: end;
   gap: 8px;
@@ -1276,7 +1277,8 @@ button:disabled {
 
 .composer-setting {
   min-width: 100px;
-  flex: 0 1 145px;
+  max-width: 145px;
+  flex: 1 1 100px;
 }
 
 .composer-setting span {
@@ -1339,6 +1341,7 @@ button:disabled {
   flex: 0 0 auto;
   align-items: end;
   gap: 8px;
+  margin-left: auto;
 }
 
 .composer-actions .secondary-button,
@@ -1353,6 +1356,28 @@ button:disabled {
   height: 38px;
   place-items: center;
   padding: 0;
+}
+
+.keep-awake-status {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+#keep-awake[data-status="on"] {
+  border-color: var(--accent);
+  background: var(--user);
+  color: var(--accent-strong);
+}
+
+#keep-awake[data-status="paused"] {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+#keep-awake[data-status="error"],
+.keep-awake-status[data-error="true"] {
+  color: var(--danger);
 }
 
 .button-icon {
@@ -1599,7 +1624,4 @@ button:disabled {
     flex-basis: 100%;
   }
 
-  .composer-actions {
-    margin-left: auto;
-  }
 }
