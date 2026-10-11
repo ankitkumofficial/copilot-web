@@ -69,10 +69,19 @@ The model and reasoning controls use the options advertised by the installed
 Copilot CLI. Changing the model refreshes the available reasoning options using
 the selected context profile; an unsupported reasoning default falls back to
 the value advertised for that model. Context is passed explicitly to the CLI
-as `--context default` or `--context long_context`, and switching context for an
-existing conversation reloads it through the selected profile. However, some
-Copilot CLI releases do not apply the requested tier to ACP sessions; the
-context meter shows the actual size reported by ACP. See
+as `--context default` or `--context long_context`. Each model/context profile
+uses a separate reusable ACP process, with the model also passed as `--model`.
+Changing model or context reloads the conversation through the selected profile,
+preserving its history and compatible reasoning preference. Profile changes and
+prompts are serialized per conversation, while cancellation and permission
+responses remain available. Before the first prompt, changing profiles recreates
+the empty native session and updates its ID without losing the browser draft
+or attachments. This avoids ACP's
+model-setting RPC resetting the context tier, including when the model has not
+changed. The context meter shows the actual size reported by ACP after a prompt,
+not an inferred size from the selected tier. This can differ from the CLI's
+full-window display: with CLI 1.0.95, Opus 5.5's 1M long-context window is reported
+as 968K by ACP. See
 https://github.com/github/copilot-cli/issues/4275 for the upstream ACP issue.
 
 The theme control cycles through **System**, **Light**, and **Dark**. System
@@ -82,7 +91,7 @@ choice is stored in the browser until System is selected again.
 ## Requirements
 
 - Node.js 24 or newer
-- GitHub Copilot CLI 1.0.87 or newer
+- GitHub Copilot CLI 1.0.95 or newer (required for ACP context startup/resume)
 - A completed `copilot login`
 - A `~/projects` directory containing the repositories to work with
 

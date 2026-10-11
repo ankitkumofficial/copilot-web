@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 
+import { SerialTaskQueue } from "./persistence.js";
+
 export type JsonRpcId = number | string;
 export type JsonObject = Record<string, unknown>;
 export type ContextTier = "default" | "long_context";
@@ -125,6 +127,7 @@ export class AcpConnection {
   private readonly clientTitle: string;
   private readonly allowAll: boolean;
   public readonly context: ContextTier;
+  public readonly model: string | undefined;
   private child: ChildProcessWithoutNullStreams | undefined;
   private stdoutBuffer = "";
   private nextRequestId = 1;
@@ -147,6 +150,7 @@ export class AcpConnection {
     clientTitle?: string;
     allowAll?: boolean;
     context?: ContextTier;
+    model?: string;
   }) {
     this.command = options.command;
     this.spawnCwd = options.cwd;
@@ -154,6 +158,7 @@ export class AcpConnection {
     this.clientTitle = options.clientTitle ?? "Copilot Web";
     this.allowAll = options.allowAll === true;
     this.context = options.context ?? "default";
+    this.model = options.model;
   }
 
   public async start(): Promise<void> {
@@ -471,6 +476,9 @@ export class AcpConnection {
   private async startInternal(): Promise<void> {
     this.stopping = false;
     const args = ["--context", this.context, "--acp", "--no-color"];
+    if (this.model !== undefined) {
+      args.push("--model", this.model);
+    }
     if (this.allowAll) {
       args.push("--allow-all");
     }
@@ -712,6 +720,14 @@ export class AcpConnection {
         if (
           typeof sessionId === "string" &&
           isRecord(update) &&
+          update.sessionUpdate === "config_option_update" &&
+          Array.isArray(update.configOptions)
+        ) {
+          this.sessionConfigOptions.set(sessionId, update.configOptions.filter(isRecord));
+        }
+        if (
+          typeof sessionId === "string" &&
+          isRecord(update) &&
           update.sessionUpdate === "available_commands_update" &&
           Array.isArray(update.availableCommands)
         ) {
@@ -886,10 +902,18 @@ export class AcpConnectionManager {
   private readonly clientVersion: string;
   private readonly clientTitle: string;
   private readonly allowAll: boolean;
-  private readonly connections = new Map<ContextTier, AcpConnection>();
-  private readonly sessionContexts = new Map<string, ContextTier>();
+  private readonly connections = new Map<string, AcpConnection>();
+  private readonly sessionConnections = new Map<string, AcpConnection>();
   private readonly sessionConfigPreferences = new Map<string, Map<string, string | boolean>>();
-  private readonly profileDefaults = new Map<ContextTier, SessionSetup>();
+  private readonly profileDefaults = new Map<string, SessionSetup>();
+  private readonly unpromptedSessions = new Set<string>();
+  private readonly replacedSessions = new Set<string>();
+  private readonly promptingSessions = new Set<string>();
+  private readonly sessionOperations = new Map<string, {
+    queue: SerialTaskQueue;
+    pending: number;
+  }>();
+  private stopping = false;
 
   public constructor(options: {
     command: string;
@@ -910,7 +934,8 @@ export class AcpConnectionManager {
   }
 
   public getCapabilities(context: ContextTier = "default"): AgentCapabilities {
-    const connection = this.connections.get(context);
+    const connection = this.connections.get(this.connectionKey(context)) ??
+      [...this.connections.values()].find((candidate) => candidate.context === context);
     if (!connection) {
       throw new Error(`ACP ${context} connection has not been initialized`);
     }
@@ -918,7 +943,11 @@ export class AcpConnectionManager {
   }
 
   public getSessionContext(sessionId: string): ContextTier | undefined {
-    return this.sessionContexts.get(sessionId);
+    return this.sessionConnections.get(sessionId)?.context;
+  }
+
+  public isSessionUnprompted(sessionId: string): boolean {
+    return this.unpromptedSessions.has(sessionId);
   }
 
   public async listSessions(): Promise<SessionInfo[]> {
@@ -927,55 +956,26 @@ export class AcpConnectionManager {
   }
 
   public async discoverConfig(context: ContextTier, model?: string): Promise<SessionSetup> {
-    const cached = this.profileDefaults.get(context);
-    if (cached && model === undefined) {
+    const key = this.connectionKey(context, model);
+    const cached = this.profileDefaults.get(key);
+    if (cached) {
       return cached;
     }
 
-    const connection = await this.getConnection(context);
+    const connection = await this.getConnection(context, model);
     const canCloseSession = connection.getCapabilities().sessionCapabilities.close;
-    const reuseCachedSession = !canCloseSession && cached !== undefined;
-    const setup = reuseCachedSession
-      ? cached
-      : await connection.newSession(this.cwd);
-    if (!cached) {
-      this.profileDefaults.set(context, setup);
-    }
-    const initialModel = setup.configOptions.find((option) => option.id === "model");
-    let configOptions = setup.configOptions;
-    let modelChanged = false;
+    const setup = await connection.newSession(this.cwd);
     try {
-      if (model !== undefined) {
-        if (!initialModel) {
-          throw new AcpError("Copilot does not expose the model session option");
-        }
-        if (!configOptionAcceptsValue(initialModel, model)) {
-          throw new AcpError(`Copilot does not support model=${model}`);
-        }
-        if (initialModel.currentValue !== model) {
-          if (!canCloseSession && typeof initialModel.currentValue !== "string") {
-            throw new AcpError("Copilot cannot safely preview a model without its current value");
-          }
-          modelChanged = true;
-          configOptions = await connection.setConfigOption(setup.sessionId, "model", model);
-        }
-      }
-      return {
-        ...setup,
-        configOptions
-      };
+      const configuredSetup = await this.applySessionConfig(
+        connection,
+        setup,
+        model === undefined ? undefined : { model }
+      );
+      this.profileDefaults.set(key, configuredSetup);
+      return configuredSetup;
     } finally {
-      if (canCloseSession && !reuseCachedSession) {
+      if (!this.stopping && canCloseSession) {
         await connection.closeSession(setup.sessionId);
-      } else if (
-        modelChanged &&
-        typeof initialModel?.currentValue === "string"
-      ) {
-        await connection.setConfigOption(
-          setup.sessionId,
-          "model",
-          initialModel.currentValue
-        );
       }
     }
   }
@@ -986,7 +986,11 @@ export class AcpConnectionManager {
     configOverrides?: Readonly<Record<string, string | boolean>>,
     fallbackConfigIds: ReadonlySet<string> = new Set()
   ): Promise<SessionSetup> {
-    const connection = await this.getConnection(context);
+    const model = configOverrides?.model;
+    if (model !== undefined && typeof model !== "string") {
+      throw new AcpError("Model must be a string");
+    }
+    const connection = await this.getConnection(context, model);
     const setup = await connection.newSession(cwd);
     try {
       const configuredSetup = await this.applySessionConfig(
@@ -996,167 +1000,311 @@ export class AcpConnectionManager {
         fallbackConfigIds
       );
       this.rememberSessionConfig(configuredSetup.sessionId, configuredSetup.configOptions);
-      this.sessionContexts.set(configuredSetup.sessionId, context);
+      this.sessionConnections.set(configuredSetup.sessionId, connection);
+      this.unpromptedSessions.add(configuredSetup.sessionId);
       return configuredSetup;
     } catch (error) {
-      if (connection.getCapabilities().sessionCapabilities.close) {
+      if (!this.stopping && connection.getCapabilities().sessionCapabilities.close) {
         await connection.closeSession(setup.sessionId);
       }
       throw error;
     }
   }
 
-  public async loadSession(session: SessionInfo, context: ContextTier): Promise<SessionSetup> {
-    const previousContext = this.sessionContexts.get(session.sessionId);
-    if (previousContext && previousContext !== context) {
-      const previousConnection = await this.getConnection(previousContext);
-      await previousConnection.closeSession(session.sessionId);
-    }
+  public async loadSession(
+    session: SessionInfo,
+    context: ContextTier,
+    model?: string
+  ): Promise<SessionSetup> {
+    return this.withSessionOperation(session.sessionId, () => (
+      this.loadSessionInternal(session, context, model)
+    ));
+  }
 
-    const connection = await this.getConnection(context);
-    const setup = await connection.loadSession(session);
-    const configuredSetup = await this.applySessionConfig(connection, setup);
-    const restoredSetup = await this.restoreConfigOptions(connection, configuredSetup);
-    this.sessionContexts.set(restoredSetup.sessionId, context);
-    return restoredSetup;
+  private async loadSessionInternal(
+    session: SessionInfo,
+    context: ContextTier,
+    model?: string
+  ): Promise<SessionSetup> {
+    const preferredModel = model ??
+      this.sessionConfigPreferences.get(session.sessionId)?.get("model");
+    const connection = await this.getConnection(
+      context,
+      typeof preferredModel === "string" ? preferredModel : undefined
+    );
+    const previousConnection = this.sessionConnections.get(session.sessionId);
+    // Unprompted ACP sessions have no persisted history to load in another process.
+    const replaceSession = this.unpromptedSessions.has(session.sessionId) &&
+      previousConnection !== connection;
+    const setup = replaceSession
+      ? await connection.newSession(session.cwd)
+      : await connection.loadSession(session);
+    try {
+      const configuredSetup = await this.applySessionConfig(
+        connection,
+        setup,
+        connection.model === undefined ? undefined : { model: connection.model }
+      );
+      const restoredSetup = await this.restoreConfigOptions(
+        connection,
+        configuredSetup,
+        this.sessionConfigPreferences.get(session.sessionId)
+      );
+      if (this.stopping) {
+        throw new AcpError("ACP connection manager stopped");
+      }
+      if (previousConnection && (previousConnection !== connection || replaceSession)) {
+        await previousConnection.closeSession(session.sessionId);
+      }
+      if (replaceSession) {
+        this.forgetSession(session.sessionId);
+        this.replacedSessions.add(session.sessionId);
+        this.unpromptedSessions.add(restoredSetup.sessionId);
+      }
+      this.sessionConnections.set(restoredSetup.sessionId, connection);
+      this.rememberSessionConfig(restoredSetup.sessionId, restoredSetup.configOptions);
+      return restoredSetup;
+    } catch (error) {
+      if (!this.stopping && (replaceSession || (previousConnection && previousConnection !== connection))) {
+        await connection.closeSession(setup.sessionId);
+      }
+      throw error;
+    }
   }
 
   public async reloadMcpServers(
     session: SessionInfo,
     signal?: AbortSignal
   ): Promise<string | undefined> {
-    const context = this.sessionContexts.get(session.sessionId) ?? "default";
-    const connection = await this.getConnection(context);
-    if (!connection.isSessionLoaded(session.sessionId)) {
-      await this.loadSession(session, context);
-    }
-    if (signal?.aborted) {
-      return "cancelled";
-    }
-    let supported: boolean;
-    try {
-      supported = await connection.waitForCommand(session.sessionId, "mcp", signal);
-    } catch (error) {
-      if (signal?.aborted && error === signal.reason) {
+    return this.withSessionPrompt(session.sessionId, async () => {
+      const connection = await this.getSessionConnection(session);
+      if (signal?.aborted) {
         return "cancelled";
       }
-      throw error;
-    }
-    if (signal?.aborted) {
-      return "cancelled";
-    }
-    if (!supported) {
-      throw new AcpError("This Copilot CLI does not advertise the native /mcp command through ACP");
-    }
-    return connection.prompt(session, [{ type: "text", text: "/mcp reload" }]);
+      let supported: boolean;
+      try {
+        supported = await connection.waitForCommand(session.sessionId, "mcp", signal);
+      } catch (error) {
+        if (signal?.aborted && error === signal.reason) {
+          return "cancelled";
+        }
+        throw error;
+      }
+      if (signal?.aborted) {
+        return "cancelled";
+      }
+      if (!supported) {
+        throw new AcpError("This Copilot CLI does not advertise the native /mcp command through ACP");
+      }
+      this.unpromptedSessions.delete(session.sessionId);
+      return connection.prompt(session, [{ type: "text", text: "/mcp reload" }]);
+    });
   }
 
   public async setConfigOption(
     session: SessionInfo,
     configId: string,
     value: string | boolean
-  ): Promise<JsonObject[]> {
-    const context = this.sessionContexts.get(session.sessionId) ?? "default";
-    const connection = await this.getConnection(context);
-    if (!connection.isSessionLoaded(session.sessionId)) {
-      await this.loadSession(session, context);
-    }
-    const configOptions = await connection.setConfigOption(session.sessionId, configId, value);
-    const preferences = this.sessionConfigPreferences.get(session.sessionId) ?? new Map();
-    preferences.set(configId, value);
-    this.sessionConfigPreferences.set(session.sessionId, preferences);
-    return configOptions;
+  ): Promise<SessionSetup> {
+    return this.withSessionOperation(session.sessionId, async () => {
+      const connection = await this.getSessionConnection(session);
+      const option = connection.getConfigOptions(session.sessionId)
+        .find((candidate) => candidate.id === configId);
+      if (option?.currentValue === value) {
+        return {
+          sessionId: session.sessionId,
+          configOptions: connection.getConfigOptions(session.sessionId)
+        };
+      }
+      if (configId === "model") {
+        if (typeof value !== "string" || !option || !configOptionAcceptsValue(option, value)) {
+          throw new AcpError(`Copilot does not support model=${String(value)}`);
+        }
+        // ACP model setters clear the tier, so load with both startup flags instead.
+        return this.loadSessionInternal(session, connection.context, value);
+      }
+      const configOptions = await connection.setConfigOption(session.sessionId, configId, value);
+      const preferences = this.sessionConfigPreferences.get(session.sessionId) ?? new Map();
+      preferences.set(configId, value);
+      this.sessionConfigPreferences.set(session.sessionId, preferences);
+      return { sessionId: session.sessionId, configOptions };
+    });
   }
 
   public getConfigOptions(sessionId: string): JsonObject[] {
-    const context = this.sessionContexts.get(sessionId);
-    const connection = context ? this.connections.get(context) : undefined;
-    return connection?.getConfigOptions(sessionId) ?? [];
+    return this.sessionConnections.get(sessionId)?.getConfigOptions(sessionId) ?? [];
   }
 
   public async prompt(
     session: SessionInfo,
-    prompt: PromptContentBlock[]
+    prompt: PromptContentBlock[],
+    signal?: AbortSignal
   ): Promise<string | undefined> {
-    const context = this.sessionContexts.get(session.sessionId) ?? "default";
-    const connection = await this.getConnection(context);
-    if (!connection.isSessionLoaded(session.sessionId)) {
-      await this.loadSession(session, context);
-    }
-    const result = await connection.prompt(session, prompt);
-    this.sessionContexts.set(session.sessionId, context);
-    return result;
+    return this.withSessionPrompt(session.sessionId, async () => {
+      if (signal?.aborted) {
+        return "cancelled";
+      }
+      const connection = await this.getSessionConnection(session);
+      if (signal?.aborted) {
+        return "cancelled";
+      }
+      this.unpromptedSessions.delete(session.sessionId);
+      const result = await connection.prompt(session, prompt);
+      this.rememberSessionConfig(session.sessionId, connection.getConfigOptions(session.sessionId));
+      return result;
+    });
   }
 
   public async cancel(sessionId: string): Promise<void> {
-    const context = this.sessionContexts.get(sessionId) ?? "default";
-    const connection = await this.getConnection(context);
+    const connection = this.sessionConnections.get(sessionId) ??
+      await this.getConnection("default");
     await connection.cancel(sessionId);
   }
 
   public async closeSession(sessionId: string): Promise<void> {
-    const context = this.sessionContexts.get(sessionId) ?? "default";
-    const connection = await this.getConnection(context);
-    await connection.closeSession(sessionId);
+    await this.withSessionOperation(sessionId, async () => {
+      const connection = this.sessionConnections.get(sessionId) ??
+        await this.getConnection("default");
+      await connection.closeSession(sessionId);
+    });
   }
 
   public forgetSession(sessionId: string): void {
-    this.sessionContexts.delete(sessionId);
+    this.sessionConnections.delete(sessionId);
     this.sessionConfigPreferences.delete(sessionId);
+    this.unpromptedSessions.delete(sessionId);
   }
 
   public async deleteSession(sessionId: string): Promise<void> {
-    const context = this.sessionContexts.get(sessionId) ?? "default";
-    const connection = await this.getConnection(context);
-    await connection.deleteSession(sessionId);
-    this.sessionContexts.delete(sessionId);
-    this.sessionConfigPreferences.delete(sessionId);
+    await this.withSessionOperation(sessionId, async () => {
+      const connection = this.sessionConnections.get(sessionId) ??
+        await this.getConnection("default");
+      await connection.deleteSession(sessionId);
+      this.forgetSession(sessionId);
+    });
   }
 
   public async respondToPermission(
     context: ContextTier,
     requestId: JsonRpcId,
-    outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" }
+    outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" },
+    sessionId: string
   ): Promise<void> {
-    const connection = await this.getConnection(context);
+    const connection = this.sessionConnections.get(sessionId);
+    if (!connection || connection.context !== context) {
+      throw new AcpError("That permission request is no longer pending for this conversation");
+    }
     await connection.respondToPermission(requestId, outcome);
   }
 
   public async stop(): Promise<void> {
+    this.stopping = true;
     await Promise.all([...this.connections.values()].map((connection) => connection.stop()));
+    await Promise.all([...this.sessionOperations.values()].map(({ queue }) => queue.flush()));
     this.connections.clear();
-    this.sessionContexts.clear();
+    this.sessionConnections.clear();
     this.sessionConfigPreferences.clear();
     this.profileDefaults.clear();
+    this.unpromptedSessions.clear();
+    this.replacedSessions.clear();
+    this.promptingSessions.clear();
+    this.sessionOperations.clear();
   }
 
-  private async getConnection(context: ContextTier): Promise<AcpConnection> {
-    const existing = this.connections.get(context);
+  private async withSessionOperation<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    let entry = this.sessionOperations.get(sessionId);
+    if (!entry) {
+      entry = { queue: new SerialTaskQueue(), pending: 0 };
+      this.sessionOperations.set(sessionId, entry);
+    }
+    entry.pending += 1;
+    try {
+      return await entry.queue.enqueue(() => {
+        if (this.stopping) {
+          throw new AcpError("ACP connection manager stopped");
+        }
+        if (this.replacedSessions.has(sessionId)) {
+          throw new AcpError("This empty conversation was replaced; reload its new session before continuing");
+        }
+        return operation();
+      });
+    } finally {
+      entry.pending -= 1;
+      if (entry.pending === 0 && this.sessionOperations.get(sessionId) === entry) {
+        this.sessionOperations.delete(sessionId);
+      }
+    }
+  }
+
+  private async withSessionPrompt(
+    sessionId: string,
+    operation: () => Promise<string | undefined>
+  ): Promise<string | undefined> {
+    if (this.promptingSessions.has(sessionId)) {
+      throw new AcpError("This conversation is already processing a prompt");
+    }
+    this.promptingSessions.add(sessionId);
+    try {
+      return await this.withSessionOperation(sessionId, operation);
+    } finally {
+      this.promptingSessions.delete(sessionId);
+    }
+  }
+
+  private connectionKey(context: ContextTier, model?: string): string {
+    return JSON.stringify([context, model ?? null]);
+  }
+
+  private async getSessionConnection(session: SessionInfo): Promise<AcpConnection> {
+    const previous = this.sessionConnections.get(session.sessionId);
+    if (previous) {
+      await previous.start();
+    }
+    if (!previous?.isSessionLoaded(session.sessionId)) {
+      const setup = await this.loadSessionInternal(session, previous?.context ?? "default");
+      if (setup.sessionId !== session.sessionId) {
+        throw new AcpError("This empty conversation was replaced; reload its new session before continuing");
+      }
+    }
+    const connection = this.sessionConnections.get(session.sessionId);
+    if (!connection) {
+      throw new AcpError("Conversation has no ACP connection");
+    }
+    return connection;
+  }
+
+  private async getConnection(context: ContextTier, model?: string): Promise<AcpConnection> {
+    if (this.stopping) {
+      throw new AcpError("ACP connection manager stopped");
+    }
+    const existing = this.connections.get(this.connectionKey(context, model));
     if (existing) {
       await existing.start();
       return existing;
     }
 
-    return this.createConnection(context);
+    return this.createConnection(context, model);
   }
 
-  private async createConnection(context: ContextTier): Promise<AcpConnection> {
+  private async createConnection(context: ContextTier, model?: string): Promise<AcpConnection> {
+    const key = this.connectionKey(context, model);
     const connection = new AcpConnection({
       command: this.command,
       cwd: this.cwd,
       clientVersion: this.clientVersion,
       clientTitle: this.clientTitle,
       allowAll: this.allowAll,
-      context
+      context,
+      ...(model === undefined ? {} : { model })
     });
     this.forwardEvents(context, connection);
-    this.connections.set(context, connection);
+    this.connections.set(key, connection);
     try {
       await connection.start();
       return connection;
     } catch (error) {
-      if (this.connections.get(context) === connection) {
-        this.connections.delete(context);
+      if (this.connections.get(key) === connection) {
+        this.connections.delete(key);
       }
       throw error;
     }
@@ -1178,7 +1326,7 @@ export class AcpConnectionManager {
       this.events.emit("permissionRequest", managedEvent);
     });
     connection.events.on("processError", (error: Error) => {
-      this.profileDefaults.delete(context);
+      this.profileDefaults.delete(this.connectionKey(context, connection.model));
       this.events.emit("processError", error);
     });
     connection.events.on("protocolError", (error: Error) => {
@@ -1237,6 +1385,9 @@ export class AcpConnectionManager {
       if (option.currentValue === value) {
         continue;
       }
+      if (configId === "model") {
+        throw new AcpError(`Copilot did not apply model=${String(value)} at startup`);
+      }
       configOptions = await connection.setConfigOption(
         setup.sessionId,
         configId,
@@ -1250,7 +1401,8 @@ export class AcpConnectionManager {
   }
 
   private rememberSessionConfig(sessionId: string, configOptions: JsonObject[]): void {
-    const preferences = new Map<string, string | boolean>();
+    const preferences = this.sessionConfigPreferences.get(sessionId) ??
+      new Map<string, string | boolean>();
     for (const configId of ["model", "reasoning_effort"]) {
       const option = configOptions.find((candidate) => candidate.id === configId);
       if (
@@ -1267,9 +1419,9 @@ export class AcpConnectionManager {
 
   private async restoreConfigOptions(
     connection: AcpConnection,
-    setup: SessionSetup
+    setup: SessionSetup,
+    preferences = this.sessionConfigPreferences.get(setup.sessionId)
   ): Promise<SessionSetup> {
-    const preferences = this.sessionConfigPreferences.get(setup.sessionId);
     if (!preferences || preferences.size === 0) {
       return setup;
     }
@@ -1280,7 +1432,12 @@ export class AcpConnectionManager {
     ));
     for (const [configId, value] of entries) {
       const option = configOptions.find((candidate) => candidate.id === configId);
-      if (!option || !configOptionAcceptsValue(option, value)) {
+      if (
+        configId === "model" ||
+        !option ||
+        option.currentValue === value ||
+        !configOptionAcceptsValue(option, value)
+      ) {
         continue;
       }
       configOptions = await connection.setConfigOption(setup.sessionId, configId, value);
