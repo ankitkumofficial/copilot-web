@@ -25,6 +25,7 @@ const nativeMessages = process.env.TEST_NATIVE_MESSAGES === "true";
 const nativeHistoryPath = path.join(process.cwd(), "native-history.json");
 const nativeTimestamp = process.env.TEST_NATIVE_TIMESTAMP ?? "2026-10-14T10:00:00.000Z";
 const pendingNativePrompts = new Map();
+let streamThoughts = true;
 const sessionFile = (id) => path.join(process.cwd(), "profile-session-" + id + ".json");
 const configOptions = (session) => profiles ? [
   {
@@ -214,7 +215,11 @@ input.on("line", (line) => {
     else advertise();
   };
   switch (request.method) {
-    case "initialize":
+    case "initialize": {
+      const events = request.params?.clientCapabilities?._meta?.["github.com/copilot"]?.events ?? [];
+      // Like the CLI, native message events suppress ACP thought chunks unless reasoning is requested.
+      streamThoughts = !events.includes("assistant.message") ||
+        events.includes("assistant.reasoning_delta");
       respond({
         protocolVersion: 1,
         agentCapabilities: {
@@ -224,6 +229,7 @@ input.on("line", (line) => {
         }
       });
       break;
+    }
     case "session/new": {
       const sessionId = profiles ? require("node:crypto").randomUUID() : "session-1";
       const session = {
@@ -349,14 +355,16 @@ input.on("line", (line) => {
         ? emitNativePrompt(request, request.params.sessionId, reply)
         : null;
       if (request.params.prompt[0]?.text === "stream-progress") {
-        update(request.params.sessionId, {
-          sessionUpdate: "agent_thought_chunk",
-          content: { type: "text", text: "Live reasoning: checking " }
-        });
-        update(request.params.sessionId, {
-          sessionUpdate: "agent_thought_chunk",
-          content: { type: "text", text: "the request." }
-        });
+        const thought = (text) => {
+          if (streamThoughts) {
+            update(request.params.sessionId, {
+              sessionUpdate: "agent_thought_chunk",
+              content: { type: "text", text }
+            });
+          }
+        };
+        thought("Live reasoning: checking ");
+        thought("the request.");
         update(request.params.sessionId, {
           sessionUpdate: "tool_call",
           toolCallId: "live-history-inspection",
@@ -364,16 +372,65 @@ input.on("line", (line) => {
           kind: "read",
           status: "in_progress"
         });
-        setTimeout(() => update(request.params.sessionId, {
-          sessionUpdate: "tool_call_update",
-          toolCallId: "live-history-inspection",
-          title: "Inspect live history",
-          status: "completed",
-          content: [{
-            type: "content",
-            content: { type: "text", text: "Inspection complete" }
-          }]
-        }), 500);
+        setTimeout(() => {
+          update(request.params.sessionId, {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "live-history-inspection",
+            title: "Inspect live history",
+            status: "completed",
+            content: [{
+              type: "content",
+              content: { type: "text", text: "Inspection complete" }
+            }]
+          });
+          // An empty reply between tool rounds must not split continuous reasoning.
+          update(request.params.sessionId, {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "" }
+          });
+          thought("Second round reasoning.");
+        }, 500);
+      } else if (request.params.prompt[0]?.text === "interleaved-rounds") {
+        const thought = (text) => {
+          if (streamThoughts) {
+            update(request.params.sessionId, {
+              sessionUpdate: "agent_thought_chunk",
+              content: { type: "text", text }
+            });
+          }
+        };
+        const tool = (toolCallId, title, status) => update(request.params.sessionId, {
+          sessionUpdate: status === "in_progress" ? "tool_call" : "tool_call_update",
+          toolCallId,
+          title,
+          kind: "read",
+          status
+        });
+        thought("Round one: ");
+        thought("inspect the code.");
+        tool("round-one-tool", "Inspect code", "in_progress");
+        setTimeout(() => {
+          tool("round-one-tool", "Inspect code", "completed");
+          if (nativeMessages) {
+            emitNativeEvent(request.params.sessionId, createNativeEvent(
+              "assistant.message",
+              "intermediate-assistant",
+              {
+                content: "Intermediate update.",
+                reasoningText: "Round one: inspect the code.",
+                toolRequests: [{ toolCallId: "round-two-tool", name: "Run tests" }]
+              },
+              150
+            ), true);
+          }
+          update(request.params.sessionId, {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Intermediate update." }
+          });
+          thought("Round two: run the tests.");
+          tool("round-two-tool", "Run tests", "in_progress");
+        }, 300);
+        setTimeout(() => tool("round-two-tool", "Run tests", "completed"), 700);
       }
       const delay = reload
         ? Number(process.env.TEST_MCP_RELOAD_DELAY_MS ?? 200)
@@ -2703,6 +2760,29 @@ test("keeps historical and live responses, reasoning, and tool activity visible"
         "Live reasoning: checking the request."
       )).length
   `), 1);
+  // Live reasoning belongs to the current turn, not to an earlier Thinking panel.
+  assert.deepEqual(await evaluate(`
+    Array.from(document.querySelectorAll("#messages > .message")).slice(-3).map((article) => [
+      article.classList[1],
+      article.querySelector(".message-text")?.textContent ??
+        article.querySelector(".thinking-content-text")?.textContent ??
+        article.querySelector(".message-body").textContent
+    ])
+  `), [
+    ["user", "stream-progress"],
+    ["tool", "Live reasoning: checking the request.Second round reasoning."],
+    ["assistant", "Done."]
+  ]);
+  assert.equal(await evaluate(`
+    Array.from(document.querySelectorAll(".message.tool")).filter((article) => (
+      article.textContent.includes("Live reasoning") ||
+      article.textContent.includes("Second round reasoning.")
+    )).length
+  `), 1);
+  assert.ok(await evaluate(`
+    Array.from(document.querySelectorAll(".thinking-content-text"))
+      .some((element) => element.textContent.includes("Second round reasoning."))
+  `));
   const activityTitles = await evaluate(`
     Array.from(document.querySelectorAll(".tool-activity-title"))
       .map((element) => element.textContent)
@@ -2711,6 +2791,143 @@ test("keeps historical and live responses, reasoning, and tool activity visible"
   for (const title of ["History lookup", "Read stored files", "Inspect live history"]) {
     assert.ok(activityTitles.includes(title), `Missing activity: ${title}`);
   }
+});
+
+// Layout of the latest turn: user prompt, Thinking panels, and responses in display order.
+const conversationLayout = `
+  (() => {
+    const articles = Array.from(document.querySelectorAll("#messages > .message"));
+    const lastUser = articles.map((article) => article.classList.contains("user")).lastIndexOf(true);
+    return articles.slice(Math.max(lastUser, 0));
+  })().map((article) => {
+    const role = article.classList[1];
+    if (role !== "tool") {
+      return [role, article.querySelector(".message-text")?.textContent ??
+        article.querySelector(".message-body").textContent];
+    }
+    return [
+      role,
+      article.querySelector(".thinking-content-text")?.textContent ?? "",
+      Array.from(article.querySelectorAll(".tool-activity-item")).map((item) => (
+        item.querySelector(".tool-activity-title").textContent + ":" +
+        item.querySelector(".tool-activity-status").textContent
+      ))
+    ];
+  })
+`;
+
+test("streams reasoning and activities in real time, grouped between visible messages", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  for (const nativeMessages of [true, false]) {
+    await t.test(nativeMessages ? "native message history" : "ACP-only history", async (t) => {
+      const server = await startTestServer(t, {
+        nativeMessages,
+        ...(nativeMessages ? { nativeHistory: { events: [] } } : {}),
+        promptDelayMs: 1_500
+      });
+      const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+      await waitFor(`Boolean(document.querySelector(
+        'button.session-item[data-session-id="${server.sessionId}"]'
+      ))`);
+      await evaluate(`document.querySelector(
+        'button.session-item[data-session-id="${server.sessionId}"]'
+      ).click()`);
+      await waitFor(`!document.querySelector("#send-prompt").disabled`);
+      await evaluate(`
+        (() => {
+          const input = document.querySelector("#prompt-input");
+          input.value = "interleaved-rounds";
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          document.querySelector("#composer").requestSubmit();
+        })();
+      `);
+
+      // The first round must appear while Copilot is still working.
+      await waitFor(`JSON.stringify(${conversationLayout}) === JSON.stringify([
+        ["user", "interleaved-rounds"],
+        ["tool", "Round one: inspect the code.", ["Inspect code:Running"]]
+      ])`);
+
+      // A visible response closes the first Thinking panel; later reasoning starts a new one.
+      await waitFor(`JSON.stringify(${conversationLayout}) === JSON.stringify([
+        ["user", "interleaved-rounds"],
+        ["tool", "Round one: inspect the code.", ["Inspect code:Completed"]],
+        ["assistant", "Intermediate update."],
+        ["tool", "Round two: run the tests.", ["Run tests:Completed"]]
+      ])`);
+
+      const expected = [
+        ["user", "interleaved-rounds"],
+        ["tool", "Round one: inspect the code.", ["Inspect code:Completed"]],
+        ["assistant", "Intermediate update."],
+        ["tool", "Round two: run the tests.", ["Run tests:Completed"]],
+        ["assistant", "Done."]
+      ];
+      await waitFor(`JSON.stringify(${conversationLayout}) === ${JSON.stringify(JSON.stringify(expected))}`);
+
+      await evaluate("window.beforeReasoningReload = true");
+      await command("Page.reload", {}, sessionId);
+      await waitFor(`
+        window.beforeReasoningReload !== true &&
+        document.querySelector("#messages")?.textContent.includes("Done.")
+      `);
+      assert.deepEqual(await evaluate(conversationLayout), expected);
+    });
+  }
+});
+
+test("groups persisted reasoning from consecutive tool rounds into one Thinking panel", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: {
+      events: [
+        nativeTranscriptEvent("user.message", "rounds-user", "Investigate", 0),
+        nativeTranscriptEvent("assistant.message", "round-1", "", 1, {
+          reasoningText: "Plan the search.",
+          toolRequests: [{ toolCallId: "round-1-tool", name: "Search files" }]
+        }),
+        nativeTranscriptEvent("assistant.message", "round-2", "", 2, {
+          reasoningText: "Narrow the results.",
+          toolRequests: [{ toolCallId: "round-2-tool", name: "Read file" }]
+        }),
+        nativeTranscriptEvent("assistant.message", "round-final", "Investigation done", 3, {
+          reasoningText: "Summarize the findings."
+        })
+      ]
+    }
+  });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Investigation done")`);
+
+  assert.deepEqual(await evaluate(`
+    Array.from(document.querySelectorAll("#messages > .message"))
+      .map((article) => article.classList[1])
+  `), ["user", "tool", "assistant"]);
+  const reasoning = await evaluate(`
+    document.querySelector(".thinking-content-text").textContent
+  `);
+  assert.equal(typeof reasoning, "string");
+  const reasoningText = String(reasoning);
+  const positions = ["Plan the search.", "Narrow the results.", "Summarize the findings."]
+    .map((text) => reasoningText.indexOf(text));
+  assert.ok(positions.every((position) => position >= 0), reasoningText);
+  assert.deepEqual(positions, [...positions].sort((left, right) => left - right));
+  assert.deepEqual(await evaluate(`
+    Array.from(document.querySelectorAll(".tool-activity-title"))
+      .map((element) => element.textContent)
+  `), ["History lookup", "Search files", "Read file"]);
 });
 
 test("maps queued prompts to native messages and leaves cancelled replies untimed", {

@@ -2879,19 +2879,30 @@ function createToolGroup(toolGroupKey) {
 
 function ensureToolGroup(conversation = activeConversation() ?? state.composer) {
   conversation.lastStreamRole = "tool";
+  let group = conversation.currentToolGroupKey
+    ? conversation.messages.find((message) => (
+      message.role === "tool" &&
+      message.toolGroupKey === conversation.currentToolGroupKey
+    ))
+    : null;
+  if (group) {
+    return group;
+  }
+
+  // Thinking and tool activity with no visible message in between stay in one panel.
+  const previous = conversation.messages.at(-1);
+  if (previous?.role === "tool") {
+    conversation.currentToolGroupKey = previous.toolGroupKey;
+    previous.lastPart = null;
+    return previous;
+  }
+
   if (!conversation.currentToolGroupKey) {
     conversation.toolGroupCounter += 1;
     conversation.currentToolGroupKey = `tool-group:orphan:${conversation.toolGroupCounter}`;
   }
-
-  let group = conversation.messages.find((message) => (
-    message.role === "tool" &&
-    message.toolGroupKey === conversation.currentToolGroupKey
-  ));
-  if (!group) {
-    group = createToolGroup(conversation.currentToolGroupKey);
-    conversation.messages.push(group);
-  }
+  group = createToolGroup(conversation.currentToolGroupKey);
+  conversation.messages.push(group);
   return group;
 }
 
@@ -2903,13 +2914,20 @@ function updateContentText(update) {
   return typeof update.text === "string" ? update.text : "";
 }
 
+function appendThinkingText(group, text) {
+  const separator = group.thinkingText && group.lastPart !== "thinking" ? "\n\n" : "";
+  group.thinkingText = `${group.thinkingText ?? ""}${separator}${text}`;
+  group.lastPart = "thinking";
+}
+
 function upsertThinking(update, conversation = activeConversation() ?? state.composer) {
   const thought = updateContentText(update);
   if (thought.length === 0) {
     return;
   }
   const group = ensureToolGroup(conversation);
-  group.thinkingText = `${group.thinkingText ?? ""}${thought}`;
+  appendThinkingText(group, thought);
+  group.acpThinking = true;
   scheduleMessagesRender(conversation, group);
 }
 
@@ -2943,6 +2961,7 @@ function upsertToolActivity(update, conversation = activeConversation() ?? state
   if (detail.length > 0) {
     activity.detail = detail;
   }
+  group.lastPart = "tool";
   scheduleMessagesRender(conversation, group);
 }
 
@@ -4379,50 +4398,60 @@ function updateNativeMessageTurn(message, conversation) {
     conversation.currentAssistantMessageKey = key;
     conversation.currentAssistantTurnKey = conversation.currentTurnKey;
     conversation.lastStreamRole = "assistant";
+    // A visible reply ends the current Thinking panel; later reasoning starts a new one.
+    conversation.currentToolGroupKey = null;
   }
 }
 
+const nativeReasoningApplied = new WeakMap();
+
+// Session loads replay no ACP thought chunks, so persisted reasoning fills in loaded history.
 function upsertNativeReasoning(record, conversation, assistantMessage) {
   const reasoningText = typeof record.reasoningText === "string"
     ? record.reasoningText
     : "";
-  if (reasoningText.length === 0) {
+  if (!conversation.loading || reasoningText.length === 0) {
+    return;
+  }
+  let applied = nativeReasoningApplied.get(conversation.messages);
+  if (!applied) {
+    applied = new Set();
+    nativeReasoningApplied.set(conversation.messages, applied);
+  }
+  if (applied.has(record.messageId)) {
     return;
   }
 
-  const assistantIndex = assistantMessage
+  const insertionIndex = assistantMessage
     ? conversation.messages.indexOf(assistantMessage)
-    : -1;
-  let group = assistantIndex > 0 &&
-    conversation.messages[assistantIndex - 1]?.role === "tool"
-    ? conversation.messages[assistantIndex - 1]
-    : null;
-  if (group?.thinkingText) {
+    : conversation.messages.length;
+  if (insertionIndex < 0) {
     return;
   }
-
-  const toolGroupKey = `tool-group:native:${record.messageId}`;
-  if (!group) {
-    group = conversation.messages.find((message) => (
-      message.role === "tool" &&
-      message.toolGroupKey === toolGroupKey
-    ));
+  let group = conversation.messages[insertionIndex - 1]?.role === "tool"
+    ? conversation.messages[insertionIndex - 1]
+    : null;
+  // Live updates kept in the server's replay cache already carry this turn's reasoning.
+  if (group?.acpThinking) {
+    return;
   }
+  applied.add(record.messageId);
+
+  let inserted = false;
   if (!group) {
-    group = createToolGroup(toolGroupKey);
-    const insertionIndex = assistantIndex >= 0
-      ? assistantIndex
-      : conversation.messages.length;
+    group = createToolGroup(`tool-group:native:${record.messageId}`);
     conversation.messages.splice(insertionIndex, 0, group);
     for (const [key, index] of conversation.messageKeys) {
       if (index >= insertionIndex) {
         conversation.messageKeys.set(key, index + 1);
       }
     }
+    inserted = true;
   }
-
-  group.thinkingText = reasoningText;
-  scheduleMessagesRender(conversation, group);
+  group.lastPart = null;
+  appendThinkingText(group, reasoningText);
+  // Inserting shifts message indexes, so in-place article updates would target the wrong rows.
+  scheduleMessagesRender(conversation, inserted ? null : group);
 }
 
 function ingestNativeMessage(record, conversation) {
@@ -4521,7 +4550,7 @@ function ingestNativeMessage(record, conversation) {
     if (Number.isInteger(index) && index >= 0) {
       conversation.messageKeys.set(key, index);
     }
-    updateNativeMessageTurn(message, conversation);
+    updateNativeMessageTurn(record, conversation);
     if (record.role === "assistant") {
       upsertNativeReasoning(record, conversation, message);
     }
@@ -4566,7 +4595,7 @@ function ingestNativeMessage(record, conversation) {
   if (record.role === "user") {
     restoreSelectionMessageMetadata(message, conversation);
   }
-  updateNativeMessageTurn(message, conversation);
+  updateNativeMessageTurn(record, conversation);
   if (record.role === "assistant") {
     upsertNativeReasoning(record, conversation, message);
   }
@@ -4782,6 +4811,16 @@ function replayNativeHistory(replayUpdates, nativeMessages, conversation) {
   const replayTurns = splitReplayTurns(replayUpdates);
   const nativeTurns = splitNativeTurns(nativeMessages);
   const pairs = alignReplayTurns(replayTurns, nativeTurns);
+  // Tool-round messages usually have no text, so their reasoning is placed with their tool calls.
+  const reasoningByToolCall = new Map();
+  for (const message of nativeMessages) {
+    if (message?.role !== "assistant" || !Array.isArray(message.toolCallIds)) {
+      continue;
+    }
+    for (const toolCallId of message.toolCallIds) {
+      reasoningByToolCall.set(toolCallId, message);
+    }
+  }
   let fallbackMessageNumber = 0;
 
   for (const [turnIndex, replayTurn] of replayTurns.entries()) {
@@ -4799,6 +4838,12 @@ function replayNativeHistory(replayUpdates, nativeMessages, conversation) {
       const matched = role === "user" ? userMatched : assistantMatches.has(groupIndex);
       if (!role || matched) {
         handleSessionUpdate(params, conversation.sessionId);
+        const nativeToolMessage = !role && params.update.sessionUpdate === "tool_call"
+          ? reasoningByToolCall.get(params.update.toolCallId)
+          : undefined;
+        if (nativeToolMessage) {
+          upsertNativeReasoning(nativeToolMessage, conversation, null);
+        }
         if (role === "user" && startsGroup) {
           ingestNativeMessage(nativeTurn.user, conversation);
         } else if (role === "assistant" && startsGroup) {
