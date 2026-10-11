@@ -52,6 +52,9 @@ keeps the model, tools, authentication, and workspace local.
   headings, lists, links, inline code, code blocks, and quotes.
 - Use a light or dark theme, defaulting to the browser/system theme.
 - Scroll conversation history independently from the chat area.
+- Jump to the latest message using the floating down-arrow button that appears
+  when you scroll up; new responses keep your reading position until you return
+  to the bottom.
 - Collapse or expand the conversation sidebar; its state is remembered in the
   browser.
 

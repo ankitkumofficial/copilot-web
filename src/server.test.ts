@@ -122,7 +122,7 @@ input.on("line", (line) => {
       update(request.params.sessionId, {
         sessionUpdate: "agent_message_chunk",
         messageId: "history-assistant",
-        content: { type: "text", text: "GoCD tools are unavailable." }
+        content: { type: "text", text: process.env.TEST_HISTORY_TEXT ?? "GoCD tools are unavailable." }
       });
       setTimeout(
         () => {
@@ -303,6 +303,7 @@ async function startTestServer(t: TestContext, options: {
   loadDelayMs?: number;
   failRecoveryLoads?: boolean;
   profileSessions?: boolean;
+  historyText?: string;
   context?: "default" | "long_context";
 } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-server-reconnect-test-"));
@@ -334,6 +335,7 @@ async function startTestServer(t: TestContext, options: {
       TEST_LOAD_DELAY_MS: String(options.loadDelayMs ?? 0),
       TEST_FAIL_RECOVERY_LOADS: String(options.failRecoveryLoads ?? false),
       TEST_PROFILE_SESSIONS: String(options.profileSessions ?? false),
+      ...(options.historyText ? { TEST_HISTORY_TEXT: options.historyText } : {}),
       PORT: String(port)
     },
     stdio: ["ignore", "pipe", "pipe"]
@@ -903,6 +905,92 @@ async function startTestBrowser(t: TestContext, baseUrl: string) {
   };
   return { command, sessionId, evaluate, waitFor };
 }
+
+test("shows a jump-to-bottom button without interrupting conversation scrolling", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    loadDelayMs: 150,
+    historyText: Array.from({ length: 30 }, (_, index) => `History paragraph ${index}.`).join("\n\n")
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await command("Emulation.setDeviceMetricsOverride", {
+    width: 1200, height: 900, deviceScaleFactor: 1, mobile: false
+  }, sessionId);
+  const button = `document.querySelector('#scroll-to-bottom')`;
+  const bottomDistance = `(() => {
+    const messages = document.querySelector('#messages');
+    return messages.scrollHeight - messages.scrollTop - messages.clientHeight;
+  })()`;
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="session-1"]'))`);
+  assert.equal(await evaluate(`${button}.hidden && ${button}.disabled`), true);
+  await evaluate(`document.querySelector('button.session-item[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector('#messages').getAttribute('aria-busy') === 'true'`);
+  assert.equal(await evaluate(`${button}.hidden && ${button}.disabled`), true);
+  await waitFor(`document.querySelector('#messages').textContent.includes('History paragraph 29.')`);
+  await waitFor(`${bottomDistance} < 1 && ${button}.hidden`);
+
+  await evaluate(`document.querySelector('#messages').scrollTop = 0`);
+  await waitFor(`!${button}.hidden && !${button}.disabled`);
+  assert.equal(await evaluate(`
+    (() => {
+      const arrow = ${button}.getBoundingClientRect();
+      const messages = document.querySelector('#messages').getBoundingClientRect();
+      const composer = document.querySelector('#composer').getBoundingClientRect();
+      return arrow.width === 36 && arrow.height === 36 &&
+        arrow.bottom <= messages.bottom && arrow.bottom < composer.top &&
+        Math.abs((arrow.left + arrow.right - messages.left - messages.right) / 2) < 1;
+    })()
+  `), true);
+  assert.equal((await server.post("messages", { text: "continue while reading history" })).status, 200);
+  await waitFor(`document.querySelector('#messages').textContent.includes('Done.')`);
+  assert.equal(await evaluate(`document.querySelector('#messages').scrollTop`), 0);
+  assert.equal(await evaluate(`${button}.hidden || ${button}.disabled`), false);
+
+  await evaluate(`${button}.click()`);
+  await waitFor(`${bottomDistance} < 1 && ${button}.hidden && ${button}.disabled`);
+  await evaluate(`
+    (() => {
+      const messages = document.querySelector('#messages');
+      messages.scrollTop = messages.scrollHeight - messages.clientHeight - 79;
+    })()
+  `);
+  await waitFor(`${button}.hidden`);
+  await evaluate(`
+    (() => {
+      const messages = document.querySelector('#messages');
+      messages.scrollTop = messages.scrollHeight - messages.clientHeight - 80;
+    })()
+  `);
+  await waitFor(`!${button}.hidden && !${button}.disabled`);
+  await command("Emulation.setEmulatedMedia", {
+    features: [{ name: "prefers-reduced-motion", value: "reduce" }]
+  }, sessionId);
+  assert.equal(await evaluate(`${button}.click(); ${bottomDistance} < 1 && ${button}.hidden`), true);
+
+  assert.equal((await server.post("messages", { text: "continue at the bottom" })).status, 200);
+  await waitFor(`document.querySelector('#messages').textContent.match(/Done\\./g)?.length === 2`);
+  await waitFor(`${bottomDistance} < 1 && ${button}.hidden`);
+  await command("Emulation.setDeviceMetricsOverride", {
+    width: 390, height: 700, deviceScaleFactor: 1, mobile: false
+  }, sessionId);
+  await waitFor(`!${button}.hidden && !${button}.disabled`);
+  assert.equal(await evaluate(`
+    ${button}.getBoundingClientRect().bottom < document.querySelector('#composer').getBoundingClientRect().top
+  `), true);
+  await evaluate(`${button}.click()`);
+  await waitFor(`${bottomDistance} < 1 && ${button}.hidden`);
+  await evaluate(`document.querySelector('#messages').scrollTop = 0`);
+  await waitFor(`!${button}.hidden`);
+  await evaluate(`document.querySelector('#new-chat').click()`);
+  await waitFor(`document.querySelector('#messages').contains(document.querySelector('#empty-state'))`);
+  assert.equal(await evaluate(`${button}.hidden && ${button}.disabled`), true);
+  await evaluate(`document.querySelector('button.session-item[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector('#messages').textContent.includes('History paragraph 29.')`);
+  await waitFor(`${bottomDistance} < 1 && ${button}.hidden`);
+});
 
 test("preserves the draft and attachments when an empty conversation changes model and context", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
