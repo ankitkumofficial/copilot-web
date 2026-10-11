@@ -15,6 +15,10 @@ keeps the model, tools, authentication, and workspace local.
   survive browser and server restarts.
 - Select an existing conversation and resume it with its full history replayed
   into the browser.
+- Show each completed user message and Copilot reply's recorded date and time
+  in the browser's local timezone, using **Today, 1:18 PM** for messages from
+  today and the date for older messages; the tooltip gives the full date and
+  time. Interrupted or otherwise untimestamped messages show no timestamp.
 - Switch between conversations while another conversation is working; each
   conversation keeps its own transcript, prompt queue, draft, attachments,
   selected passages, cancellation state, streamed activities, and usage.
@@ -122,9 +126,28 @@ choice is stored in the browser until System is selected again.
 ## Requirements
 
 - Node.js 24 or newer
-- GitHub Copilot CLI 1.0.95 or newer (required for ACP context startup/resume)
+- GitHub Copilot CLI 1.0.95 or newer for ACP context startup/resume; native
+  message timestamps require the SDK/CLI `sessions.readPersistedEvents` API
+  (verified with CLI 1.0.97)
 - A completed `copilot login`
 - A `~/projects` directory containing the repositories to work with
+
+Recorded user-message and reply timestamps use Copilot's persisted native
+message events. The server reads those events through the discovered Copilot
+SDK and the normal `copilot` executable;
+it does not create, resume, or activate a conversation to read history, rewrite
+the transcript, or store timestamps in a separate file. The displayed local
+date and time are in a separate `<time>` element, outside the Markdown body and
+copied message content. ACP continues to provide tool, reasoning, and
+configuration activity.
+
+Persisted-history reading depends on an experimental SDK/CLI API, available in
+the tested Copilot CLI 1.0.97 release. If the API is unsupported or a history
+read fails, Copilot Web displays a warning and falls back to ACP replay;
+timestamps are unavailable for those ACP-only messages. A message without a
+recorded event timestamp never receives an inferred or current time. Copilot
+does not record command output such as `/mcp reload` (used by **Reconnect
+tools**), so it is shown without a timestamp and without a warning.
 
 ## Running
 
@@ -213,6 +236,15 @@ brand mark uses `C`.
 - Long-running prompt turns remain active until Copilot completes, the user
   cancels them, or a new prompt requests an interruption; they are not cut off
   by the bridge's short request timeout.
+- Native persisted-message history is experimental and depends on the installed
+  SDK and Copilot CLI supporting `sessions.readPersistedEvents`. If it is
+  unavailable or unreadable, ACP replay remains available with an explicit
+  warning, but it cannot supply recorded message timestamps.
+- When loading history, native messages are placed beside ACP tool and
+  reasoning activity by conversation turn, using the tool-call IDs both sources
+  share. If a turn's native and ACP messages cannot be matched exactly, that
+  part of the transcript is shown from ACP without timestamps, with a warning,
+  rather than risking shifted or duplicated messages.
 - Tool recovery requires the CLI to advertise the native `/mcp` command through
   ACP. Recovery waits up to five seconds for delayed command metadata and
   reports an explicit timeout if it never arrives. Cancelling during that wait
@@ -227,6 +259,9 @@ The Node.js backend launches `copilot --acp` as a local child process and
 translates ACP JSON-RPC messages into a small HTTP/SSE API. The static browser
 client consumes that API; Copilot credentials, model calls, file access, shell
 commands, MCP servers, and tool execution remain in the local CLI process.
+Native user and assistant messages are sourced from the Copilot event stream
+and read-only persisted-event snapshots; ACP remains authoritative for tools,
+reasoning, and configuration activity.
 
 ## Configuration
 
@@ -239,7 +274,7 @@ commands, MCP servers, and tool execution remain in the local CLI process.
 | `COPILOT_BIN` | `copilot` | Copilot CLI executable |
 | `COPILOT_ALLOW_ALL` | `false` | Pass `--allow-all` to the Copilot ACP process |
 | `COPILOT_NATIVE_SESSION_DELETE` | `true` | Enable the SDK/native CLI fallback for deleting sessions |
-| `COPILOT_SDK_PATH` | auto-discovered | Optional path to the installed Copilot SDK `index.js` |
+| `COPILOT_SDK_PATH` | auto-discovered | Optional path to the installed Copilot SDK `index.js`, used for session deletion and persisted-message history |
 
 Session deletion is confirmation-protected in the browser. ACP deletion is
 preferred when advertised; otherwise the backend uses Copilot CLI's native

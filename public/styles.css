@@ -694,6 +694,21 @@ button:disabled {
   margin: 0 auto 23px;
 }
 
+.history-warning {
+  margin: 10px 0 0;
+  padding: 8px 11px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 0.76rem;
+  line-height: 1.4;
+}
+
+.history-warning[hidden] {
+  display: none;
+}
+
 .message-header {
   display: flex;
   align-items: center;
@@ -849,6 +864,15 @@ button:disabled {
   line-height: 1.58;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.message-timestamp {
+  display: block;
+  margin: 5px 2px 0;
+  color: var(--muted);
+  font-size: 0.74rem;
+  line-height: 1.2;
+  text-align: right;
 }
 
 .message.assistant .message-body {

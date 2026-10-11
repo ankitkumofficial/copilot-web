@@ -535,7 +535,11 @@ export class AcpConnection {
             events: [
               "assistant.usage",
               "session.usage_checkpoint",
-              "session.session_limits_changed"
+              "session.session_limits_changed",
+              "user.message",
+              "assistant.message_start",
+              "assistant.message_delta",
+              "assistant.message"
             ]
           }
         },
