@@ -202,6 +202,8 @@ const elements = {
   dropHint: document.querySelector("#drop-hint"),
   attachFiles: document.querySelector("#attach-files"),
   fileInput: document.querySelector("#file-input"),
+  voiceInput: document.querySelector("#voice-input"),
+  voiceInputStatus: document.querySelector("#voice-input-status"),
   keepAwake: document.querySelector("#keep-awake"),
   keepAwakeStatus: document.querySelector("#keep-awake-status"),
   reconnectTools: document.querySelector("#reconnect-tools"),
@@ -225,6 +227,17 @@ const elements = {
   imagePreviewDialog: document.querySelector("#image-preview-dialog"),
   imagePreviewImage: document.querySelector("#image-preview-image")
 };
+
+const speechRecognitionConstructor = window.SpeechRecognition ?? window.webkitSpeechRecognition;
+const voiceInputState = {
+  supported: Boolean(window.isSecureContext) && typeof speechRecognitionConstructor === "function",
+  unavailableReason: window.isSecureContext
+    ? "Speech recognition is not supported by this browser."
+    : "Voice input requires HTTPS or localhost.",
+  session: null,
+  notice: null
+};
+let pendingVoiceSubmit = null;
 
 const screenWakeLock = {
   enabled: typeof navigator.wakeLock?.request === "function" && readScreenWakeLockPreference(),
@@ -1341,6 +1354,366 @@ function setStatus(message, conversation = activeConversation() ?? state.compose
   hint.hidden = hidden;
 }
 
+function renderVoiceInputControl() {
+  const session = voiceInputState.session;
+  const active = Boolean(session);
+  const conversation = currentComposerConversation();
+  const iconName = active ? "stop" : "microphone";
+  if (elements.voiceInput.dataset.icon !== iconName) {
+    elements.voiceInput.innerHTML = iconName === "stop"
+      ? '<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg>'
+      : '<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2m7 9v3m-4 0h8"></path></svg>';
+    elements.voiceInput.dataset.icon = iconName;
+  }
+
+  const label = active
+    ? session.status === "starting" ? "Cancel voice input" : "Stop voice input"
+    : voiceInputState.supported ? "Start voice input" : "Voice input unavailable";
+  elements.voiceInput.disabled = !voiceInputState.supported || (
+    !active && conversation.loading
+  );
+  elements.voiceInput.title = active ? label : (
+    voiceInputState.supported ? label : voiceInputState.unavailableReason
+  );
+  elements.voiceInput.setAttribute("aria-label", label);
+  elements.voiceInput.setAttribute("aria-pressed", String(active));
+  elements.voiceInput.dataset.state = session?.status ??
+    (voiceInputState.notice?.type === "error" ? "error" : "idle");
+
+  const notice = voiceInputState.notice;
+  elements.voiceInputStatus.textContent = notice?.message ?? "";
+  elements.voiceInputStatus.hidden = !notice;
+  elements.voiceInputStatus.dataset.state = notice?.type ?? "";
+}
+
+function appendSpeechSegment(current, segment) {
+  if (
+    current &&
+    segment &&
+    !/\s$/.test(current) &&
+    !/^[,.;:!?%)\]}]/.test(segment)
+  ) {
+    return `${current} ${segment}`;
+  }
+  return `${current}${segment}`;
+}
+
+function transcriptFromSpeechResults(results) {
+  let finalTranscript = "";
+  let interimTranscript = "";
+  for (const result of Array.from(results ?? [])) {
+    const transcript = result?.[0]?.transcript;
+    if (typeof transcript !== "string" || transcript.length === 0) {
+      continue;
+    }
+    if (result.isFinal) {
+      finalTranscript = appendSpeechSegment(finalTranscript, transcript);
+    } else {
+      interimTranscript = appendSpeechSegment(interimTranscript, transcript);
+    }
+  }
+  return appendSpeechSegment(finalTranscript, interimTranscript).trim();
+}
+
+function formatVoiceTranscript(transcript, prefix, suffix) {
+  let formatted = transcript.trim();
+  if (!formatted) {
+    return "";
+  }
+  if (
+    prefix &&
+    !/\s$/.test(prefix) &&
+    !/^[,.;:!?%)\]}]/.test(formatted)
+  ) {
+    formatted = ` ${formatted}`;
+  }
+  if (
+    suffix &&
+    !/^\s/.test(suffix) &&
+    !/[ \t\n]$/.test(formatted) &&
+    !/^[,.;:!?%)\]}]/.test(suffix)
+  ) {
+    formatted += " ";
+  }
+  return formatted;
+}
+
+function updateVoiceInputRangeAfterEdit(session, nextValue) {
+  const previousValue = session.lastDraftValue;
+  if (previousValue === nextValue) {
+    return true;
+  }
+
+  let changedStart = 0;
+  while (
+    changedStart < previousValue.length &&
+    changedStart < nextValue.length &&
+    previousValue[changedStart] === nextValue[changedStart]
+  ) {
+    changedStart += 1;
+  }
+  let unchangedSuffix = 0;
+  while (
+    unchangedSuffix < previousValue.length - changedStart &&
+    unchangedSuffix < nextValue.length - changedStart &&
+    previousValue[previousValue.length - unchangedSuffix - 1] ===
+      nextValue[nextValue.length - unchangedSuffix - 1]
+  ) {
+    unchangedSuffix += 1;
+  }
+
+  const changedEnd = previousValue.length - unchangedSuffix;
+  const nextChangedEnd = nextValue.length - unchangedSuffix;
+  if (changedEnd <= session.start) {
+    const change = nextChangedEnd - changedEnd;
+    session.start += change;
+    session.end += change;
+  } else if (changedStart < session.end) {
+    return false;
+  }
+  session.lastDraftValue = nextValue;
+  return true;
+}
+
+function voiceDraftFor(conversation) {
+  return currentComposerConversation() === conversation
+    ? elements.input.value
+    : conversation.draft;
+}
+
+function updateVoiceDraft(conversation, value, selectionEnd) {
+  conversation.draft = value;
+  if (currentComposerConversation() !== conversation) {
+    return;
+  }
+  elements.input.value = value;
+  elements.input.setSelectionRange(selectionEnd, selectionEnd);
+  resizePromptInput();
+}
+
+function updateVoiceTranscript(session, results) {
+  if (voiceInputState.session !== session || !session.acceptResults) {
+    return;
+  }
+  const currentValue = voiceDraftFor(session.conversation);
+  if (currentValue.slice(session.start, session.end) !== session.renderedText) {
+    void stopVoiceInput(session, {
+      discardResults: true,
+      notice: "Voice input stopped because the dictated text was edited."
+    });
+    return;
+  }
+
+  const transcript = transcriptFromSpeechResults(results);
+  const replacement = transcript
+    ? formatVoiceTranscript(
+      transcript,
+      currentValue.slice(0, session.start),
+      currentValue.slice(session.end)
+    )
+    : session.originalText;
+  const nextValue = currentValue.slice(0, session.start) +
+    replacement +
+    currentValue.slice(session.end);
+  session.end = session.start + replacement.length;
+  session.renderedText = replacement;
+  session.lastDraftValue = nextValue;
+  updateVoiceDraft(session.conversation, nextValue, session.end);
+}
+
+function voiceStartErrorMessage(error) {
+  const name = error && typeof error === "object" && "name" in error
+    ? String(error.name)
+    : "";
+  if (name === "NotAllowedError" || name === "SecurityError") {
+    return "Microphone access was denied. Allow microphone access in your browser and try again.";
+  }
+  return "Unable to start voice input. Check your microphone and browser permissions, then try again.";
+}
+
+function voiceRecognitionErrorMessage(error) {
+  switch (error) {
+    case "not-allowed":
+    case "service-not-allowed":
+      return "Microphone access or speech recognition was denied. Check your browser permissions and try again.";
+    case "audio-capture":
+      return "No microphone is available. Connect or enable a microphone and try again.";
+    case "network":
+      return "Speech recognition could not connect. Check your network and try again.";
+    case "no-speech":
+      return "No speech was detected. Click the microphone to try again.";
+    case "language-not-supported":
+      return "This browser does not support speech recognition for the selected language.";
+    case "aborted":
+      return "Voice input was interrupted.";
+    default:
+      return "Voice input failed. Check your microphone and browser permissions, then try again.";
+  }
+}
+
+function finishVoiceInput(session) {
+  if (session.finished) {
+    return;
+  }
+  session.finished = true;
+  if (voiceInputState.session === session) {
+    voiceInputState.session = null;
+    if (session.errorMessage) {
+      voiceInputState.notice = { message: session.errorMessage, type: "error" };
+    } else if (session.stopNotice) {
+      voiceInputState.notice = { message: session.stopNotice, type: "status" };
+    } else if (!session.stopRequested) {
+      voiceInputState.notice = {
+        message: "Voice input ended. Click the microphone to start again.",
+        type: "status"
+      };
+    } else {
+      voiceInputState.notice = null;
+    }
+    renderVoiceInputControl();
+  }
+  session.resolveEnded();
+}
+
+function stopVoiceInput(session = voiceInputState.session, {
+  discardResults = false,
+  notice = null
+} = {}) {
+  if (!session) {
+    return Promise.resolve();
+  }
+  if (discardResults) {
+    session.acceptResults = false;
+  }
+  if (notice) {
+    session.stopNotice = notice;
+  }
+  if (session.stopRequested) {
+    return session.endedPromise;
+  }
+
+  session.stopRequested = true;
+  session.status = "stopping";
+  voiceInputState.notice = notice
+    ? { message: notice, type: "status" }
+    : { message: "Stopping voice input…", type: "status" };
+  renderVoiceInputControl();
+  try {
+    if (session.started) {
+      session.recognition.stop();
+    } else {
+      session.recognition.abort();
+    }
+  } catch (error) {
+    session.acceptResults = false;
+    session.errorMessage = "Unable to stop voice input. The browser could not stop microphone access.";
+    voiceInputState.notice = { message: session.errorMessage, type: "error" };
+    renderVoiceInputControl();
+    try {
+      session.recognition.abort();
+    } catch {
+      finishVoiceInput(session);
+    }
+  }
+  return session.endedPromise;
+}
+
+function startVoiceInput() {
+  if (!voiceInputState.supported || voiceInputState.session) {
+    return;
+  }
+  const conversation = currentComposerConversation();
+  if (conversation.loading) {
+    return;
+  }
+
+  let recognition;
+  try {
+    recognition = new speechRecognitionConstructor();
+  } catch (error) {
+    voiceInputState.notice = { message: voiceStartErrorMessage(error), type: "error" };
+    renderVoiceInputControl();
+    return;
+  }
+
+  const draft = elements.input.value;
+  const start = elements.input.selectionStart ?? draft.length;
+  const end = elements.input.selectionEnd ?? start;
+  let resolveEnded;
+  const endedPromise = new Promise((resolve) => {
+    resolveEnded = resolve;
+  });
+  const session = {
+    recognition,
+    conversation,
+    start,
+    end,
+    originalText: draft.slice(start, end),
+    renderedText: draft.slice(start, end),
+    lastDraftValue: draft,
+    status: "starting",
+    started: false,
+    stopRequested: false,
+    stopNotice: null,
+    acceptResults: true,
+    errorMessage: null,
+    finished: false,
+    endedPromise,
+    resolveEnded
+  };
+  voiceInputState.session = session;
+  voiceInputState.notice = { message: "Starting voice input…", type: "status" };
+
+  recognition.lang = navigator.language || "en-US";
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.maxAlternatives = 1;
+  recognition.onstart = () => {
+    if (session.finished) {
+      return;
+    }
+    session.started = true;
+    if (session.stopRequested) {
+      try {
+        recognition.stop();
+      } catch (error) {
+        session.errorMessage = "Unable to stop voice input. The browser could not stop microphone access.";
+        voiceInputState.notice = { message: session.errorMessage, type: "error" };
+        finishVoiceInput(session);
+      }
+      return;
+    }
+    session.status = "recording";
+    voiceInputState.notice = {
+      message: "Listening… Click the cross button to stop.",
+      type: "listening"
+    };
+    renderVoiceInputControl();
+  };
+  recognition.onresult = (event) => {
+    updateVoiceTranscript(session, event.results);
+  };
+  recognition.onerror = (event) => {
+    if (voiceInputState.session !== session || (event.error === "aborted" && session.stopRequested)) {
+      return;
+    }
+    session.errorMessage = voiceRecognitionErrorMessage(event.error);
+    voiceInputState.notice = { message: session.errorMessage, type: "error" };
+    renderVoiceInputControl();
+  };
+  recognition.onend = () => {
+    finishVoiceInput(session);
+  };
+  renderVoiceInputControl();
+  try {
+    recognition.start();
+  } catch (error) {
+    session.acceptResults = false;
+    session.errorMessage = voiceStartErrorMessage(error);
+    finishVoiceInput(session);
+  }
+}
+
 function resizePromptInput() {
   const styles = window.getComputedStyle(elements.input);
   const minHeight = Number.parseFloat(styles.minHeight) || 36;
@@ -1541,6 +1914,7 @@ function updateAttachmentControls() {
     conversation.attachmentBusy;
   elements.attachFiles.disabled = disabled;
   elements.fileInput.disabled = disabled;
+  renderVoiceInputControl();
   renderConfigurationControls();
 }
 
@@ -3489,6 +3863,7 @@ function persistComposerDraft() {
 
 function activateConversation(sessionId) {
   persistComposerDraft();
+  void stopVoiceInput();
   const conversation = conversationState(sessionId);
   state.activeSessionId = sessionId;
   saveActiveSessionId(sessionId);
@@ -3534,9 +3909,13 @@ function activateComposerConversation(conversation = state.composer) {
   renderConnectionStatus();
 }
 
-function startNewConversation({ discardDraft = false } = {}) {
+async function startNewConversation({ discardDraft = false } = {}) {
   if (state.deletingSessionId && !discardDraft) {
     return;
+  }
+  const voiceSession = voiceInputState.session;
+  if (voiceSession) {
+    await stopVoiceInput(voiceSession);
   }
   if (!discardDraft) {
     persistComposerDraft();
@@ -4021,6 +4400,31 @@ async function drainPromptQueue(conversation = activeConversation()) {
 
 async function sendPrompt(event) {
   event.preventDefault();
+  if (pendingVoiceSubmit) {
+    await pendingVoiceSubmit;
+    return;
+  }
+  const voiceSession = voiceInputState.session;
+  if (voiceSession) {
+    const conversation = currentComposerConversation();
+    pendingVoiceSubmit = (async () => {
+      await stopVoiceInput(voiceSession);
+      if (currentComposerConversation() !== conversation) {
+        return;
+      }
+      await submitPrompt();
+    })();
+    try {
+      await pendingVoiceSubmit;
+    } finally {
+      pendingVoiceSubmit = null;
+    }
+    return;
+  }
+  await submitPrompt();
+}
+
+async function submitPrompt() {
   let conversation = currentComposerConversation();
   const text = elements.input.value;
   if (
@@ -4436,8 +4840,23 @@ elements.fileInput.addEventListener("change", () => {
   void addFiles(elements.fileInput.files);
   elements.fileInput.value = "";
 });
+elements.voiceInput.addEventListener("click", () => {
+  if (voiceInputState.session) {
+    void stopVoiceInput();
+  } else {
+    startVoiceInput();
+  }
+});
 elements.input.addEventListener("input", () => {
-  currentComposerConversation().draft = elements.input.value;
+  const conversation = currentComposerConversation();
+  conversation.draft = elements.input.value;
+  const session = voiceInputState.session;
+  if (session?.conversation === conversation && !updateVoiceInputRangeAfterEdit(session, elements.input.value)) {
+    void stopVoiceInput(session, {
+      discardResults: true,
+      notice: "Voice input stopped because the dictated text was edited."
+    });
+  }
   resizePromptInput();
 });
 elements.input.addEventListener("paste", handlePaste);
@@ -4505,10 +4924,17 @@ elements.keepAwake.addEventListener("click", () => {
   screenWakeLock.error = null;
   void updateScreenWakeLock();
 });
+renderVoiceInputControl();
 document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    void stopVoiceInput(voiceInputState.session, {
+      notice: "Voice input stopped because this tab was hidden."
+    });
+  }
   void updateScreenWakeLock();
 });
 window.addEventListener("pagehide", () => {
+  void stopVoiceInput();
   screenWakeLock.pageActive = false;
   void updateScreenWakeLock();
 });

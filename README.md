@@ -23,6 +23,10 @@ keeps the model, tools, authentication, and workspace local.
 - Reload a conversation after a CLI crash without duplicating its history or
   showing historical messages as new output.
 - Send prompts and receive streamed Copilot responses.
+- Dictate into the message composer with the microphone button; interim speech
+  appears as text while recording, and the cross button stops recording while
+  keeping the draft. This requires browser speech-recognition support and
+  microphone permission in a secure context (HTTPS or localhost).
 - Send another prompt while Copilot is working to interrupt the active turn;
   the new prompt is submitted as soon as cancellation completes.
 - Queue multiple prompts while an interruption is in progress; they are sent
@@ -182,6 +186,10 @@ brand mark uses `C`.
 
 - This is a single-user local interface. It is not intended to be exposed to
   a network or used as a multi-user service.
+- Voice dictation uses the browser's Web Speech API, not a local speech model.
+  Recognition availability and language support depend on the browser, and its
+  speech-recognition service may process audio remotely. Dictation stops when
+  switching conversations or hiding the tab.
 - The workspace is Copilot's default context and working directory, not an
   absolute security boundary. Copilot may access other paths when explicitly
   permitted by the CLI.
