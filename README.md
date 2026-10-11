@@ -20,6 +20,8 @@ keeps the model, tools, authentication, and workspace local.
   cancellation state, streamed activities, and usage.
 - Recover an in-progress prompt after a browser refresh and continue showing
   its streamed result.
+- Reload a conversation after a CLI crash without duplicating its history or
+  showing historical messages as new output.
 - Send prompts and receive streamed Copilot responses.
 - Send another prompt while Copilot is working to interrupt the active turn;
   the new prompt is submitted as soon as cancellation completes.
@@ -29,6 +31,16 @@ keeps the model, tools, authentication, and workspace local.
   through ACP.
 - Show Copilot reasoning text when the ACP stream exposes thought chunks.
 - Display tool activity while Copilot works.
+- Reload MCP connections using **Reconnect tools**, even when Copilot says a
+  tool is unavailable without attempting a call, or after refreshing the page.
+  This uses the native `/mcp reload` ACP command without restarting the CLI,
+  rerunning earlier actions, or clearing your draft.
+- Use **Reconnect & retry** after an MCP-related prompt or tool failure to
+  reload MCP connections before resubmitting the original text and attachments.
+  The action requires an explicit MCP error or connection-failure message;
+  tool titles and filenames alone do not qualify. Unidentified failures can
+  still be handled with **Reconnect tools**. Retrying reruns the entire prompt
+  and may repeat actions that already completed.
 - Approve or reject Copilot tool permission requests from the browser.
 - Cancel an in-progress prompt.
 - Switch the active model when Copilot exposes model choices.
@@ -153,6 +165,13 @@ brand mark uses `C`.
 - Long-running prompt turns remain active until Copilot completes, the user
   cancels them, or a new prompt requests an interruption; they are not cut off
   by the bridge's short request timeout.
+- Tool recovery requires the CLI to advertise the native `/mcp` command through
+  ACP. Recovery waits up to five seconds for delayed command metadata and
+  reports an explicit timeout if it never arrives. Cancelling during that wait
+  prevents the reload and prompt retry. It reloads configured MCP servers but
+  does not guarantee that every server reconnects successfully or permanently
+  fix upstream lifecycle bugs.
+  Verify recovery with a fresh tool call; a cached status is not sufficient.
 
 ## Architecture
 
