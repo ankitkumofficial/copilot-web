@@ -35,6 +35,10 @@ keeps the model, tools, authentication, and workspace local.
   tool is unavailable without attempting a call, or after refreshing the page.
   This uses the native `/mcp reload` ACP command without restarting the CLI,
   rerunning earlier actions, or clearing your draft.
+  Reload and retry controls remain disabled while any conversation has an
+  active or queued prompt, including background conversations.
+  Server activity is tracked separately from local prompt queues, and delayed
+  session or status responses cannot overwrite newer activity notifications.
 - Use **Reconnect & retry** after an MCP-related prompt or tool failure to
   reload MCP connections before resubmitting the original text and attachments.
   The action requires an explicit MCP error or connection-failure message;
@@ -172,6 +176,10 @@ brand mark uses `C`.
 - Only the selected conversation's composer and settings are shown in the main
   panel. Background conversations continue processing and show a working or
   queued indicator in the sidebar.
+- MCP reloads are exclusive across conversations because ACP connections may
+  be shared. The server rejects reloads while any prompt is active and rejects
+  new prompts during a reload, including manually submitted `/mcp reload`
+  commands.
 - Prompt attachments are limited to images and PDFs, with an 8 MB per-file and
   16 MB per-message total size limit.
 - Long-running prompt turns remain active until Copilot completes, the user
