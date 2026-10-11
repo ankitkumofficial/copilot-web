@@ -927,13 +927,6 @@ async function main(): Promise<void> {
     allowAll
   });
   await copilotHistory.initialize();
-  if (!copilotHistory.available) {
-    console.warn(
-      `[history] Native message history is unavailable: ${
-        copilotHistory.unavailableReason ?? "unknown error"
-      }. ACP fallback messages do not have recorded timestamps.`
-    );
-  }
 
   const browserCapabilities = () => {
     const capabilities = acp.getCapabilities();
@@ -1011,10 +1004,6 @@ async function main(): Promise<void> {
         ? [{ ...message, attachments: message.attachments.map((attachment) => ({ ...attachment })) }]
         : [];
     })
-  );
-
-  const historyFallbackWarning = (reason: string): string => (
-    `Native message history is unavailable (${reason}). Showing ACP history; recorded message timestamps are unavailable.`
   );
 
   const ensureSessionAvailable = (sessionId: string): void => {
@@ -1273,11 +1262,6 @@ async function main(): Promise<void> {
       context: acp.getSessionContext(setup.sessionId),
       configOptions: setup.configOptions,
       nativeMessageHistoryAvailable: copilotHistory.available,
-      ...(!copilotHistory.available
-        ? { historyWarning: historyFallbackWarning(
-          copilotHistory.unavailableReason ?? "the installed Copilot SDK is unavailable"
-        ) }
-        : {}),
       ...(persistenceWarnings.length > 0 ? { persistenceWarnings } : {})
     }, previousSessionId);
     for (const client of sseClients) {
@@ -1539,11 +1523,6 @@ async function main(): Promise<void> {
         capabilities: browserCapabilities(),
         contexts: contextOptions,
         nativeMessageHistoryAvailable: copilotHistory.available,
-        ...(!copilotHistory.available
-          ? { historyWarning: historyFallbackWarning(
-            copilotHistory.unavailableReason ?? "the persisted-history API is unavailable"
-          ) }
-          : {}),
         newSessionDefaults
       });
       return true;
@@ -1591,11 +1570,6 @@ async function main(): Promise<void> {
         projectsDirectory,
         contexts: contextOptions,
         nativeMessageHistoryAvailable: copilotHistory.available,
-        ...(!copilotHistory.available
-          ? { historyWarning: historyFallbackWarning(
-            copilotHistory.unavailableReason ?? "the persisted-history API is unavailable"
-          ) }
-          : {}),
         newSessionDefaults
       }));
       sseClients.add(client);
@@ -1638,11 +1612,6 @@ async function main(): Promise<void> {
         capabilities: browserCapabilities(),
         contexts: contextOptions,
         nativeMessageHistoryAvailable: copilotHistory.available,
-        ...(!copilotHistory.available
-          ? { historyWarning: historyFallbackWarning(
-            copilotHistory.unavailableReason ?? "the persisted-history API is unavailable"
-          ) }
-          : {}),
         newSessionDefaults
       });
       return true;
@@ -1710,11 +1679,6 @@ async function main(): Promise<void> {
         models: setup.models,
         modes: setup.modes,
         nativeMessageHistoryAvailable: copilotHistory.available,
-        ...(!copilotHistory.available
-          ? { historyWarning: historyFallbackWarning(
-            copilotHistory.unavailableReason ?? "the persisted-history API is unavailable"
-          ) }
-          : {}),
         newSessionDefaults
       });
       return true;
@@ -1860,18 +1824,19 @@ async function main(): Promise<void> {
       const nativeHistoryRead = startNativeHistoryRead(sessionId);
       let persistedNativeEvents: JsonObject[] = [];
       let nativeHistoryReadSucceeded = sessionWasUnprompted && copilotHistory.available;
-      let nativeHistoryReadError: string | undefined;
       try {
         if (nativeHistoryRead) {
           persistedNativeEvents = await nativeHistoryRead.promise;
           nativeHistoryReadSucceeded = true;
         } else if (!sessionWasUnprompted && copilotHistory.available) {
-          nativeHistoryReadError = "A persisted-history read could not be started";
+          console.warn(
+            `[history] Unable to start persisted-message read for ${sessionId}`
+          );
         }
       } catch (error) {
-        nativeHistoryReadError = error instanceof Error ? error.message : String(error);
+        const message = error instanceof Error ? error.message : String(error);
         console.warn(
-          `[history] Unable to read persisted messages for ${sessionId}: ${nativeHistoryReadError}`
+          `[history] Unable to read persisted messages for ${sessionId}: ${message}`
         );
       }
 
@@ -1920,7 +1885,6 @@ async function main(): Promise<void> {
         );
         nativePipelineModes.set(setup.sessionId, nativeMessagesActive);
         let nativeMessages: NativeMessage[] = [];
-        let historyWarning: string | undefined;
         if (nativeMessagesActive) {
           if (nativeHistoryReadSucceeded) {
             for (const event of persistedNativeEvents) {
@@ -1939,7 +1903,6 @@ async function main(): Promise<void> {
             );
           } else {
             nativeMessages = nativeMessagesForState(state);
-            historyWarning = `Copilot persisted history could not be read (${nativeHistoryReadError ?? "unknown error"}). Earlier messages may be missing; timestamps are shown only when available from native events.`;
           }
           if (
             busyPrompt?.nativeUserMessageId &&
@@ -1954,11 +1917,6 @@ async function main(): Promise<void> {
               }
             }
           }
-        } else {
-          const reason = nativeHistoryReadError ??
-            copilotHistory.unavailableReason ??
-            "the persisted-history API is unavailable";
-          historyWarning = historyFallbackWarning(reason);
         }
         jsonResponse(response, 200, {
           session: sessionView,
@@ -1972,7 +1930,6 @@ async function main(): Promise<void> {
           replayUpdates: [...(sessionReplayCache.get(setup.sessionId) ?? [])],
           nativeMessagesActive,
           ...(nativeMessagesActive ? { nativeMessages } : {}),
-          ...(historyWarning ? { historyWarning } : {}),
           ...(persistenceWarnings.length > 0 ? { persistenceWarnings } : {})
         });
         return true;
@@ -2185,11 +2142,6 @@ async function main(): Promise<void> {
         context: acp.getSessionContext(setup.sessionId) ?? "default",
         configOptions: setup.configOptions,
         nativeMessageHistoryAvailable: copilotHistory.available,
-        ...(!copilotHistory.available
-          ? { historyWarning: historyFallbackWarning(
-            copilotHistory.unavailableReason ?? "the persisted-history API is unavailable"
-          ) }
-          : {}),
         ...(persistenceWarnings.length > 0 ? { persistenceWarnings } : {})
       });
       return true;
