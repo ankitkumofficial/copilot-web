@@ -95,6 +95,7 @@ interface BusyPrompt {
   clientPromptId?: string;
   userMessageId?: string;
   cancelController: AbortController;
+  reloadingMcp: boolean;
 }
 
 interface SessionUsage {
@@ -1729,9 +1730,25 @@ async function main(): Promise<void> {
       if (busySessions.has(sessionId)) {
         throw new HttpError(409, "Conversation is already processing a prompt");
       }
+      const nativeMcpReload = typeof body.text === "string" &&
+        body.text.trim() === "/mcp reload";
+      const reloadMcp = body.reconnect === true || nativeMcpReload;
+      if ([...busySessions.values()].some((prompt) => prompt.reloadingMcp)) {
+        throw new HttpError(409, "MCP connections are currently reloading");
+      }
+      if (reloadMcp && busySessions.size > 0) {
+        throw new HttpError(
+          409,
+          "Cannot reload MCP connections while another conversation is processing a prompt"
+        );
+      }
       const clientPromptId = parseOptionalPromptId(body.clientPromptId, "Client prompt id");
       const promptId = randomBytes(12).toString("hex");
-      const busyPrompt: BusyPrompt = { promptId, cancelController: new AbortController() };
+      const busyPrompt: BusyPrompt = {
+        promptId,
+        cancelController: new AbortController(),
+        reloadingMcp: reloadMcp
+      };
       if (clientPromptId !== undefined) {
         busyPrompt.clientPromptId = clientPromptId;
       }
@@ -1739,6 +1756,7 @@ async function main(): Promise<void> {
       let stopReason: string | undefined;
       let errorMessage: string | undefined;
       try {
+        publish("session-prompt-started", { sessionId, promptId }, sessionId);
         const context = acp.getSessionContext(sessionId) ?? "default";
         await acp.start(context);
         const prompt = parsePrompt(body, acp.getCapabilities(context));
@@ -1762,6 +1780,7 @@ async function main(): Promise<void> {
             acp.reloadMcpServers(session, busyPrompt.cancelController.signal)
           ));
           ensureSessionAvailable(sessionId);
+          busyPrompt.reloadingMcp = nativeMcpReload;
         }
         const reloadOnly = body.reconnect === true &&
           prompt.length === 1 &&

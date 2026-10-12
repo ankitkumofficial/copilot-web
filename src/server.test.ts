@@ -203,7 +203,9 @@ input.on("line", (line) => {
           }
         });
         respond({ stopReason: "end_turn" });
-      }, reload ? 200 : 20);
+      }, reload
+        ? Number(process.env.TEST_MCP_RELOAD_DELAY_MS ?? 200)
+        : Number(process.env.TEST_PROMPT_DELAY_MS ?? 20));
       if (profiles) {
         const session = sessions.get(request.params.sessionId);
         session.messages.push(request.params.prompt[0].text);
@@ -303,6 +305,8 @@ async function startTestServer(t: TestContext, options: {
   loadDelayMs?: number;
   failRecoveryLoads?: boolean;
   profileSessions?: boolean;
+  promptDelayMs?: number;
+  reloadDelayMs?: number;
   historyText?: string;
   context?: "default" | "long_context";
 } = {}) {
@@ -335,6 +339,8 @@ async function startTestServer(t: TestContext, options: {
       TEST_LOAD_DELAY_MS: String(options.loadDelayMs ?? 0),
       TEST_FAIL_RECOVERY_LOADS: String(options.failRecoveryLoads ?? false),
       TEST_PROFILE_SESSIONS: String(options.profileSessions ?? false),
+      TEST_PROMPT_DELAY_MS: String(options.promptDelayMs ?? 20),
+      TEST_MCP_RELOAD_DELAY_MS: String(options.reloadDelayMs ?? 200),
       ...(options.historyText ? { TEST_HISTORY_TEXT: options.historyText } : {}),
       PORT: String(port)
     },
@@ -364,8 +370,7 @@ async function startTestServer(t: TestContext, options: {
   const cookie = homeResponse.headers.get("set-cookie")?.split(";")[0];
   assert.ok(cookie);
   const headers = { Cookie: cookie, "Content-Type": "application/json" };
-  let sessionId = "session-1";
-  if (!options.existingSession) {
+  const createSession = async (): Promise<string> => {
     const createResponse = await fetch(`${baseUrl}/api/sessions`, {
       method: "POST",
       headers,
@@ -380,16 +385,19 @@ async function startTestServer(t: TestContext, options: {
     const created: unknown = await createResponse.json();
     assert.ok(isRecord(created) && isRecord(created.session));
     assert.equal(typeof created.session.sessionId, "string");
-    sessionId = String(created.session.sessionId);
+    const sessionId = String(created.session.sessionId);
     if (!options.profileSessions) {
       assert.equal(sessionId, "session-1");
     }
-  }
+    return sessionId;
+  };
+  const sessionId = options.existingSession ? "session-1" : await createSession();
 
   return {
     baseUrl,
     headers,
     sessionId,
+    createSession,
     session: (id: string) => readFile(path.join(projects, `profile-session-${id}.json`), "utf8")
       .then((content) => JSON.parse(content) as unknown),
     metadata: (name: string) => readFile(path.join(home, ".copilot-web", name), "utf8")
@@ -401,6 +409,13 @@ async function startTestServer(t: TestContext, options: {
         assert.ok(isRecord(request));
         return request;
       });
+    },
+    async waitForPrompt(text: string): Promise<void> {
+      const deadline = Date.now() + 5_000;
+      while (!(await this.requests()).some((request) => request.text === text)) {
+        assert.ok(Date.now() < deadline, `Prompt did not start: ${text}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
     },
     starts: () => readFile(path.join(projects, "copilot-start-count.txt"), "utf8"),
     post: (subroute: string, body: JsonObject, id = sessionId) => fetch(
@@ -530,6 +545,129 @@ test("reloads tools only once without replaying a previous prompt", async (t) =>
     [{ method: "session/prompt", text: "/mcp reload" }]
   );
   assert.equal(await server.starts(), "1");
+});
+
+test("rejects cross-conversation MCP reloads without blocking ordinary parallel prompts", async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true, promptDelayMs: 1_000
+  });
+  const idleSessionId = await server.createSession();
+  const working = server.post("messages", { text: "working" });
+  await server.waitForPrompt("working");
+
+  for (const body of [
+    { text: "/mcp reload", reconnect: true },
+    { text: "retry after reconnecting", reconnect: true },
+    { text: "/mcp reload" }
+  ]) {
+    const response = await server.post("messages", body, idleSessionId);
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      error: "Cannot reload MCP connections while another conversation is processing a prompt"
+    });
+  }
+  assert.equal((await server.requests()).some((request) => request.text === "/mcp reload"), false);
+
+  const parallel = server.post("messages", { text: "parallel prompt" }, idleSessionId);
+  await server.waitForPrompt("parallel prompt");
+  const statusResponse = await fetch(
+    `${server.baseUrl}/api/sessions/${server.sessionId}/status`,
+    { headers: server.headers }
+  );
+  const status: unknown = await statusResponse.json();
+  assert.ok(isRecord(status) && status.busy === true);
+  for (const response of await Promise.all([working, parallel])) {
+    assert.equal(response.status, 200);
+  }
+
+  const reload = await server.post("messages", { text: "/mcp reload", reconnect: true }, idleSessionId);
+  assert.equal(reload.status, 200);
+  assert.deepEqual(
+    (await server.requests()).filter((request) => request.method === "session/prompt")
+      .map((request) => request.text),
+    ["working", "parallel prompt", "/mcp reload"]
+  );
+});
+
+test("blocks new prompts and reloads while another conversation reloads MCP", async (t) => {
+  for (const reconnect of [true, false]) {
+    await t.test(reconnect ? "Reconnect tools" : "native command", async (t) => {
+      const server = await startTestServer(t, {
+        profileSessions: true, reloadDelayMs: 1_000
+      });
+      const idleSessionId = await server.createSession();
+      const reload = server.post("messages", { text: "/mcp reload", reconnect });
+      await server.waitForPrompt("/mcp reload");
+
+      for (const body of [
+        { text: "blocked during reload" },
+        { text: "/mcp reload", reconnect: true },
+        { text: "blocked retry", reconnect: true },
+        { text: "/mcp reload" }
+      ]) {
+        const response = await server.post("messages", body, idleSessionId);
+        assert.equal(response.status, 409);
+        assert.deepEqual(await response.json(), {
+          error: "MCP connections are currently reloading"
+        });
+      }
+      assert.equal(
+        (await server.requests()).filter((request) => request.method === "session/prompt").length,
+        1
+      );
+      assert.equal((await reload).status, 200);
+      assert.equal(
+        (await server.post("messages", { text: "after reload" }, idleSessionId)).status,
+        200
+      );
+    });
+  }
+});
+
+test("allows parallel prompts after MCP reload finishes during a retry", async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true, promptDelayMs: 1_000, reloadDelayMs: 20
+  });
+  const idleSessionId = await server.createSession();
+  const retry = server.post("messages", { text: "retry this prompt", reconnect: true });
+  await server.waitForPrompt("retry this prompt");
+  const parallel = server.post("messages", { text: "parallel with retry" }, idleSessionId);
+  await server.waitForPrompt("parallel with retry");
+  const statusResponse = await fetch(
+    `${server.baseUrl}/api/sessions/${server.sessionId}/status`,
+    { headers: server.headers }
+  );
+  const status: unknown = await statusResponse.json();
+  assert.ok(isRecord(status) && status.busy === true);
+  for (const response of await Promise.all([retry, parallel])) {
+    assert.equal(response.status, 200);
+  }
+});
+
+test("releases cross-conversation MCP reload guards after failure and cancellation", async (t) => {
+  for (const failReload of [true, false]) {
+    await t.test(failReload ? "failure" : "cancellation", async (t) => {
+      const server = await startTestServer(t, {
+        profileSessions: true, failReload, reloadDelayMs: 500
+      });
+      const idleSessionId = await server.createSession();
+      const reload = server.post("messages", { text: "/mcp reload", reconnect: true });
+      if (!failReload) {
+        await server.waitForPrompt("/mcp reload");
+        assert.equal((await server.post("cancel", {})).status, 202);
+      }
+      const response = await reload;
+      assert.equal(response.status, failReload ? 500 : 200);
+      assert.deepEqual(
+        await response.json(),
+        failReload ? { error: "MCP reload failed" } : { stopReason: "cancelled" }
+      );
+      assert.equal(
+        (await server.post("messages", { text: "after recovery" }, idleSessionId)).status,
+        200
+      );
+    });
+  }
 });
 
 test("preserves prompt text and attachments when retrying after MCP reload", async (t) => {
@@ -791,7 +929,7 @@ const chromePath = process.env.CHROME_BIN ?? (
     : "/usr/bin/google-chrome"
 );
 
-async function startTestBrowser(t: TestContext, baseUrl: string) {
+async function startTestBrowser(t: TestContext, baseUrl: string, preloadScript?: string) {
   const profile = await mkdtemp(path.join(tmpdir(), "copilot-web-browser-test-"));
   const browser = spawn(chromePath, [
     "--headless=new",
@@ -882,11 +1020,16 @@ async function startTestBrowser(t: TestContext, baseUrl: string) {
       }));
     })
   );
-  const target = await command("Target.createTarget", { url: baseUrl });
+  const target = await command("Target.createTarget", { url: "about:blank" });
   assert.equal(typeof target.targetId, "string");
   const attached = await command("Target.attachToTarget", { targetId: target.targetId, flatten: true });
   assert.equal(typeof attached.sessionId, "string");
   const sessionId = String(attached.sessionId);
+  if (preloadScript) {
+    await command("Page.enable", {}, sessionId);
+    await command("Page.addScriptToEvaluateOnNewDocument", { source: preloadScript }, sessionId);
+  }
+  await command("Page.navigate", { url: baseUrl }, sessionId);
   const evaluate = async (expression: string): Promise<unknown> => {
     const result = await command("Runtime.evaluate", {
       expression,
@@ -905,6 +1048,57 @@ async function startTestBrowser(t: TestContext, baseUrl: string) {
   };
   return { command, sessionId, evaluate, waitFor };
 }
+
+const trackPromptEvents = `
+  const NativeEventSource = window.EventSource;
+  window.promptEvents = [];
+  window.EventSource = class extends NativeEventSource {
+    constructor(url, options) {
+      super(url, options);
+      window.testEventSource = this;
+      for (const type of ['session-prompt-started', 'session-prompt-complete']) {
+        this.addEventListener(type, (event) => {
+          window.promptEvents.push({ type, ...JSON.parse(event.data) });
+        });
+      }
+    }
+  };
+`;
+
+const holdSessionListResponse = `
+  if (!window.nativeFetchForRaceTest) {
+    window.nativeFetchForRaceTest = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      const url = typeof resource === 'string' ? resource : resource.url;
+      if (
+        !url.endsWith('/api/sessions') ||
+        (init?.method ?? 'GET') !== 'GET' ||
+        !window.holdNextSessionList
+      ) {
+        return window.nativeFetchForRaceTest(resource, init);
+      }
+      window.holdNextSessionList = false;
+      const response = await window.nativeFetchForRaceTest(resource, init);
+      const payload = await response.json();
+      window.heldSessionList = payload;
+      return new Promise((resolve) => {
+        window.releaseSessionList = () => {
+          if (typeof window.snapshotMarker === 'string') {
+            payload.sessions.find((session) => (
+              session.sessionId === window.markerSessionId
+            )).title = window.snapshotMarker;
+          }
+          resolve(new Response(JSON.stringify(payload), {
+            status: response.status,
+            headers: response.headers
+          }));
+        };
+      });
+    };
+  }
+  window.heldSessionList = null;
+  window.holdNextSessionList = true;
+`;
 
 test("shows a jump-to-bottom button without interrupting conversation scrolling", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
@@ -1072,6 +1266,236 @@ test("preserves the draft and attachments when an empty conversation changes mod
   assert.equal(prompt.prompt[1].type, "image");
   assert.equal(prompt.prompt[1].data, imageData);
   assert.match(String(await evaluate(`document.querySelector('#usage-context').textContent`)), /968K/);
+});
+
+test("disables MCP recovery across conversations and restores it when background work finishes", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true, promptDelayMs: 3_000 });
+  const idleSessionId = await server.createSession();
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${idleSessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${idleSessionId}"]'
+  ).click()`);
+  await waitFor(`!document.querySelector('#reconnect-tools').disabled`);
+  await evaluate(`
+    (() => {
+      const input = document.querySelector('#prompt-input');
+      input.value = 'mcp-failure';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('#composer').dispatchEvent(
+        new Event('submit', { bubbles: true, cancelable: true })
+      );
+    })()
+  `);
+  await waitFor(`document.querySelector('.message-retry')?.disabled === false`);
+
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`!document.querySelector('#reconnect-tools').disabled`);
+  await evaluate(`
+    (() => {
+      const input = document.querySelector('#prompt-input');
+      input.value = 'working in another conversation';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('#composer').dispatchEvent(
+        new Event('submit', { bubbles: true, cancelable: true })
+      );
+    })()
+  `);
+  await server.waitForPrompt("working in another conversation");
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${idleSessionId}"]'
+  ).click()`);
+  await waitFor(`
+    document.querySelector('button.session-item.active')?.dataset.sessionId === "${idleSessionId}" &&
+    document.querySelector('#reconnect-tools').disabled &&
+    document.querySelector('.message-retry')?.disabled === true
+  `);
+  await evaluate(`
+    (() => {
+      window.retryConfirmations = 0;
+      window.confirm = () => {
+        window.retryConfirmations += 1;
+        return true;
+      };
+      for (const button of document.querySelectorAll('#reconnect-tools, .message-retry')) {
+        button.disabled = false;
+        button.click();
+        button.disabled = true;
+      }
+    })()
+  `);
+  assert.equal(await evaluate("window.retryConfirmations"), 0);
+  assert.equal(await evaluate(`document.querySelector('#messages').textContent.includes('/mcp reload')`), false);
+  assert.equal((await server.requests()).some((request) => request.text === "/mcp reload"), false);
+  await waitFor(`
+    !document.querySelector('#reconnect-tools').disabled &&
+    document.querySelector('.message-retry')?.disabled === false
+  `);
+
+  const externalPrompt = server.post("messages", { text: "prompt from another tab" });
+  await waitFor(`
+    document.querySelector('#reconnect-tools').disabled &&
+    document.querySelector('.message-retry')?.disabled === true
+  `);
+  await evaluate("window.beforeBusyRefresh = true");
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`
+    window.beforeBusyRefresh !== true &&
+    document.querySelector('button.session-item.active')?.dataset.sessionId === "${idleSessionId}" &&
+    document.querySelector(
+      'button.session-item[data-session-id="${server.sessionId}"] .session-status'
+    )?.textContent.includes('Working') &&
+    document.querySelector('#reconnect-tools')?.disabled === true
+  `);
+  assert.equal((await externalPrompt).status, 200);
+  await waitFor(`!document.querySelector('#reconnect-tools').disabled`);
+});
+
+test("keeps MCP recovery disabled when local cleanup overlaps a newer remote prompt", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true, promptDelayMs: 1_500 });
+  const idleSessionId = await server.createSession();
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, trackPromptEvents);
+  await waitFor(`Boolean(window.testEventSource)`);
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${idleSessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${idleSessionId}"]'
+  ).click()`);
+  await waitFor(`!document.querySelector('#reconnect-tools').disabled`);
+  await evaluate(`
+    (() => {
+      const input = document.querySelector('#prompt-input');
+      input.value = 'mcp-failure';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('#composer').dispatchEvent(
+        new Event('submit', { bubbles: true, cancelable: true })
+      );
+    })()
+  `);
+  await waitFor(`document.querySelector('.message-retry')?.disabled === false`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`!document.querySelector('#reconnect-tools').disabled`);
+  await evaluate(holdSessionListResponse);
+  await evaluate(`
+    (() => {
+      const input = document.querySelector('#prompt-input');
+      input.value = 'local prompt awaiting cleanup';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('#composer').dispatchEvent(
+        new Event('submit', { bubbles: true, cancelable: true })
+      );
+    })()
+  `);
+  await waitFor(`Boolean(window.heldSessionList)`);
+  assert.equal(await evaluate(`window.heldSessionList.sessions.find((session) => (
+    session.sessionId === "${server.sessionId}"
+  )).busy`), false);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${idleSessionId}"]'
+  ).click()`);
+
+  const remotePrompt = server.post("messages", { text: "newer remote prompt" });
+  await waitFor(`window.promptEvents.filter((event) => (
+    event.type === 'session-prompt-started' && event.sessionId === "${server.sessionId}"
+  )).length === 2`);
+  await evaluate(`window.releaseSessionList()`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`document.querySelector('#cancel-prompt').disabled`);
+  assert.equal(await evaluate(`document.querySelector('#reconnect-tools').disabled`), true);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${idleSessionId}"]'
+  ).click()`);
+  assert.equal(await evaluate(`document.querySelector('.message-retry').disabled`), true);
+  assert.equal((await remotePrompt).status, 200);
+  await waitFor(`
+    !document.querySelector('#reconnect-tools').disabled &&
+    document.querySelector('.message-retry')?.disabled === false
+  `);
+});
+
+test("merges delayed session snapshots without overriding newer prompt events", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true, promptDelayMs: 1_500 });
+  const idleSessionId = await server.createSession();
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, trackPromptEvents);
+  await waitFor(`Boolean(window.testEventSource)`);
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${idleSessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${idleSessionId}"]'
+  ).click()`);
+  await waitFor(`!document.querySelector('#reconnect-tools').disabled`);
+  await evaluate(`
+    (() => {
+      const input = document.querySelector('#prompt-input');
+      input.value = 'mcp-failure';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('#composer').dispatchEvent(
+        new Event('submit', { bubbles: true, cancelable: true })
+      );
+    })()
+  `);
+  await waitFor(`document.querySelector('.message-retry')?.disabled === false`);
+  await evaluate(`window.markerSessionId = "${server.sessionId}"`);
+
+  for (const busySnapshot of [true, false]) {
+    const marker = busySnapshot ? "Completed snapshot applied" : "Started snapshot applied";
+    let remotePrompt: Promise<Response> | undefined;
+    if (busySnapshot) {
+      remotePrompt = server.post("messages", { text: "complete before snapshot arrives" });
+      await waitFor(`document.querySelector('#reconnect-tools').disabled`);
+    }
+    await evaluate(holdSessionListResponse);
+    await evaluate(`
+      window.snapshotMarker = ${JSON.stringify(marker)};
+      window.testEventSource.dispatchEvent(new MessageEvent('session-activity', {
+        data: JSON.stringify({
+          sessionId: 'session-refresh-probe',
+          lastActivityAt: new Date().toISOString()
+        })
+      }));
+    `);
+    await waitFor(`Boolean(window.heldSessionList)`);
+    assert.equal(await evaluate(`window.heldSessionList.sessions.find((session) => (
+      session.sessionId === "${server.sessionId}"
+    )).busy`), busySnapshot);
+
+    if (busySnapshot) {
+      assert.equal((await remotePrompt)?.status, 200);
+      await waitFor(`!document.querySelector('#reconnect-tools').disabled`);
+    } else {
+      remotePrompt = server.post("messages", { text: "start after snapshot was captured" });
+      await waitFor(`document.querySelector('#reconnect-tools').disabled`);
+    }
+    await evaluate(`window.releaseSessionList()`);
+    await waitFor(`document.querySelector(
+      'button.session-item[data-session-id="${server.sessionId}"] .session-title'
+    )?.textContent === ${JSON.stringify(marker)}`);
+    assert.equal(await evaluate(`document.querySelector('#reconnect-tools').disabled`), !busySnapshot);
+    assert.equal(await evaluate(`document.querySelector('.message-retry').disabled`), !busySnapshot);
+    if (!busySnapshot) {
+      assert.equal((await remotePrompt)?.status, 200);
+      await waitFor(`!document.querySelector('#reconnect-tools').disabled`);
+    }
+  }
 });
 
 test("keeps tools recovery available for successful refusals and after page refresh", {
