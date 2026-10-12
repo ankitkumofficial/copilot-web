@@ -165,6 +165,10 @@ let eventReconnectTimer = null;
 let eventReconnectDelayMs = eventReconnectInitialDelayMs;
 let eventReconnectInProgress = false;
 const pendingPromptCompletions = new Map();
+const serverPromptStates = new Map();
+let serverPromptRevision = 0;
+let serverPromptRequestId = 0;
+let lastSessionListRequestId = 0;
 
 const elements = {
   statusFavicon: document.querySelector("#app-favicon"),
@@ -568,6 +572,56 @@ function selectedNewSessionConfigOverrides(conversation) {
   );
 }
 
+function beginServerPromptStateRequest() {
+  return {
+    revision: serverPromptRevision,
+    requestId: ++serverPromptRequestId
+  };
+}
+
+function applyServerPromptState(sessionId, result, request = null) {
+  const previous = serverPromptStates.get(sessionId);
+  // Preserve newer events and responses from later requests.
+  if (
+    request &&
+    previous &&
+    (
+      previous.revision > request.revision ||
+      previous.requestId > request.requestId
+    )
+  ) {
+    return previous;
+  }
+  const promptState = {
+    busy: result.busy === true,
+    promptId: result.busy === true && typeof result.promptId === "string"
+      ? result.promptId
+      : null,
+    revision: request ? previous?.revision ?? 0 : ++serverPromptRevision,
+    requestId: request?.requestId ?? previous?.requestId ?? 0
+  };
+  serverPromptStates.set(sessionId, promptState);
+  const session = state.sessions.find((item) => item.sessionId === sessionId);
+  if (session) {
+    session.busy = promptState.busy;
+    session.promptId = promptState.promptId;
+  }
+  return promptState;
+}
+
+function canReloadMcp(conversation) {
+  return Boolean(conversation?.sessionId) &&
+    !conversation.loading &&
+    !conversation.configurationBusy &&
+    !conversation.attachmentBusy &&
+    !promptIsActive(conversation) &&
+    conversation.promptQueue.length === 0 &&
+    ![...serverPromptStates.values()].some((promptState) => promptState.busy) &&
+    ![...state.conversations.values()].some((candidate) => (
+      promptIsActive(candidate) || candidate.promptQueue.length > 0
+    ));
+}
+
 function renderConfigurationControls() {
   const conversation = activeConversation() ?? state.composer;
   const configuration = conversation;
@@ -582,12 +636,11 @@ function renderConfigurationControls() {
     conversation &&
     (conversation.busy || conversation.loading || conversation.configurationBusy)
   );
-  elements.reconnectTools.disabled = !conversation?.sessionId ||
-    promptIsActive(conversation) ||
-    conversation.loading ||
-    conversation.configurationBusy ||
-    conversation.attachmentBusy ||
-    conversation.promptQueue.length > 0;
+  const reloadDisabled = !canReloadMcp(conversation);
+  elements.reconnectTools.disabled = reloadDisabled;
+  for (const retry of elements.messages.querySelectorAll(".message-retry")) {
+    retry.disabled = reloadDisabled;
+  }
 }
 
 function applySessionSetup(result, context, conversation = activeConversation() ?? state.composer) {
@@ -2509,11 +2562,7 @@ function renderMessages(conversation = activeConversation()) {
       retry.className = "message-retry";
       retry.textContent = "Reconnect & retry";
       retry.title = "Reload MCP connections and retry the whole prompt";
-      retry.disabled = conversation.loading ||
-        conversation.configurationBusy ||
-        conversation.attachmentBusy ||
-        promptIsActive(conversation) ||
-        conversation.promptQueue.length > 0;
+      retry.disabled = !canReloadMcp(conversation);
       retry.addEventListener("click", () => retryFailedPrompt(message, conversation));
       article.append(retry);
     }
@@ -2561,6 +2610,7 @@ function setBusy(value, conversation = activeConversation()) {
     renderConversationControls();
   } else {
     renderConnectionStatus();
+    renderConversationControls();
   }
   renderRetryActions(conversation);
 }
@@ -2665,6 +2715,7 @@ function scheduleRecoveredPromptPolling(conversation = activeConversation()) {
       return;
     }
     try {
+      const request = beginServerPromptStateRequest();
       const result = await api(`/api/sessions/${encodeURIComponent(sessionId)}/status`);
       if (
         (!conversation.busy && !conversation.recoveredPrompt) ||
@@ -2672,9 +2723,10 @@ function scheduleRecoveredPromptPolling(conversation = activeConversation()) {
       ) {
         return;
       }
+      const promptState = applyServerPromptState(sessionId, result, request);
       if (
-        result.busy !== true ||
-        (promptId && result.promptId !== promptId)
+        !promptState.busy ||
+        (promptId && promptState.promptId !== promptId)
       ) {
         if (conversation.recoveredPrompt) {
           finishRecoveredPrompt({ sessionId, promptId }, conversation);
@@ -3214,11 +3266,17 @@ async function deleteConversation(sessionId) {
 }
 
 async function refreshSessions() {
+  const request = beginServerPromptStateRequest();
   const result = await api("/api/sessions");
+  if (request.requestId < lastSessionListRequestId) {
+    return;
+  }
+  lastSessionListRequestId = request.requestId;
   const sessions = Array.isArray(result.sessions) ? result.sessions : [];
   state.sessions = sessions.map((session) => {
     const previousSession = state.sessions.find((item) => item.sessionId === session.sessionId);
     const conversation = conversationState(session.sessionId, false);
+    const promptState = applyServerPromptState(session.sessionId, session, request);
     if (typeof session.customTitle === "string" && session.customTitle.length > 0) {
       if (conversation) {
         conversation.activeSessionTitleOverride = session.customTitle;
@@ -3227,10 +3285,12 @@ async function refreshSessions() {
     }
     return {
       ...session,
+      busy: promptState.busy,
+      promptId: promptState.promptId,
       lastActivityAt: latestTimestamp(
         previousSession?.lastActivityAt,
         session.lastActivityAt ?? session.updatedAt,
-        session.busy === true ? new Date().toISOString() : undefined
+        promptState.busy ? new Date().toISOString() : undefined
       ),
       ...(conversation?.activeSessionTitleOverride
         ? { title: conversation.activeSessionTitleOverride }
@@ -3239,6 +3299,12 @@ async function refreshSessions() {
           : {})
     };
   });
+  const listedSessions = new Set(sessions.map((session) => session.sessionId));
+  for (const sessionId of serverPromptStates.keys()) {
+    if (!listedSessions.has(sessionId)) {
+      applyServerPromptState(sessionId, { busy: false }, request);
+    }
+  }
   state.capabilities = result.capabilities ?? state.capabilities;
   state.newSessionDefaults = result.newSessionDefaults ?? state.newSessionDefaults;
   renderSessionList();
@@ -3272,14 +3338,20 @@ async function reconcileConversationStatus(conversation) {
   ) {
     return;
   }
+  const sessionId = conversation.sessionId;
   try {
+    const request = beginServerPromptStateRequest();
     const result = await api(
-      `/api/sessions/${encodeURIComponent(conversation.sessionId)}/status`
+      `/api/sessions/${encodeURIComponent(sessionId)}/status`
     );
-    if (result.busy === true) {
+    if (conversation.sessionId !== sessionId) {
+      return;
+    }
+    const promptState = applyServerPromptState(sessionId, result, request);
+    if (promptState.busy) {
       if (conversation.recoveredPrompt) {
-        conversation.recoveredPromptId = typeof result.promptId === "string"
-          ? result.promptId
+        conversation.recoveredPromptId = promptState.promptId !== null
+          ? promptState.promptId
           : conversation.recoveredPromptId;
         scheduleRecoveredPromptPolling(conversation);
       }
@@ -3473,9 +3545,14 @@ function upsertSession(session) {
     return false;
   }
   const conversation = conversationState(session.sessionId, false);
+  const promptState = serverPromptStates.get(session.sessionId);
   state.sessions = [
     {
       ...session,
+      ...(promptState ? {
+        busy: promptState.busy,
+        promptId: promptState.promptId
+      } : {}),
       ...(conversation?.activeSessionTitleOverride
         ? { title: conversation.activeSessionTitleOverride }
         : {})
@@ -3491,6 +3568,7 @@ function applySessionReplacement(result, previousSessionId) {
   if (!session || typeof session.sessionId !== "string" || session.sessionId === previousSessionId) {
     return;
   }
+  applyServerPromptState(previousSessionId, { busy: false });
   const conversation = conversationState(previousSessionId, false);
   const wasActive = state.activeSessionId === previousSessionId;
   if (wasActive) {
@@ -3569,11 +3647,13 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
   setStatus("Loading conversation...", conversation);
 
   try {
+    const request = beginServerPromptStateRequest();
     const result = await api(`/api/sessions/${encodeURIComponent(sessionId)}/load`, {
       method: "POST",
       body: JSON.stringify({ context: requestedContext })
     });
     applySessionReplacement(result, sessionId);
+    const promptState = applyServerPromptState(conversation.sessionId, result, request);
     conversation.loaded = true;
     applySessionSetup(result, requestedContext, conversation);
     if (
@@ -3599,11 +3679,9 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
     const pendingCompletion = pendingPromptCompletions.get(conversation.sessionId);
     pendingPromptCompletions.delete(conversation.sessionId);
     let completionHandled = false;
-    if (result.busy === true) {
+    if (promptState.busy) {
       conversation.recoveredPrompt = true;
-      conversation.recoveredPromptId = typeof result.promptId === "string"
-        ? result.promptId
-        : null;
+      conversation.recoveredPromptId = promptState.promptId;
       setBusy(true, conversation);
       setStatus("Copilot is working...", conversation);
       completionHandled = pendingCompletion
@@ -3910,15 +3988,7 @@ function enqueuePrompt(conversation, text, attachments, reconnect = false) {
 
 function retryFailedPrompt(message, conversation) {
   const retryPrompt = message.retryPrompt;
-  if (
-    !retryPrompt ||
-    !conversation.sessionId ||
-    conversation.loading ||
-    conversation.configurationBusy ||
-    conversation.attachmentBusy ||
-    conversation.promptQueue.length > 0 ||
-    promptIsActive(conversation)
-  ) {
+  if (!retryPrompt || !canReloadMcp(conversation)) {
     return;
   }
   if (!window.confirm(
@@ -3940,7 +4010,7 @@ function retryFailedPrompt(message, conversation) {
 
 function reconnectTools() {
   const conversation = activeConversation();
-  if (!conversation?.sessionId || elements.reconnectTools.disabled) {
+  if (!canReloadMcp(conversation)) {
     return;
   }
   enqueuePrompt(conversation, "/mcp reload", [], true);
@@ -4093,7 +4163,12 @@ function connectEvents() {
       applySessionReplacement(data, data.previousSessionId);
     }
   });
-  source.addEventListener("session-deleted", () => {
+  source.addEventListener("session-deleted", (event) => {
+    const data = JSON.parse(event.data);
+    if (typeof data?.sessionId === "string") {
+      applyServerPromptState(data.sessionId, { busy: false });
+      renderConversationControls();
+    }
     void refreshSessions().catch(showError);
   });
   source.addEventListener("session-renamed", (event) => {
@@ -4114,14 +4189,42 @@ function connectEvents() {
     conversation.activeSessionIsNew = false;
     renderSessionList();
   });
+  source.addEventListener("session-prompt-started", (event) => {
+    const data = JSON.parse(event.data);
+    if (
+      !data ||
+      typeof data.sessionId !== "string" ||
+      typeof data.promptId !== "string"
+    ) {
+      return;
+    }
+    applyServerPromptState(data.sessionId, { busy: true, promptId: data.promptId });
+    const session = state.sessions.find((item) => item.sessionId === data.sessionId);
+    if (!session) {
+      renderConversationControls();
+      void refreshSessions().catch(showError);
+      return;
+    }
+    renderSessionList();
+    renderConversationControls();
+    renderConnectionStatus();
+  });
   source.addEventListener("session-prompt-complete", (event) => {
     const data = JSON.parse(event.data);
     if (
       !data ||
-      typeof data.sessionId !== "string"
+      typeof data.sessionId !== "string" ||
+      typeof data.promptId !== "string"
     ) {
       return;
     }
+    const promptState = serverPromptStates.get(data.sessionId);
+    if (!promptState?.promptId || promptState.promptId === data.promptId) {
+      applyServerPromptState(data.sessionId, { busy: false });
+    }
+    renderSessionList();
+    renderConversationControls();
+    renderConnectionStatus();
     const conversation = conversationState(data.sessionId);
     if (finishRecoveredPrompt(data, conversation)) {
       return;
