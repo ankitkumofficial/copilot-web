@@ -6,6 +6,7 @@ const contextPreferences = ["default", "long_context"];
 const maximumAttachmentCount = 10;
 const maximumAttachmentBytes = 8 * 1024 * 1024;
 const maximumAttachmentTotalBytes = 16 * 1024 * 1024;
+const messagesBottomThreshold = 80;
 const imageMimeTypesByExtension = {
   ".avif": "image/avif",
   ".gif": "image/gif",
@@ -187,6 +188,7 @@ const elements = {
   usageContextMetric: document.querySelector("#usage-context-metric"),
   usageContext: document.querySelector("#usage-context"),
   messages: document.querySelector("#messages"),
+  scrollToBottom: document.querySelector("#scroll-to-bottom"),
   emptyState: document.querySelector("#empty-state"),
   loadingState: document.querySelector("#loading-state"),
   composer: document.querySelector("#composer"),
@@ -2389,6 +2391,21 @@ function restoreMessagePanelScroll(article, message, positions) {
   });
 }
 
+function messagesAreAtBottom() {
+  return elements.messages.scrollHeight -
+    elements.messages.scrollTop -
+    elements.messages.clientHeight < messagesBottomThreshold;
+}
+
+function updateScrollToBottomButton() {
+  const conversation = activeConversation();
+  const visible = conversation?.loading === false &&
+    conversation.messages.length > 0 &&
+    !messagesAreAtBottom();
+  elements.scrollToBottom.hidden = !visible;
+  elements.scrollToBottom.disabled = !visible;
+}
+
 function updateMessagesInPlace(conversation, messages) {
   const articlesByIndex = new Map();
   elements.messages.querySelectorAll(".message").forEach((article) => {
@@ -2407,9 +2424,7 @@ function updateMessagesInPlace(conversation, messages) {
     return false;
   }
 
-  const wasAtBottom = elements.messages.scrollHeight -
-    elements.messages.scrollTop -
-    elements.messages.clientHeight < 80;
+  const wasAtBottom = messagesAreAtBottom();
   const previousScrollTop = elements.messages.scrollTop;
   const previousScrollLeft = elements.messages.scrollLeft;
   for (const update of updates) {
@@ -2421,6 +2436,7 @@ function updateMessagesInPlace(conversation, messages) {
     elements.messages.scrollTop = previousScrollTop;
     elements.messages.scrollLeft = previousScrollLeft;
   }
+  updateScrollToBottomButton();
   return true;
 }
 
@@ -2428,9 +2444,7 @@ function renderMessages(conversation = activeConversation()) {
   if (conversation !== activeConversation()) {
     return;
   }
-  const wasAtBottom = elements.messages.scrollHeight -
-    elements.messages.scrollTop -
-    elements.messages.clientHeight < 80;
+  const wasAtBottom = messagesAreAtBottom();
   const previousScrollTop = elements.messages.scrollTop;
   const previousScrollLeft = elements.messages.scrollLeft;
   const panelScrollPositions = captureMessagePanelScroll(conversation);
@@ -2440,6 +2454,7 @@ function renderMessages(conversation = activeConversation()) {
     elements.messages.append(elements.loadingState);
     elements.emptyState.hidden = true;
     elements.messages.setAttribute("aria-busy", "true");
+    updateScrollToBottomButton();
     return;
   }
 
@@ -2448,6 +2463,7 @@ function renderMessages(conversation = activeConversation()) {
   if (!conversation || conversation.messages.length === 0) {
     elements.messages.append(elements.emptyState);
     elements.emptyState.hidden = false;
+    updateScrollToBottomButton();
     return;
   }
 
@@ -2510,6 +2526,7 @@ function renderMessages(conversation = activeConversation()) {
     elements.messages.scrollTop = previousScrollTop;
     elements.messages.scrollLeft = previousScrollLeft;
   }
+  updateScrollToBottomButton();
 }
 
 function renderRetryActions(conversation) {
@@ -4130,6 +4147,18 @@ function connectEvents() {
 elements.newChat.addEventListener("click", () => {
   startNewConversation();
 });
+elements.messages.addEventListener("scroll", updateScrollToBottomButton, { passive: true });
+elements.messages.addEventListener("load", updateScrollToBottomButton, true);
+elements.messages.addEventListener("toggle", updateScrollToBottomButton, true);
+elements.scrollToBottom.addEventListener("click", () => {
+  elements.messages.scrollTo({
+    top: elements.messages.scrollHeight,
+    behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
+  });
+  updateScrollToBottomButton();
+});
+const messagesResizeObserver = new ResizeObserver(updateScrollToBottomButton);
+messagesResizeObserver.observe(elements.messages);
 elements.renameInput.addEventListener("keydown", (event) => {
   if (event.key !== "Enter") {
     return;
