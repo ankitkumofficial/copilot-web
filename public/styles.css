@@ -544,9 +544,41 @@ button:disabled {
 }
 
 .messages {
+  grid-area: 1 / 1;
   min-height: 0;
   padding: 28px clamp(20px, 5vw, 72px);
   overflow: auto;
+}
+
+.scroll-to-bottom {
+  display: grid;
+  grid-area: 1 / 1;
+  z-index: 1;
+  align-self: end;
+  justify-self: center;
+  width: 36px;
+  height: 36px;
+  margin-bottom: 12px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface-raised);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.scroll-to-bottom[hidden] {
+  display: none;
+}
+
+.scroll-to-bottom:hover {
+  background: var(--surface-hover);
+}
+
+.scroll-to-bottom:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 
 .empty-state {
@@ -986,6 +1018,7 @@ button:disabled {
 
 .composer {
   position: relative;
+  grid-area: 2 / 1;
   width: calc(100% - 40px);
   max-width: 920px;
   margin: 8px auto 24px;
