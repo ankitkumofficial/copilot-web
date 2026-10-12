@@ -91,6 +91,7 @@ function createConversationState(sessionId = null) {
     status: "Ready",
     busy: false,
     activePromptKey: null,
+    activePrompt: null,
     cancelRequested: false,
     recoveredPrompt: false,
     recoveredPromptId: null,
@@ -194,6 +195,7 @@ const elements = {
   dropHint: document.querySelector("#drop-hint"),
   attachFiles: document.querySelector("#attach-files"),
   fileInput: document.querySelector("#file-input"),
+  reconnectTools: document.querySelector("#reconnect-tools"),
   send: document.querySelector("#send-prompt"),
   cancel: document.querySelector("#cancel-prompt"),
   permissionDialog: document.querySelector("#permission-dialog"),
@@ -578,6 +580,12 @@ function renderConfigurationControls() {
     conversation &&
     (conversation.busy || conversation.loading || conversation.configurationBusy)
   );
+  elements.reconnectTools.disabled = !conversation?.sessionId ||
+    promptIsActive(conversation) ||
+    conversation.loading ||
+    conversation.configurationBusy ||
+    conversation.attachmentBusy ||
+    conversation.promptQueue.length > 0;
 }
 
 function applySessionSetup(result, context, conversation = activeConversation() ?? state.composer) {
@@ -1376,6 +1384,7 @@ function updateAttachmentControls() {
     conversation.attachmentBusy;
   elements.attachFiles.disabled = disabled;
   elements.fileInput.disabled = disabled;
+  renderConfigurationControls();
 }
 
 function attachmentDataUrl(attachment) {
@@ -1475,6 +1484,7 @@ async function addFiles(fileList) {
 
   conversation.attachmentBusy = true;
   updateAttachmentControls();
+  renderRetryActions(conversation);
   const errors = [];
   let added = 0;
   try {
@@ -1531,6 +1541,7 @@ async function addFiles(fileList) {
     if (isActiveConversation(conversation) || conversation === state.composer) {
       updateAttachmentControls();
     }
+    renderRetryActions(conversation);
   }
 
   if (errors.length > 0) {
@@ -1963,6 +1974,24 @@ function updateContentText(update) {
   return typeof update.text === "string" ? update.text : "";
 }
 
+function isMcpFailure(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const lines = message.split(/\r?\n/);
+  const mcpContext = /\bmcp(?:[ \t]*:|[ \t]+(?:server|connection|transport|protocol|client|session|reload|request|error|failure)\b)/i;
+  const failure = /\b(?:failed|failure|error|closed|disconnected|refused|unavailable|timed out|timeout|not connected|not running)\b/i;
+  return lines.some((line, index) => {
+    if (!mcpContext.test(line)) {
+      return false;
+    }
+    if (failure.test(line)) {
+      return true;
+    }
+    const nextLine = lines[index + 1] ?? "";
+    return /^\s*(?:error|failed|failure|connection|transport|protocol|timeout|timed out|disconnected)\b/i.test(nextLine) &&
+      failure.test(nextLine);
+  });
+}
+
 function upsertThinking(update, conversation = activeConversation() ?? state.composer) {
   const thought = updateContentText(update);
   if (thought.length === 0) {
@@ -2002,6 +2031,13 @@ function upsertToolActivity(update, conversation = activeConversation() ?? state
   const detail = updateContentText(update).trim();
   if (detail.length > 0) {
     activity.detail = detail;
+  }
+  if (
+    activity.status.toLowerCase() === "failed" &&
+    conversation.activePrompt &&
+    isMcpFailure(activity.detail)
+  ) {
+    markPromptRetryable(conversation.activePrompt, conversation);
   }
   scheduleMessagesRender(conversation, group);
 }
@@ -2451,6 +2487,20 @@ function renderMessages(conversation = activeConversation()) {
     body.className = "message-body";
     renderMessageBody(body, message);
     article.append(header, body);
+    if (message.role === "user" && message.retryPrompt) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "message-retry";
+      retry.textContent = "Reconnect & retry";
+      retry.title = "Reload MCP connections and retry the whole prompt";
+      retry.disabled = conversation.loading ||
+        conversation.configurationBusy ||
+        conversation.attachmentBusy ||
+        promptIsActive(conversation) ||
+        conversation.promptQueue.length > 0;
+      retry.addEventListener("click", () => retryFailedPrompt(message, conversation));
+      article.append(retry);
+    }
     elements.messages.append(article);
     restoreMessagePanelScroll(article, message, panelScrollPositions);
   }
@@ -2459,6 +2509,12 @@ function renderMessages(conversation = activeConversation()) {
   } else {
     elements.messages.scrollTop = previousScrollTop;
     elements.messages.scrollLeft = previousScrollLeft;
+  }
+}
+
+function renderRetryActions(conversation) {
+  if (conversation.messages.some((message) => message.retryPrompt)) {
+    renderMessages(conversation);
   }
 }
 
@@ -2489,6 +2545,7 @@ function setBusy(value, conversation = activeConversation()) {
   } else {
     renderConnectionStatus();
   }
+  renderRetryActions(conversation);
 }
 
 function stopRecoveredPromptPolling(conversation = activeConversation()) {
@@ -2647,6 +2704,7 @@ function setConfigurationBusy(value, conversation = activeConversation()) {
     updateAttachmentControls();
     renderConversationControls();
   }
+  renderRetryActions(conversation);
 }
 
 function addMessage(
@@ -2677,6 +2735,22 @@ function addMessage(
   if (key) {
     conversation.messageKeys.set(key, index);
   }
+  scheduleMessagesRender(conversation, message);
+}
+
+function markPromptRetryable(queuedPrompt, conversation) {
+  const messageIndex = conversation.messageKeys.get(queuedPrompt.messageKey);
+  if (messageIndex === undefined) {
+    return;
+  }
+  const message = conversation.messages[messageIndex];
+  if (!message || message.role !== "user") {
+    return;
+  }
+  message.retryPrompt = {
+    text: queuedPrompt.text,
+    attachments: queuedPrompt.attachments.map((attachment) => ({ ...attachment }))
+  };
   scheduleMessagesRender(conversation, message);
 }
 
@@ -3297,7 +3371,11 @@ function startNewConversation({ discardDraft = false } = {}) {
 }
 
 function applyFallbackConversationTitle(queuedPrompt, conversation) {
-  if (!conversation.activeSessionIsNew || conversation.activeSessionTitleOverride) {
+  if (
+    !conversation.activeSessionIsNew ||
+    conversation.activeSessionTitleOverride ||
+    (queuedPrompt.reconnect && queuedPrompt.text.trim() === "/mcp reload")
+  ) {
     return;
   }
   const attachmentNames = queuedPrompt.attachments
@@ -3637,14 +3715,18 @@ async function drainPromptQueue(conversation = activeConversation()) {
       conversation.currentToolGroupKey = `tool-group:${queuedPrompt.messageKey}`;
       conversation.lastStreamRole = "user";
       conversation.currentAssistantMessageKey = null;
+      conversation.activePrompt = queuedPrompt;
       setStatus(
-        conversation.promptQueue.length > 0
-          ? `Copilot is working... ${conversation.promptQueue.length} queued`
-          : "Copilot is working...",
+        queuedPrompt.reconnect
+          ? "Reloading MCP connections..."
+          : conversation.promptQueue.length > 0
+            ? `Copilot is working... ${conversation.promptQueue.length} queued`
+            : "Copilot is working...",
         conversation
       );
       const controller = new AbortController();
       conversation.promptRequestController = controller;
+      let promptCompleted = false;
       try {
         const result = await api(`/api/sessions/${encodeURIComponent(queuedPrompt.sessionId)}/messages`, {
           method: "POST",
@@ -3652,6 +3734,7 @@ async function drainPromptQueue(conversation = activeConversation()) {
           body: JSON.stringify({
             text: queuedPrompt.text,
             clientPromptId: queuedPrompt.messageKey,
+            reconnect: queuedPrompt.reconnect === true,
             attachments: queuedPrompt.attachments.map(({ name, mimeType, size, data }) => ({
               name,
               mimeType,
@@ -3660,6 +3743,7 @@ async function drainPromptQueue(conversation = activeConversation()) {
             }))
           })
         });
+        promptCompleted = true;
         if (conversation.promptRunId !== runId) {
           return;
         }
@@ -3677,9 +3761,15 @@ async function drainPromptQueue(conversation = activeConversation()) {
           return;
         }
         finalStatus = "Something went wrong";
+        if (!promptCompleted && isMcpFailure(error)) {
+          markPromptRetryable(queuedPrompt, conversation);
+        }
         showError(error, conversation);
         conversation.cancelRequested = false;
       } finally {
+        if (conversation.activePrompt === queuedPrompt) {
+          conversation.activePrompt = null;
+        }
         if (conversation.promptRequestController === controller) {
           conversation.promptRequestController = null;
         }
@@ -3733,18 +3823,23 @@ async function sendPrompt(event) {
     return;
   }
 
-  const messageKey = nextSyntheticMessageKey("local-user", conversation);
-  const queuedPrompt = {
-    sessionId: conversation.sessionId,
-    text,
-    attachments,
-    messageKey
-  };
   elements.input.value = "";
   conversation.draft = "";
   resizePromptInput();
   conversation.attachments = [];
   renderAttachmentList();
+  enqueuePrompt(conversation, text, attachments);
+}
+
+function enqueuePrompt(conversation, text, attachments, reconnect = false) {
+  const messageKey = nextSyntheticMessageKey("local-user", conversation);
+  const queuedPrompt = {
+    sessionId: conversation.sessionId,
+    text,
+    attachments,
+    messageKey,
+    reconnect
+  };
   addMessage("user", text, messageKey, attachments, conversation);
   conversation.promptQueue.push(queuedPrompt);
   renderSessionList();
@@ -3762,6 +3857,44 @@ async function sendPrompt(event) {
     return;
   }
   void drainPromptQueue(conversation);
+}
+
+function retryFailedPrompt(message, conversation) {
+  const retryPrompt = message.retryPrompt;
+  if (
+    !retryPrompt ||
+    !conversation.sessionId ||
+    conversation.loading ||
+    conversation.configurationBusy ||
+    conversation.attachmentBusy ||
+    conversation.promptQueue.length > 0 ||
+    promptIsActive(conversation)
+  ) {
+    return;
+  }
+  if (!window.confirm(
+    "MCP connections will reload before rerunning the entire prompt. " +
+    "Actions that already completed may be repeated. Continue?"
+  )) {
+    return;
+  }
+
+  message.retryPrompt = null;
+  scheduleMessagesRender(conversation, message);
+  enqueuePrompt(
+    conversation,
+    retryPrompt.text,
+    retryPrompt.attachments.map((attachment) => ({ ...attachment })),
+    true
+  );
+}
+
+function reconnectTools() {
+  const conversation = activeConversation();
+  if (!conversation?.sessionId || elements.reconnectTools.disabled) {
+    return;
+  }
+  enqueuePrompt(conversation, "/mcp reload", [], true);
 }
 
 async function cancelPrompt(statusMessage = "Cancelling...", conversation = activeConversation()) {
@@ -4094,6 +4227,7 @@ elements.composer.addEventListener("submit", (event) => {
 elements.cancel.addEventListener("click", () => {
   void cancelPrompt();
 });
+elements.reconnectTools.addEventListener("click", reconnectTools);
 elements.permissionCancel.addEventListener("click", (event) => {
   event.preventDefault();
   elements.permissionDialog.close();

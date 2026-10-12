@@ -25,6 +25,7 @@ import {
   type JsonRpcId,
   type JsonObject,
   type ManagedPermissionRequestEvent,
+  type ManagedSessionReplayEvent,
   type PromptContentBlock,
   type SessionSetup,
   type SessionInfo
@@ -92,6 +93,8 @@ interface SseClient {
 interface BusyPrompt {
   promptId: string;
   clientPromptId?: string;
+  userMessageId?: string;
+  cancelController: AbortController;
 }
 
 interface SessionUsage {
@@ -908,7 +911,7 @@ async function main(): Promise<void> {
   const sessionTitleWrites = new SerialTaskQueue();
   const sessionUsageWrites = new SerialTaskQueue();
   const sessionActivityWrites = new SerialTaskQueue();
-  const replayingSessions = new Set<string>();
+  const replayingSessions = new Map<string, JsonObject[]>();
   const busySessions = new Map<string, BusyPrompt>();
   const deletingSessions = new Set<string>();
   const deletedSessions = new Set<string>();
@@ -1105,6 +1108,27 @@ async function main(): Promise<void> {
     return session;
   };
 
+  acp.events.on("sessionReplay", (event: ManagedSessionReplayEvent) => {
+    const { sessionId } = event;
+    if (deletedSessions.has(sessionId)) {
+      return;
+    }
+    if (event.phase === "start") {
+      replayingSessions.set(sessionId, []);
+      return;
+    }
+    const replay = replayingSessions.get(sessionId);
+    replayingSessions.delete(sessionId);
+    if (event.succeeded && replay) {
+      const pendingMessageId = busySessions.get(sessionId)?.userMessageId;
+      const pendingUpdates = pendingMessageId
+        ? (sessionReplayCache.get(sessionId) ?? []).filter((params) => (
+          isRecord(params.update) && params.update.messageId === pendingMessageId
+        ))
+        : [];
+      sessionReplayCache.set(sessionId, [...replay, ...pendingUpdates]);
+    }
+  });
   acp.events.on("sessionUpdate", (event: { context: ContextTier; params: JsonObject }) => {
     if (!isRecord(event.params)) {
       return;
@@ -1114,9 +1138,11 @@ async function main(): Promise<void> {
       return;
     }
     if (sessionId) {
-      const replay = sessionReplayCache.get(sessionId) ?? [];
+      const replay = replayingSessions.get(sessionId) ?? sessionReplayCache.get(sessionId) ?? [];
       replay.push(event.params);
-      sessionReplayCache.set(sessionId, replay);
+      if (!replayingSessions.has(sessionId)) {
+        sessionReplayCache.set(sessionId, replay);
+      }
     }
     if (
       sessionId &&
@@ -1252,6 +1278,7 @@ async function main(): Promise<void> {
     requireAuthorization(request);
 
     if (request.method === "GET" && requestUrl.pathname === "/api/health") {
+      await acp.start();
       const newSessionDefaults = await readCopilotDefaults();
       jsonResponse(response, 200, {
         ok: true,
@@ -1289,6 +1316,7 @@ async function main(): Promise<void> {
     }
 
     if (request.method === "GET" && requestUrl.pathname === "/api/events") {
+      await acp.start();
       const requestedSessionId = requestUrl.searchParams.get("sessionId") ?? undefined;
       const client: SseClient = requestedSessionId
         ? { response, sessionId: requestedSessionId }
@@ -1442,6 +1470,7 @@ async function main(): Promise<void> {
     if (deleteRequest) {
       try {
         await waitForSessionOperations(sessionId);
+        await acp.start(acp.getSessionContext(sessionId) ?? "default");
         const acpSupportsDelete = acp.getCapabilities().sessionCapabilities.delete;
         if (!acpSupportsDelete && !nativeSessionDelete) {
           throw new HttpError(409, "This Copilot CLI does not support session deletion");
@@ -1554,17 +1583,7 @@ async function main(): Promise<void> {
           configOptions: acp.getConfigOptions(sessionId)
         };
       } else {
-        setup = await withSessionOperation(sessionId, async () => {
-          if (previousContext && previousContext !== context) {
-            sessionReplayCache.delete(sessionId);
-          }
-          replayingSessions.add(sessionId);
-          try {
-            return await acp.loadSession(session, context);
-          } finally {
-            replayingSessions.delete(sessionId);
-          }
-        });
+        setup = await withSessionOperation(sessionId, () => acp.loadSession(session, context));
         ensureSessionAvailable(sessionId);
       }
       const sessionView = {
@@ -1609,34 +1628,55 @@ async function main(): Promise<void> {
       }
       const body = await readJsonBody(request);
       ensureSessionAvailable(sessionId);
-      const context = acp.getSessionContext(sessionId) ?? "default";
-      const prompt = parsePrompt(body, acp.getCapabilities(context));
-      const clientPromptId = parseOptionalPromptId(body.clientPromptId, "Client prompt id");
-      const replay = sessionReplayCache.get(sessionId) ?? [];
-      const userMessageId = `web-${randomBytes(12).toString("hex")}`;
-      for (const content of prompt) {
-        replay.push({
-          sessionId,
-          update: {
-            sessionUpdate: "user_message_chunk",
-            messageId: userMessageId,
-            content
-          }
-        });
+      if (body.reconnect !== undefined && typeof body.reconnect !== "boolean") {
+        throw new HttpError(400, "reconnect must be a boolean");
       }
-      sessionReplayCache.set(sessionId, replay);
-
+      if (busySessions.has(sessionId)) {
+        throw new HttpError(409, "Conversation is already processing a prompt");
+      }
+      const clientPromptId = parseOptionalPromptId(body.clientPromptId, "Client prompt id");
       const promptId = randomBytes(12).toString("hex");
-      const busyPrompt: BusyPrompt = { promptId };
+      const busyPrompt: BusyPrompt = { promptId, cancelController: new AbortController() };
       if (clientPromptId !== undefined) {
         busyPrompt.clientPromptId = clientPromptId;
       }
       busySessions.set(sessionId, busyPrompt);
-      touchSessionActivity(sessionId);
       let stopReason: string | undefined;
       let errorMessage: string | undefined;
       try {
-        stopReason = await acp.prompt(session, prompt);
+        const context = acp.getSessionContext(sessionId) ?? "default";
+        await acp.start(context);
+        const prompt = parsePrompt(body, acp.getCapabilities(context));
+        const replay = sessionReplayCache.get(sessionId) ?? [];
+        const userMessageId = `web-${randomBytes(12).toString("hex")}`;
+        busyPrompt.userMessageId = userMessageId;
+        for (const content of prompt) {
+          replay.push({
+            sessionId,
+            update: {
+              sessionUpdate: "user_message_chunk",
+              messageId: userMessageId,
+              content
+            }
+          });
+        }
+        sessionReplayCache.set(sessionId, replay);
+        touchSessionActivity(sessionId);
+        if (body.reconnect === true && !busyPrompt.cancelController.signal.aborted) {
+          stopReason = await withSessionOperation(sessionId, () => (
+            acp.reloadMcpServers(session, busyPrompt.cancelController.signal)
+          ));
+          ensureSessionAvailable(sessionId);
+        }
+        const reloadOnly = body.reconnect === true &&
+          prompt.length === 1 &&
+          prompt[0]?.type === "text" &&
+          prompt[0].text.trim() === "/mcp reload";
+        if (busyPrompt.cancelController.signal.aborted) {
+          stopReason = "cancelled";
+        } else if (!reloadOnly && stopReason !== "cancelled") {
+          stopReason = await acp.prompt(session, prompt);
+        }
         jsonResponse(response, 200, { stopReason });
       } catch (error) {
         errorMessage = error instanceof Error ? error.message : String(error);
@@ -1674,6 +1714,7 @@ async function main(): Promise<void> {
         jsonResponse(response, 202, { cancelled: false });
         return true;
       }
+      busyPrompt.cancelController.abort();
       await withSessionOperation(sessionId, () => acp.cancel(sessionId));
       ensureSessionAvailable(sessionId);
       jsonResponse(response, 202, {

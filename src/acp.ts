@@ -70,6 +70,13 @@ interface ManagedSessionUpdateEvent {
   params: JsonObject;
 }
 
+type SessionReplayEvent = { sessionId: string } & (
+  | { phase: "start" }
+  | { phase: "complete"; succeeded: boolean }
+);
+
+export type ManagedSessionReplayEvent = SessionReplayEvent & { context: ContextTier };
+
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
@@ -77,6 +84,8 @@ interface PendingRequest {
 }
 
 const defaultRequestTimeoutMs = 120_000;
+const processShutdownTimeoutMs = 2_000;
+const commandAdvertisementTimeoutMs = 5_000;
 const copilotSessionEventMethod = "github.com/copilot/sessionEvent";
 
 export class AcpError extends Error {
@@ -127,7 +136,9 @@ export class AcpConnection {
   private readonly permissionRequests = new Set<string>();
   private readonly activeSessions = new Set<string>();
   private readonly busySessions = new Set<string>();
+  private readonly loadingSessions = new Map<string, Promise<SessionSetup>>();
   private readonly sessionConfigOptions = new Map<string, JsonObject[]>();
+  private readonly sessionCommands = new Map<string, Set<string>>();
 
   public constructor(options: {
     command: string;
@@ -146,18 +157,29 @@ export class AcpConnection {
   }
 
   public async start(): Promise<void> {
-    if (this.initialized) {
+    if (
+      this.initialized &&
+      this.child &&
+      !this.child.killed &&
+      !this.child.stdin.destroyed
+    ) {
       return;
     }
     if (this.startPromise) {
       return this.startPromise;
     }
+    if (this.child) {
+      await this.stop();
+    }
 
-    this.startPromise = this.startInternal();
+    const startPromise = this.startInternal();
+    this.startPromise = startPromise;
     try {
-      await this.startPromise;
+      await startPromise;
     } catch (error) {
-      this.startPromise = undefined;
+      if (this.startPromise === startPromise) {
+        this.startPromise = undefined;
+      }
       throw error;
     }
   }
@@ -231,15 +253,19 @@ export class AcpConnection {
       };
     }
 
-    const result = await this.sendRequest<unknown>("session/load", {
-      sessionId: session.sessionId,
-      cwd: session.cwd,
-      mcpServers: []
-    });
-    const setup = this.parseSessionSetup(result, "session/load", session.sessionId);
-    this.activeSessions.add(setup.sessionId);
-    this.sessionConfigOptions.set(setup.sessionId, setup.configOptions);
-    return setup;
+    const existingLoad = this.loadingSessions.get(session.sessionId);
+    if (existingLoad) {
+      return existingLoad;
+    }
+    const load = this.loadSessionInternal(session);
+    this.loadingSessions.set(session.sessionId, load);
+    try {
+      return await load;
+    } finally {
+      if (this.loadingSessions.get(session.sessionId) === load) {
+        this.loadingSessions.delete(session.sessionId);
+      }
+    }
   }
 
   public async setConfigOption(
@@ -265,6 +291,59 @@ export class AcpConnection {
     return this.sessionConfigOptions.get(sessionId) ?? [];
   }
 
+  public isSessionLoaded(sessionId: string): boolean {
+    return this.activeSessions.has(sessionId);
+  }
+
+  public async waitForCommand(
+    sessionId: string,
+    name: string,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    signal?.throwIfAborted();
+    const commands = this.sessionCommands.get(sessionId);
+    if (commands) {
+      return commands.has(name);
+    }
+
+    return new Promise<boolean>((resolve, reject) => {
+      const finish = (error?: unknown) => {
+        clearTimeout(timer);
+        this.events.off("commandsAvailable", onCommands);
+        this.events.off("disconnected", onDisconnect);
+        this.events.off("sessionClosed", onClose);
+        signal?.removeEventListener("abort", onAbort);
+        if (error !== undefined) {
+          reject(error);
+        } else {
+          resolve(this.sessionCommands.get(sessionId)?.has(name) === true);
+        }
+      };
+      const onCommands = (updatedSessionId: string) => {
+        if (updatedSessionId === sessionId) {
+          finish();
+        }
+      };
+      const onDisconnect = () => finish(
+        new AcpError("Copilot ACP disconnected before native command metadata was received")
+      );
+      const onClose = (closedSessionId: string) => {
+        if (closedSessionId === sessionId) {
+          finish(new AcpError("Conversation closed before native command metadata was received"));
+        }
+      };
+      const onAbort = () => finish(signal?.reason);
+      const timer = setTimeout(() => finish(
+        new AcpError("Timed out waiting for Copilot's native command metadata")
+      ), commandAdvertisementTimeoutMs);
+      timer.unref();
+      this.events.on("commandsAvailable", onCommands);
+      this.events.on("disconnected", onDisconnect);
+      this.events.on("sessionClosed", onClose);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
   public async closeSession(sessionId: string): Promise<void> {
     await this.start();
     if (!this.activeSessions.has(sessionId)) {
@@ -277,6 +356,8 @@ export class AcpConnection {
     await this.sendRequest("session/close", { sessionId });
     this.activeSessions.delete(sessionId);
     this.sessionConfigOptions.delete(sessionId);
+    this.sessionCommands.delete(sessionId);
+    this.events.emit("sessionClosed", sessionId);
   }
 
   public async prompt(
@@ -356,12 +437,35 @@ export class AcpConnection {
 
     const child = this.child;
     this.child = undefined;
-    if (!child || child.killed) {
+    this.resetProcessState();
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
       return;
     }
 
-    child.stdin.end();
-    child.kill("SIGTERM");
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        resolve();
+      };
+      const timeout = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+        }
+      }, processShutdownTimeoutMs);
+      timeout.unref();
+      child.once("close", finish);
+      if (child.exitCode !== null || child.signalCode !== null) {
+        finish();
+        return;
+      }
+      child.stdin.end();
+      child.kill("SIGTERM");
+    });
   }
 
   private async startInternal(): Promise<void> {
@@ -381,20 +485,35 @@ export class AcpConnection {
     this.child = child;
 
     child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => this.handleStdout(chunk));
+    child.stdout.on("data", (chunk: string) => {
+      if (this.child === child) {
+        this.handleStdout(chunk);
+      }
+    });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
-      this.events.emit("stderr", chunk);
+      if (this.child === child) {
+        this.events.emit("stderr", chunk);
+      }
     });
     child.on("error", (error) => {
-      this.events.emit("processError", error);
+      if (this.child !== child) {
+        return;
+      }
+      this.disconnectProcess(child);
       this.rejectPending(error);
+      this.events.emit("processError", error);
     });
     child.on("exit", (code, signal) => {
+      if (this.child !== child) {
+        return;
+      }
       const suffix = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
       const error = new Error(`Copilot ACP process exited with ${suffix}`);
+      const unexpected = !this.stopping;
+      this.disconnectProcess(child);
       this.events.emit("processExit", { code, signal });
-      if (!this.stopping) {
+      if (unexpected) {
         this.rejectPending(error);
         this.events.emit("processError", error);
       }
@@ -460,6 +579,51 @@ export class AcpConnection {
     }
     this.initialized = true;
     this.events.emit("initialized", this.agentCapabilities);
+  }
+
+  private disconnectProcess(child: ChildProcessWithoutNullStreams): void {
+    if (this.child !== child) {
+      return;
+    }
+    this.child = undefined;
+    this.resetProcessState();
+  }
+
+  private async loadSessionInternal(session: SessionInfo): Promise<SessionSetup> {
+    this.events.emit("sessionReplay", { sessionId: session.sessionId, phase: "start" });
+    let succeeded = false;
+    try {
+      const result = await this.sendRequest<unknown>("session/load", {
+        sessionId: session.sessionId,
+        cwd: session.cwd,
+        mcpServers: []
+      });
+      const setup = this.parseSessionSetup(result, "session/load", session.sessionId);
+      this.activeSessions.add(setup.sessionId);
+      this.sessionConfigOptions.set(setup.sessionId, setup.configOptions);
+      succeeded = true;
+      return setup;
+    } finally {
+      this.events.emit("sessionReplay", {
+        sessionId: session.sessionId,
+        phase: "complete",
+        succeeded
+      });
+    }
+  }
+
+  private resetProcessState(): void {
+    this.initialized = false;
+    this.startPromise = undefined;
+    this.agentCapabilities = undefined;
+    this.stdoutBuffer = "";
+    this.permissionRequests.clear();
+    this.activeSessions.clear();
+    this.busySessions.clear();
+    this.loadingSessions.clear();
+    this.sessionConfigOptions.clear();
+    this.sessionCommands.clear();
+    this.events.emit("disconnected");
   }
 
   private parseSessionSetup(
@@ -544,6 +708,21 @@ export class AcpConnection {
 
     if (method === "session/update") {
       if (isRecord(message.params)) {
+        const { sessionId, update } = message.params;
+        if (
+          typeof sessionId === "string" &&
+          isRecord(update) &&
+          update.sessionUpdate === "available_commands_update" &&
+          Array.isArray(update.availableCommands)
+        ) {
+          this.sessionCommands.set(sessionId, new Set(
+            update.availableCommands
+              .filter(isRecord)
+              .map((command) => command.name)
+              .filter((name): name is string => typeof name === "string")
+          ));
+          this.events.emit("commandsAvailable", sessionId);
+        }
         this.events.emit("sessionUpdate", message.params);
       } else {
         this.events.emit("protocolError", new Error("ACP session/update omitted params"));
@@ -842,6 +1021,36 @@ export class AcpConnectionManager {
     return restoredSetup;
   }
 
+  public async reloadMcpServers(
+    session: SessionInfo,
+    signal?: AbortSignal
+  ): Promise<string | undefined> {
+    const context = this.sessionContexts.get(session.sessionId) ?? "default";
+    const connection = await this.getConnection(context);
+    if (!connection.isSessionLoaded(session.sessionId)) {
+      await this.loadSession(session, context);
+    }
+    if (signal?.aborted) {
+      return "cancelled";
+    }
+    let supported: boolean;
+    try {
+      supported = await connection.waitForCommand(session.sessionId, "mcp", signal);
+    } catch (error) {
+      if (signal?.aborted && error === signal.reason) {
+        return "cancelled";
+      }
+      throw error;
+    }
+    if (signal?.aborted) {
+      return "cancelled";
+    }
+    if (!supported) {
+      throw new AcpError("This Copilot CLI does not advertise the native /mcp command through ACP");
+    }
+    return connection.prompt(session, [{ type: "text", text: "/mcp reload" }]);
+  }
+
   public async setConfigOption(
     session: SessionInfo,
     configId: string,
@@ -849,7 +1058,7 @@ export class AcpConnectionManager {
   ): Promise<JsonObject[]> {
     const context = this.sessionContexts.get(session.sessionId) ?? "default";
     const connection = await this.getConnection(context);
-    if (!this.sessionContexts.has(session.sessionId)) {
+    if (!connection.isSessionLoaded(session.sessionId)) {
       await this.loadSession(session, context);
     }
     const configOptions = await connection.setConfigOption(session.sessionId, configId, value);
@@ -871,6 +1080,9 @@ export class AcpConnectionManager {
   ): Promise<string | undefined> {
     const context = this.sessionContexts.get(session.sessionId) ?? "default";
     const connection = await this.getConnection(context);
+    if (!connection.isSessionLoaded(session.sessionId)) {
+      await this.loadSession(session, context);
+    }
     const result = await connection.prompt(session, prompt);
     this.sessionContexts.set(session.sessionId, context);
     return result;
@@ -925,6 +1137,10 @@ export class AcpConnectionManager {
       return existing;
     }
 
+    return this.createConnection(context);
+  }
+
+  private async createConnection(context: ContextTier): Promise<AcpConnection> {
     const connection = new AcpConnection({
       command: this.command,
       cwd: this.cwd,
@@ -939,12 +1155,18 @@ export class AcpConnectionManager {
       await connection.start();
       return connection;
     } catch (error) {
-      this.connections.delete(context);
+      if (this.connections.get(context) === connection) {
+        this.connections.delete(context);
+      }
       throw error;
     }
   }
 
   private forwardEvents(context: ContextTier, connection: AcpConnection): void {
+    connection.events.on("sessionReplay", (event: SessionReplayEvent) => {
+      const managedEvent: ManagedSessionReplayEvent = { ...event, context };
+      this.events.emit("sessionReplay", managedEvent);
+    });
     connection.events.on("sessionUpdate", (params: unknown) => {
       if (isRecord(params)) {
         const event: ManagedSessionUpdateEvent = { context, params };
@@ -956,6 +1178,7 @@ export class AcpConnectionManager {
       this.events.emit("permissionRequest", managedEvent);
     });
     connection.events.on("processError", (error: Error) => {
+      this.profileDefaults.delete(context);
       this.events.emit("processError", error);
     });
     connection.events.on("protocolError", (error: Error) => {
