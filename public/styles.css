@@ -668,6 +668,23 @@ button:disabled {
   stroke-width: 1.8;
 }
 
+.message-retry {
+  margin-top: 8px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.message-retry:hover,
+.message-retry:focus-visible {
+  border-color: var(--accent);
+  background: var(--surface-hover);
+  color: var(--accent-strong);
+}
+
 .message-body {
   padding: 14px 16px;
   border: 1px solid var(--border);
