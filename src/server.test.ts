@@ -1100,6 +1100,410 @@ const holdSessionListResponse = `
   window.holdNextSessionList = true;
 `;
 
+const mockScreenWakeLock = `
+  window.wakeLockTest = {
+    requests: [], sentinels: [], visibility: 'visible',
+    requestError: null, releaseError: null, delayRequest: false
+  };
+  Object.defineProperty(document, 'visibilityState', {
+    get: () => window.wakeLockTest.visibility
+  });
+  Object.defineProperty(navigator, 'wakeLock', {
+    value: {
+      async request(type) {
+        const state = window.wakeLockTest;
+        state.requests.push(type);
+        if (state.delayRequest) {
+          state.delayRequest = false;
+          await new Promise((resolve) => { state.resolveRequest = resolve; });
+        }
+        if (state.requestError) {
+          throw new DOMException(state.requestError, 'NotAllowedError');
+        }
+        const sentinel = new EventTarget();
+        sentinel.released = false;
+        sentinel.releaseCalls = 0;
+        sentinel.release = async () => {
+          sentinel.releaseCalls += 1;
+          if (state.releaseError) {
+            throw new Error(state.releaseError);
+          }
+          sentinel.released = true;
+          sentinel.dispatchEvent(new Event('release'));
+        };
+        state.sentinels.push(sentinel);
+        return sentinel;
+      }
+    }
+  });
+`;
+
+test("toggles a native screen wake lock from the message bar", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const button = `document.querySelector('#keep-awake')`;
+  await waitFor(`${button}?.dataset.status === 'off'`);
+  assert.equal(await evaluate(`window.isSecureContext && typeof navigator.wakeLock.request === 'function'`), true);
+  assert.equal(await evaluate(`${button}.disabled`), false);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "false");
+  assert.equal(await evaluate(`${button}.nextElementSibling.id`), "reconnect-tools");
+  await evaluate(`${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "true");
+  assert.equal(await evaluate(`${button}.title`), "Keep awake: On");
+  await evaluate(`window.beforeWakeLockReload = true`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeWakeLockReload && ${button}?.dataset.status === 'on' && !${button}.disabled`);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "true");
+  await evaluate(`${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'off' && !${button}.disabled`);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "false");
+  assert.equal(await evaluate(`${button}.title`), "Keep awake: Off");
+  await evaluate(`window.beforeWakeLockReload = true`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeWakeLockReload && ${button}?.dataset.status === 'off'`);
+  assert.equal(
+    (await server.requests()).filter((request) => request.method === "session/prompt").length,
+    0
+  );
+});
+
+test("pauses and resumes the screen wake lock across visibility and page lifecycle changes", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, mockScreenWakeLock);
+  const button = `document.querySelector('#keep-awake')`;
+  const status = `document.querySelector('#keep-awake-status')`;
+  await waitFor(`${button}?.dataset.status === 'off'`);
+  await evaluate(`${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'on'`);
+  assert.deepEqual(await evaluate(`window.wakeLockTest.requests`), ["screen"]);
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('button.session-item[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector('#messages').textContent.includes('GoCD tools are unavailable.')`);
+  assert.equal(await evaluate(`${button}.dataset.status`), "on");
+  assert.equal(await evaluate(`window.wakeLockTest.requests.length`), 1);
+
+  await evaluate(`
+    window.wakeLockTest.visibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+  `);
+  await waitFor(`${button}.dataset.status === 'paused' && !${button}.disabled`);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "true");
+  assert.equal(await evaluate(`window.wakeLockTest.sentinels[0].releaseCalls`), 1);
+  assert.equal(await evaluate(`${status}.classList.contains('visually-hidden')`), false);
+  await evaluate(`
+    window.wakeLockTest.visibility = 'visible';
+    document.dispatchEvent(new Event('visibilitychange'));
+    document.dispatchEvent(new Event('visibilitychange'));
+  `);
+  await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
+  assert.equal(await evaluate(`window.wakeLockTest.requests.length`), 2);
+
+  await evaluate(`window.wakeLockTest.sentinels[1].release()`);
+  await waitFor(`${button}.dataset.status === 'paused'`);
+  assert.equal(await evaluate(`window.wakeLockTest.requests.length`), 2);
+  assert.equal(await evaluate(`${status}.textContent.includes('toggle Off and On to retry')`), true);
+  await evaluate(`${button}.click(); ${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
+  assert.equal(await evaluate(`window.wakeLockTest.requests.length`), 3);
+
+  await evaluate(`window.dispatchEvent(new Event('pagehide'))`);
+  await waitFor(`${button}.dataset.status === 'paused' && !${button}.disabled`);
+  assert.equal(await evaluate(`window.wakeLockTest.sentinels[2].releaseCalls`), 1);
+  await evaluate(`window.dispatchEvent(new Event('pageshow'))`);
+  await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
+  assert.equal(await evaluate(`window.wakeLockTest.requests.length`), 4);
+
+  await evaluate(`${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'off' && !${button}.disabled`);
+  await evaluate(`
+    window.wakeLockTest.visibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.wakeLockTest.visibility = 'visible';
+    document.dispatchEvent(new Event('visibilitychange'));
+  `);
+  assert.equal(await evaluate(`window.wakeLockTest.requests.length`), 4);
+  await evaluate(`${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
+  await evaluate(`window.beforeWakeLockReload = true`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeWakeLockReload && ${button}?.dataset.status === 'on' && !${button}.disabled`);
+  assert.equal(await evaluate(`window.wakeLockTest.requests.length`), 1);
+  await evaluate(`${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'off' && !${button}.disabled`);
+  await evaluate(`window.beforeWakeLockReload = true`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeWakeLockReload && ${button}?.dataset.status === 'off'`);
+  assert.equal(await evaluate(`window.wakeLockTest.requests.length`), 0);
+});
+
+test("restores the screen wake lock preference without acquiring it until the tab is visible", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    ${mockScreenWakeLock}
+    window.localStorage.setItem('copilot-web-keep-awake', 'true');
+    window.wakeLockTest.visibility = 'hidden';
+  `);
+  const button = `document.querySelector('#keep-awake')`;
+  await waitFor(`${button}?.dataset.status === 'paused' && !${button}.disabled`);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "true");
+  assert.equal(await evaluate(`window.wakeLockTest.requests.length`), 0);
+  await evaluate(`
+    window.wakeLockTest.visibility = 'visible';
+    document.dispatchEvent(new Event('visibilitychange'));
+  `);
+  await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
+  assert.equal(await evaluate(`window.wakeLockTest.requests.length`), 1);
+  assert.equal(await evaluate(`window.wakeLockTest.sentinels[0].released`), false);
+});
+
+test("handles screen wake lock requests that finish after the page becomes hidden", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, mockScreenWakeLock);
+  const button = `document.querySelector('#keep-awake')`;
+  await waitFor(`${button}?.dataset.status === 'off'`);
+  await evaluate(`window.wakeLockTest.delayRequest = true; ${button}.click()`);
+  await waitFor(`Boolean(window.wakeLockTest.resolveRequest)`);
+  assert.equal(await evaluate(`${button}.disabled`), true);
+  await evaluate(`
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.wakeLockTest.visibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.wakeLockTest.resolveRequest();
+  `);
+  await waitFor(`${button}.dataset.status === 'paused' && !${button}.disabled`);
+  assert.equal(await evaluate(`window.wakeLockTest.requests.length`), 1);
+  assert.equal(await evaluate(`window.wakeLockTest.sentinels[0].released`), true);
+  assert.equal(await evaluate(`window.wakeLockTest.sentinels[0].releaseCalls`), 1);
+  await evaluate(`
+    window.wakeLockTest.visibility = 'visible';
+    document.dispatchEvent(new Event('visibilitychange'));
+  `);
+  await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
+  assert.equal(await evaluate(`window.wakeLockTest.requests.length`), 2);
+});
+
+test("reports screen wake lock failures and allows retrying without claiming it is active", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, mockScreenWakeLock);
+  const button = `document.querySelector('#keep-awake')`;
+  const status = `document.querySelector('#keep-awake-status')`;
+  await waitFor(`${button}?.dataset.status === 'off'`);
+  await evaluate(`window.wakeLockTest.requestError = 'Permission denied'; ${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'error' && !${button}.disabled`);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "true");
+  assert.equal(await evaluate(`${status}.textContent`), "Unable to enable keep awake: Permission denied");
+  assert.equal(await evaluate(`${status}.classList.contains('visually-hidden')`), false);
+  assert.equal(await evaluate(`window.wakeLockTest.sentinels.length`), 0);
+  assert.equal(await evaluate(`window.localStorage.getItem('copilot-web-keep-awake')`), "true");
+
+  await evaluate(`window.wakeLockTest.requestError = null; ${button}.click(); ${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
+  await evaluate(`window.wakeLockTest.releaseError = 'Release failed'; ${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'error' && !${button}.disabled`);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "false");
+  assert.equal(await evaluate(`${status}.textContent`), "Unable to disable keep awake: Release failed");
+  assert.equal(await evaluate(`window.wakeLockTest.sentinels[0].released`), false);
+  assert.equal(await evaluate(`window.localStorage.getItem('copilot-web-keep-awake')`), "false");
+  await evaluate(`window.wakeLockTest.releaseError = null; ${button}.click(); ${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'off' && !${button}.disabled`);
+  assert.equal(await evaluate(`window.wakeLockTest.sentinels[0].released`), true);
+
+  await evaluate(`${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
+  await evaluate(`
+    window.wakeLockTest.visibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+  `);
+  await waitFor(`${button}.dataset.status === 'paused' && !${button}.disabled`);
+  await evaluate(`
+    window.wakeLockTest.requestError = 'Low battery';
+    window.wakeLockTest.visibility = 'visible';
+    document.dispatchEvent(new Event('visibilitychange'));
+  `);
+  await waitFor(`${button}.dataset.status === 'error' && !${button}.disabled`);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "true");
+  assert.equal(await evaluate(`${status}.textContent`), "Unable to enable keep awake: Low battery");
+  assert.equal(await evaluate(`window.localStorage.getItem('copilot-web-keep-awake')`), "true");
+  await evaluate(`
+    window.wakeLockTest.requestError = null;
+    window.wakeLockTest.visibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.wakeLockTest.visibility = 'visible';
+    document.dispatchEvent(new Event('visibilitychange'));
+  `);
+  await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
+  assert.equal(await evaluate(`${status}.classList.contains('visually-hidden')`), true);
+});
+
+test("preserves the saved screen wake lock choice through a rejected restore and a later successful reload", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    ${mockScreenWakeLock}
+    if (window.localStorage.getItem('wake-lock-test-reject') === 'true') {
+      window.wakeLockTest.requestError = 'Low battery';
+    }
+  `);
+  const button = `document.querySelector('#keep-awake')`;
+  await waitFor(`${button}?.dataset.status === 'off'`);
+  await evaluate(`${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
+  await evaluate(`
+    window.localStorage.setItem('wake-lock-test-reject', 'true');
+    window.beforeWakeLockReload = true;
+  `);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeWakeLockReload && ${button}?.dataset.status === 'error' && !${button}.disabled`);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "true");
+  assert.equal(await evaluate(`window.localStorage.getItem('copilot-web-keep-awake')`), "true");
+  assert.equal(await evaluate(`window.wakeLockTest.sentinels.length`), 0);
+  assert.equal(await evaluate(`document.querySelector('#keep-awake-status').textContent`),
+    "Unable to enable keep awake: Low battery");
+  await evaluate(`
+    window.localStorage.removeItem('wake-lock-test-reject');
+    window.beforeWakeLockReload = true;
+  `);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeWakeLockReload && ${button}?.dataset.status === 'on' && !${button}.disabled`);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "true");
+  assert.equal(await evaluate(`window.localStorage.getItem('copilot-web-keep-awake')`), "true");
+  assert.equal(await evaluate(`window.wakeLockTest.sentinels[0].released`), false);
+});
+
+test("disables the screen wake lock toggle when the browser API is unavailable", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    window.localStorage.setItem('copilot-web-keep-awake', 'true');
+    Object.defineProperty(navigator, 'wakeLock', { value: undefined });
+  `);
+  const button = `document.querySelector('#keep-awake')`;
+  await waitFor(`${button}?.dataset.status === 'off'`);
+  assert.equal(await evaluate(`${button}.disabled`), true);
+  assert.equal(await evaluate(`${button}.title`), "Keep awake: Unavailable in this browser");
+  await evaluate(`${button}.click()`);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "false");
+  assert.equal(await evaluate(`window.localStorage.getItem('copilot-web-keep-awake')`), "true");
+});
+
+test("keeps the screen wake lock toggle usable and reports unavailable preference storage", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    ${mockScreenWakeLock}
+    window.wakeLockStorageWarnings = [];
+    const nativeWarn = console.warn.bind(console);
+    console.warn = (...args) => {
+      window.wakeLockStorageWarnings.push(args[0]);
+      nativeWarn(...args);
+    };
+    for (const method of ['getItem', 'setItem']) {
+      const native = Storage.prototype[method];
+      Storage.prototype[method] = function (key, ...args) {
+        if (key === 'copilot-web-keep-awake') {
+          throw new DOMException('Storage disabled', 'SecurityError');
+        }
+        return native.call(this, key, ...args);
+      };
+    }
+  `);
+  const button = `document.querySelector('#keep-awake')`;
+  await waitFor(`${button}?.dataset.status === 'off' && !${button}.disabled`);
+  assert.deepEqual(await evaluate(`window.wakeLockStorageWarnings`), [
+    "Unable to restore the keep-awake preference"
+  ]);
+  await evaluate(`${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
+  assert.equal(await evaluate(`window.wakeLockStorageWarnings[1]`),
+    "Unable to save the keep-awake preference; it may reset after a refresh");
+  await evaluate(`${button}.click()`);
+  await waitFor(`${button}.dataset.status === 'off' && !${button}.disabled`);
+  assert.equal(await evaluate(`window.wakeLockTest.sentinels[0].released`), true);
+});
+
+test("keeps composer usage beside the selectors and wraps narrow layouts without overlap", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('button.session-item[data-session-id="session-1"]').click()`);
+  await waitFor(`!document.querySelector('#reconnect-tools').disabled`);
+  await evaluate(`
+    document.querySelector('#usage-summary').hidden = false;
+    document.querySelector('#usage-aic-metric').hidden = false;
+    document.querySelector('#usage-context-metric').hidden = false;
+  `);
+  const noOverlap = `(() => {
+    const footer = document.querySelector('.composer-footer').getBoundingClientRect();
+    const boxes = [
+      ...document.querySelectorAll('.composer-setting'),
+      document.querySelector('#usage-summary'),
+      document.querySelector('.composer-actions')
+    ].map((element) => element.getBoundingClientRect());
+    return Math.abs(boxes.at(-1).right - footer.right) < 1 && boxes.every((box) => (
+      box.left >= footer.left - 1 && box.right <= footer.right + 1 &&
+      box.top >= footer.top - 1 && box.bottom <= footer.bottom + 1
+    )) && boxes.every((box, index) => boxes.slice(index + 1).every((other) => !(
+      box.left < other.right - 1 && box.right > other.left + 1 &&
+      box.top < other.bottom - 1 && box.bottom > other.top + 1
+    )));
+  })()`;
+  for (const width of [1360, 1200]) {
+    await command("Emulation.setDeviceMetricsOverride", {
+      width, height: 900, deviceScaleFactor: 1, mobile: false
+    }, sessionId);
+    for (const [aic, context] of [
+      ["0.13 used", "36.8K / 872K tokens"],
+      ["58.67 used", "107.3K / 922K tokens"]
+    ]) {
+      await evaluate(`
+        document.querySelector('#usage-aic').textContent = ${JSON.stringify(aic)};
+        document.querySelector('#usage-context').textContent = ${JSON.stringify(context)};
+      `);
+      assert.equal(await evaluate(`(() => {
+        const usage = document.querySelector('#usage-summary').getBoundingClientRect();
+        const settings = [...document.querySelectorAll('.composer-setting')]
+          .map((element) => element.getBoundingClientRect());
+        return settings.every((box) => (
+          Math.abs(box.bottom - usage.bottom) < 1 && box.width >= 100 && box.width <= 145
+        )) && usage.left >= settings[2].right;
+      })()`), true, `Usage should stay inline at ${width}px with ${aic} and ${context}`);
+      assert.equal(await evaluate(noOverlap), true);
+    }
+  }
+  for (const width of [1000, 801, 768, 390, 320]) {
+    await command("Emulation.setDeviceMetricsOverride", {
+      width, height: 900, deviceScaleFactor: 1, mobile: false
+    }, sessionId);
+    assert.equal(await evaluate(noOverlap), true, `Composer should not overflow or overlap at ${width}px`);
+    assert.equal(await evaluate(`document.querySelector('#keep-awake').nextElementSibling.id`), "reconnect-tools");
+  }
+});
+
 test("shows a jump-to-bottom button without interrupting conversation scrolling", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
