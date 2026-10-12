@@ -3469,6 +3469,42 @@ function upsertSession(session) {
   return true;
 }
 
+function applySessionReplacement(result, previousSessionId) {
+  const session = result.session;
+  if (!session || typeof session.sessionId !== "string" || session.sessionId === previousSessionId) {
+    return;
+  }
+  const conversation = conversationState(previousSessionId, false);
+  const wasActive = state.activeSessionId === previousSessionId;
+  if (wasActive) {
+    persistComposerDraft();
+  }
+  if (conversation) {
+    state.conversations.delete(previousSessionId);
+    conversation.sessionId = session.sessionId;
+    state.conversations.set(session.sessionId, conversation);
+    for (const prompt of conversation.promptQueue) {
+      prompt.sessionId = session.sessionId;
+    }
+    applySessionSetup(result, result.context, conversation);
+  }
+  state.sessions = state.sessions.filter((item) => item.sessionId !== previousSessionId);
+  pendingPromptCompletions.delete(previousSessionId);
+  if (wasActive) {
+    state.activeSessionId = session.sessionId;
+    saveActiveSessionId(session.sessionId);
+  }
+  upsertSession(session);
+  renderConversationControls();
+  if (Array.isArray(result.persistenceWarnings) && result.persistenceWarnings.length > 0) {
+    showError(new Error(
+      `Conversation settings changed, but metadata persistence was incomplete: ${
+        result.persistenceWarnings.join("; ")
+      }`
+    ), conversation ?? activeConversation() ?? state.composer);
+  }
+}
+
 async function loadConversation(sessionId, requestedContext = state.selectedContext, force = false) {
   if (state.deletingSessionId) {
     return false;
@@ -3520,6 +3556,7 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
       method: "POST",
       body: JSON.stringify({ context: requestedContext })
     });
+    applySessionReplacement(result, sessionId);
     conversation.loaded = true;
     applySessionSetup(result, requestedContext, conversation);
     if (
@@ -3539,11 +3576,11 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
       conversation.messageKeys.clear();
       resetStreamTracking(conversation);
       for (const replayUpdate of result.replayUpdates) {
-        handleSessionUpdate(replayUpdate, sessionId);
+        handleSessionUpdate(replayUpdate, conversation.sessionId);
       }
     }
-    const pendingCompletion = pendingPromptCompletions.get(sessionId);
-    pendingPromptCompletions.delete(sessionId);
+    const pendingCompletion = pendingPromptCompletions.get(conversation.sessionId);
+    pendingPromptCompletions.delete(conversation.sessionId);
     let completionHandled = false;
     if (result.busy === true) {
       conversation.recoveredPrompt = true;
@@ -3600,13 +3637,6 @@ async function changeContext(value) {
     renderConfigurationControls();
     return;
   }
-  if (conversation.messages.length === 0) {
-    setStatus("The selected context will apply to your first message", conversation);
-    void loadContextDefaults(value);
-    renderConfigurationControls();
-    return;
-  }
-
   const loaded = await loadConversation(conversation.sessionId, value, true);
   if (!loaded) {
     state.selectedContext = previousContext;
@@ -3663,11 +3693,13 @@ async function changeConfigOption(configId, value) {
 
   setConfigurationBusy(true, conversation);
   setStatus("Updating conversation settings...", conversation);
+  const previousSessionId = conversation.sessionId;
   try {
-    const result = await api(`/api/sessions/${encodeURIComponent(conversation.sessionId)}/config`, {
+    const result = await api(`/api/sessions/${encodeURIComponent(previousSessionId)}/config`, {
       method: "POST",
       body: JSON.stringify({ configId, value })
     });
+    applySessionReplacement(result, previousSessionId);
     conversation.configOptions = Array.isArray(result.configOptions)
       ? result.configOptions
       : [];
@@ -4036,6 +4068,12 @@ function connectEvents() {
   source.addEventListener("session-created", (event) => {
     if (!upsertSession(JSON.parse(event.data))) {
       void refreshSessions().catch(showError);
+    }
+  });
+  source.addEventListener("session-replaced", (event) => {
+    const data = JSON.parse(event.data);
+    if (typeof data.previousSessionId === "string") {
+      applySessionReplacement(data, data.previousSessionId);
     }
   });
   source.addEventListener("session-deleted", () => {

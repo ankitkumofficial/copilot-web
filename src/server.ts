@@ -916,6 +916,7 @@ async function main(): Promise<void> {
   const deletingSessions = new Set<string>();
   const deletedSessions = new Set<string>();
   const activeSessionOperations = new Map<string, number>();
+  const configuringSessions = new Map<string, number>();
   const sessionOperationWaiters = new Map<string, Set<() => void>>();
   const sseClients = new Set<SseClient>();
   const browserToken = randomBytes(32).toString("hex");
@@ -931,16 +932,28 @@ async function main(): Promise<void> {
 
   const withSessionOperation = async <T>(
     sessionId: string,
-    operation: () => Promise<T>
+    operation: () => Promise<T>,
+    configuring = false
   ): Promise<T> => {
     ensureSessionAvailable(sessionId);
     activeSessionOperations.set(
       sessionId,
       (activeSessionOperations.get(sessionId) ?? 0) + 1
     );
+    if (configuring) {
+      configuringSessions.set(sessionId, (configuringSessions.get(sessionId) ?? 0) + 1);
+    }
     try {
       return await operation();
     } finally {
+      if (configuring) {
+        const configuringCount = (configuringSessions.get(sessionId) ?? 1) - 1;
+        if (configuringCount === 0) {
+          configuringSessions.delete(sessionId);
+        } else {
+          configuringSessions.set(sessionId, configuringCount);
+        }
+      }
       const activeCount = (activeSessionOperations.get(sessionId) ?? 1) - 1;
       if (activeCount > 0) {
         activeSessionOperations.set(sessionId, activeCount);
@@ -1106,6 +1119,68 @@ async function main(): Promise<void> {
       throw new HttpError(404, "Conversation not found");
     }
     return session;
+  };
+
+  const replaceEmptySession = async (
+    session: SessionInfo,
+    setup: SessionSetup
+  ): Promise<{ session: SessionInfo; persistenceWarnings: string[] }> => {
+    if (session.sessionId === setup.sessionId) {
+      return { session, persistenceWarnings: [] };
+    }
+    const previousSessionId = session.sessionId;
+    const replacement = { ...session, sessionId: setup.sessionId };
+    sessionCache.set(setup.sessionId, replacement);
+    sessionCache.delete(previousSessionId);
+    sessionReplayCache.delete(previousSessionId);
+    sessionUsageCache.delete(previousSessionId);
+    const activity = sessionActivityCache.get(previousSessionId) ?? session.updatedAt;
+    sessionActivityCache.delete(previousSessionId);
+    if (activity) {
+      sessionActivityCache.set(setup.sessionId, activity);
+    }
+    deletedSessions.add(previousSessionId);
+
+    const titleSave = sessionTitleWrites.enqueue(async () => {
+      const snapshot = new Map(sessionTitleOverrides);
+      const title = snapshot.get(previousSessionId);
+      snapshot.delete(previousSessionId);
+      if (title !== undefined) {
+        snapshot.set(setup.sessionId, title);
+        replacement.title = title;
+        replacement.customTitle = title;
+      }
+      await saveSessionTitleOverrides(sessionTitlesPath, snapshot);
+      sessionTitleOverrides.delete(previousSessionId);
+      if (title !== undefined) {
+        sessionTitleOverrides.set(setup.sessionId, title);
+      }
+    });
+    const labels = ["session titles", "session usage", "session activity"];
+    const saved = await Promise.allSettled([
+      titleSave, queueSessionUsageSave(), queueSessionActivitySave()
+    ]);
+    const persistenceWarnings: string[] = [];
+    saved.forEach((result, index) => {
+      if (result.status === "rejected") {
+        const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        persistenceWarnings.push(`${labels[index]}: ${message}`);
+        console.error(`[server] Unable to persist replaced conversation metadata: ${message}`);
+      }
+    });
+    publish("session-replaced", {
+      previousSessionId,
+      session: replacement,
+      context: acp.getSessionContext(setup.sessionId),
+      configOptions: setup.configOptions,
+      ...(persistenceWarnings.length > 0 ? { persistenceWarnings } : {})
+    }, previousSessionId);
+    for (const client of sseClients) {
+      if (client.sessionId === previousSessionId) {
+        client.sessionId = setup.sessionId;
+      }
+    }
+    return { session: replacement, persistenceWarnings };
   };
 
   acp.events.on("sessionReplay", (event: ManagedSessionReplayEvent) => {
@@ -1344,6 +1419,12 @@ async function main(): Promise<void> {
 
     if (request.method === "GET" && requestUrl.pathname === "/api/sessions") {
       const sessions = await acp.listSessions();
+      const listed = new Set(sessions.map((session) => session.sessionId));
+      for (const session of sessionCache.values()) {
+        if (acp.isSessionUnprompted(session.sessionId) && !listed.has(session.sessionId)) {
+          sessions.push(session);
+        }
+      }
       const newSessionDefaults = await readCopilotDefaults();
       cacheSessions(sessions);
       jsonResponse(response, 200, {
@@ -1577,26 +1658,33 @@ async function main(): Promise<void> {
         ? previousContext ?? requestedContext
         : requestedContext;
       let setup: SessionSetup;
+      let persistenceWarnings: string[] = [];
       if (busy) {
         setup = {
           sessionId,
           configOptions: acp.getConfigOptions(sessionId)
         };
       } else {
-        setup = await withSessionOperation(sessionId, () => acp.loadSession(session, context));
-        ensureSessionAvailable(sessionId);
+        setup = await withSessionOperation(sessionId, async () => {
+          const loaded = await acp.loadSession(session, context);
+          const replacement = await replaceEmptySession(session, loaded);
+          session = replacement.session;
+          persistenceWarnings = replacement.persistenceWarnings;
+          return loaded;
+        }, true);
+        ensureSessionAvailable(setup.sessionId);
       }
       const sessionView = {
         ...session,
         context,
-        lastActivityAt: sessionActivityCache.get(sessionId) ?? session.updatedAt
+        lastActivityAt: sessionActivityCache.get(setup.sessionId) ?? session.updatedAt
       };
       if (!busy) {
         publish("session-loaded", {
           session: sessionView,
           context,
           configOptions: setup.configOptions
-        }, sessionId);
+        }, setup.sessionId);
       }
       jsonResponse(response, 200, {
         session: sessionView,
@@ -1606,8 +1694,9 @@ async function main(): Promise<void> {
         modes: setup.modes,
         busy,
         ...(busyPrompt ? { promptId: busyPrompt.promptId } : {}),
-        usage: sessionUsageCache.get(sessionId) ?? null,
-        replayUpdates: [...(sessionReplayCache.get(sessionId) ?? [])]
+        usage: sessionUsageCache.get(setup.sessionId) ?? null,
+        replayUpdates: [...(sessionReplayCache.get(setup.sessionId) ?? [])],
+        ...(persistenceWarnings.length > 0 ? { persistenceWarnings } : {})
       });
       return true;
     }
@@ -1623,11 +1712,17 @@ async function main(): Promise<void> {
     }
 
     if (request.method === "POST" && subroute === "messages") {
+      if (configuringSessions.has(sessionId)) {
+        throw new HttpError(409, "Conversation is currently updating its settings");
+      }
       if (busySessions.has(sessionId)) {
         throw new HttpError(409, "Conversation is already processing a prompt");
       }
       const body = await readJsonBody(request);
       ensureSessionAvailable(sessionId);
+      if (configuringSessions.has(sessionId)) {
+        throw new HttpError(409, "Conversation is currently updating its settings");
+      }
       if (body.reconnect !== undefined && typeof body.reconnect !== "boolean") {
         throw new HttpError(400, "reconnect must be a boolean");
       }
@@ -1675,7 +1770,7 @@ async function main(): Promise<void> {
         if (busyPrompt.cancelController.signal.aborted) {
           stopReason = "cancelled";
         } else if (!reloadOnly && stopReason !== "cancelled") {
-          stopReason = await acp.prompt(session, prompt);
+          stopReason = await acp.prompt(session, prompt, busyPrompt.cancelController.signal);
         }
         jsonResponse(response, 200, { stopReason });
       } catch (error) {
@@ -1744,13 +1839,20 @@ async function main(): Promise<void> {
         throw new HttpError(400, "That configuration option cannot be changed here");
       }
 
-      const configOptions = await withSessionOperation(sessionId, () => (
-        acp.setConfigOption(session, configId, configValue)
-      ));
-      ensureSessionAvailable(sessionId);
+      let persistenceWarnings: string[] = [];
+      const setup = await withSessionOperation(sessionId, async () => {
+        const configured = await acp.setConfigOption(session, configId, configValue);
+        const replacement = await replaceEmptySession(session, configured);
+        session = replacement.session;
+        persistenceWarnings = replacement.persistenceWarnings;
+        return configured;
+      }, true);
+      ensureSessionAvailable(setup.sessionId);
       jsonResponse(response, 200, {
-        context: acp.getSessionContext(sessionId) ?? "default",
-        configOptions
+        session,
+        context: acp.getSessionContext(setup.sessionId) ?? "default",
+        configOptions: setup.configOptions,
+        ...(persistenceWarnings.length > 0 ? { persistenceWarnings } : {})
       });
       return true;
     }
@@ -1768,7 +1870,8 @@ async function main(): Promise<void> {
         await withSessionOperation(sessionId, () => acp.respondToPermission(
           context,
           requestId,
-          { outcome: "cancelled" }
+          { outcome: "cancelled" },
+          sessionId
         ));
       } else if (typeof optionId === "string" && optionId.length > 0) {
         await withSessionOperation(sessionId, () => acp.respondToPermission(
@@ -1777,7 +1880,8 @@ async function main(): Promise<void> {
           {
             outcome: "selected",
             optionId
-          }
+          },
+          sessionId
         ));
       } else {
         throw new HttpError(400, "Permission optionId or cancelled is required");

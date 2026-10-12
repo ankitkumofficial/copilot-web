@@ -16,6 +16,23 @@ const path = require("node:path");
 const readline = require("node:readline");
 const startCountFile = path.join(process.cwd(), "copilot-start-count.txt");
 const requestLogFile = path.join(process.cwd(), "copilot-requests.log");
+const profiles = process.env.TEST_PROFILE_SESSIONS === "true";
+const args = process.argv.slice(2);
+const startupModel = args.includes("--model") ? args[args.indexOf("--model") + 1] : undefined;
+const context = args[args.indexOf("--context") + 1];
+const sessions = new Map();
+const sessionFile = (id) => path.join(process.cwd(), "profile-session-" + id + ".json");
+const configOptions = (session) => profiles ? [
+  {
+    id: "model", type: "select", category: "model", currentValue: session.model,
+    options: ["gpt-6-luna", "claude-opus-5.5"].map((value) => ({ value, name: value }))
+  },
+  {
+    id: "reasoning_effort", type: "select", category: "thought_level",
+    currentValue: session.reasoningEffort,
+    options: ["low", "max"].map((value) => ({ value, name: value }))
+  }
+] : [];
 let startCount = 1;
 try {
   startCount = Number(fs.readFileSync(startCountFile, "utf8")) + 1;
@@ -30,6 +47,7 @@ input.on("line", (line) => {
   fs.appendFileSync(requestLogFile, JSON.stringify({
     method: request.method,
     text: request.params?.prompt?.[0]?.text,
+    ...(profiles ? { sessionId: request.params?.sessionId, model: startupModel, context } : {}),
     ...(request.params?.prompt?.length > 1 ? { prompt: request.params.prompt } : {})
   }) + "\\n");
   const respond = (result) => process.stdout.write(
@@ -63,11 +81,38 @@ input.on("line", (line) => {
         }
       });
       break;
-    case "session/new":
-      commands("session-1");
-      respond({ sessionId: "session-1", configOptions: [] });
+    case "session/new": {
+      const sessionId = profiles ? require("node:crypto").randomUUID() : "session-1";
+      const session = {
+        sessionId, model: startupModel ?? "gpt-6-luna", context,
+        reasoningEffort: "max", messages: []
+      };
+      sessions.set(sessionId, session);
+      commands(sessionId);
+      respond({ sessionId, configOptions: configOptions(session) });
       break;
+    }
     case "session/load":
+      if (profiles) {
+        if (!fs.existsSync(sessionFile(request.params.sessionId))) {
+          process.stdout.write(JSON.stringify({
+            jsonrpc: "2.0", id: request.id, error: { code: -32602, message: "Session not found" }
+          }) + "\\n");
+          break;
+        }
+        const session = JSON.parse(fs.readFileSync(sessionFile(request.params.sessionId), "utf8"));
+        session.model = startupModel ?? session.model;
+        session.context = context;
+        sessions.set(session.sessionId, session);
+        for (const text of session.messages) {
+          update(session.sessionId, { sessionUpdate: "user_message_chunk", content: { type: "text", text } });
+        }
+        commands(session.sessionId);
+        setTimeout(() => respond({
+          sessionId: session.sessionId, configOptions: configOptions(session)
+        }), Number(process.env.TEST_LOAD_DELAY_MS ?? 0));
+        break;
+      }
       commands(request.params.sessionId);
       update(request.params.sessionId, {
         sessionUpdate: "user_message_chunk",
@@ -159,11 +204,46 @@ input.on("line", (line) => {
         });
         respond({ stopReason: "end_turn" });
       }, reload ? 200 : 20);
+      if (profiles) {
+        const session = sessions.get(request.params.sessionId);
+        session.messages.push(request.params.prompt[0].text);
+        fs.writeFileSync(sessionFile(session.sessionId), JSON.stringify(session));
+        update(session.sessionId, {
+          sessionUpdate: "usage_update", used: 100,
+          size: session.context === "long_context"
+            ? (session.model === "claude-opus-5.5" ? 968000 : 872000)
+            : (session.model === "claude-opus-5.5" ? 200000 : 272000)
+        });
+      }
       break;
     }
+    case "session/set_config_option": {
+      const session = sessions.get(request.params.sessionId);
+      if (request.params.configId === "model") {
+        session.model = request.params.value;
+        session.context = "default";
+      } else {
+        session.reasoningEffort = request.params.value;
+      }
+      respond({ configOptions: configOptions(session) });
+      break;
+    }
+    case "session/close":
+      sessions.delete(request.params.sessionId);
+      respond({});
+      break;
     case "session/cancel":
       break;
     case "session/list":
+      if (profiles) {
+        respond({ sessions: fs.readdirSync(process.cwd())
+          .filter((name) => name.startsWith("profile-session-") && name.endsWith(".json"))
+          .map((name) => {
+            const session = JSON.parse(fs.readFileSync(path.join(process.cwd(), name), "utf8"));
+            return { sessionId: session.sessionId, cwd: process.cwd(), title: "Profile conversation" };
+          }) });
+        break;
+      }
       respond({ sessions: [{
         sessionId: "session-1",
         cwd: process.cwd(),
@@ -222,6 +302,8 @@ async function startTestServer(t: TestContext, options: {
   missingCommandMetadata?: boolean;
   loadDelayMs?: number;
   failRecoveryLoads?: boolean;
+  profileSessions?: boolean;
+  context?: "default" | "long_context";
 } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-server-reconnect-test-"));
   const home = path.join(directory, "home");
@@ -251,6 +333,7 @@ async function startTestServer(t: TestContext, options: {
       TEST_COMMAND_METADATA: options.missingCommandMetadata ? "missing" : "available",
       TEST_LOAD_DELAY_MS: String(options.loadDelayMs ?? 0),
       TEST_FAIL_RECOVERY_LOADS: String(options.failRecoveryLoads ?? false),
+      TEST_PROFILE_SESSIONS: String(options.profileSessions ?? false),
       PORT: String(port)
     },
     stdio: ["ignore", "pipe", "pipe"]
@@ -279,21 +362,36 @@ async function startTestServer(t: TestContext, options: {
   const cookie = homeResponse.headers.get("set-cookie")?.split(";")[0];
   assert.ok(cookie);
   const headers = { Cookie: cookie, "Content-Type": "application/json" };
+  let sessionId = "session-1";
   if (!options.existingSession) {
     const createResponse = await fetch(`${baseUrl}/api/sessions`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ context: "default" })
+      body: JSON.stringify({
+        context: options.context ?? "default",
+        ...(options.profileSessions ? {
+          configOverrides: { model: "gpt-6-luna", reasoning_effort: "low" }
+        } : {})
+      })
     });
     assert.equal(createResponse.status, 201);
     const created: unknown = await createResponse.json();
     assert.ok(isRecord(created) && isRecord(created.session));
-    assert.equal(created.session.sessionId, "session-1");
+    assert.equal(typeof created.session.sessionId, "string");
+    sessionId = String(created.session.sessionId);
+    if (!options.profileSessions) {
+      assert.equal(sessionId, "session-1");
+    }
   }
 
   return {
     baseUrl,
     headers,
+    sessionId,
+    session: (id: string) => readFile(path.join(projects, `profile-session-${id}.json`), "utf8")
+      .then((content) => JSON.parse(content) as unknown),
+    metadata: (name: string) => readFile(path.join(home, ".copilot-web", name), "utf8")
+      .then((content) => JSON.parse(content) as unknown),
     async requests(): Promise<JsonObject[]> {
       const log = await readFile(path.join(projects, "copilot-requests.log"), "utf8");
       return log.trim().split("\n").map((line) => {
@@ -303,12 +401,89 @@ async function startTestServer(t: TestContext, options: {
       });
     },
     starts: () => readFile(path.join(projects, "copilot-start-count.txt"), "utf8"),
-    post: (subroute: string, body: JsonObject) => fetch(
-      `${baseUrl}/api/sessions/session-1/${subroute}`,
+    post: (subroute: string, body: JsonObject, id = sessionId) => fetch(
+      `${baseUrl}/api/sessions/${id}/${subroute}`,
       { method: "POST", headers, body: JSON.stringify(body) }
     )
   };
 }
+
+test("updates empty-session IDs through the API and preserves metadata and selected context", async (t) => {
+  const server = await startTestServer(t, { profileSessions: true, context: "long_context" });
+  assert.equal((await server.post("title", { title: "Empty conversation title" })).status, 200);
+  const configuredResponse = await server.post("config", { configId: "model", value: "claude-opus-5.5" });
+  assert.equal(configuredResponse.status, 200);
+  const configured: unknown = await configuredResponse.json();
+  assert.ok(isRecord(configured) && isRecord(configured.session));
+  assert.equal(typeof configured.session.sessionId, "string");
+  const opusId = String(configured.session.sessionId);
+  assert.notEqual(opusId, server.sessionId);
+  assert.equal(configured.context, "long_context");
+  assert.equal(configured.session.customTitle, "Empty conversation title");
+  assert.equal((await server.post("load", { context: "long_context" })).status, 404);
+  const titles = await server.metadata("session-titles.json");
+  assert.ok(isRecord(titles));
+  assert.equal(titles[opusId], "Empty conversation title");
+  assert.equal(titles[server.sessionId], undefined);
+  const listResponse = await fetch(`${server.baseUrl}/api/sessions`, { headers: server.headers });
+  const list: unknown = await listResponse.json();
+  assert.ok(isRecord(list) && Array.isArray(list.sessions));
+  assert.deepEqual(list.sessions.filter(isRecord).map((session) => session.sessionId), [opusId]);
+
+  const defaultResponse = await server.post("load", { context: "default" }, opusId);
+  assert.equal(defaultResponse.status, 200);
+  const loadedDefault: unknown = await defaultResponse.json();
+  assert.ok(isRecord(loadedDefault) && isRecord(loadedDefault.session));
+  const defaultId = String(loadedDefault.session.sessionId);
+  assert.notEqual(defaultId, opusId);
+  const longResponse = await server.post("load", { context: "long_context" }, defaultId);
+  assert.equal(longResponse.status, 200);
+  const loadedLong: unknown = await longResponse.json();
+  assert.ok(isRecord(loadedLong) && isRecord(loadedLong.session));
+  const longId = String(loadedLong.session.sessionId);
+  assert.notEqual(longId, defaultId);
+  assert.equal((await server.post("messages", { text: "first message" }, longId)).status, 200);
+  const saved = await server.session(longId);
+  assert.ok(isRecord(saved));
+  assert.deepEqual(saved.messages, ["first message"]);
+  assert.equal(saved.model, "claude-opus-5.5");
+  assert.equal(saved.context, "long_context");
+  assert.equal(saved.reasoningEffort, "low");
+  const reloaded = await server.post("load", { context: "long_context" }, longId);
+  assert.equal(reloaded.status, 200);
+  const replay = replayUpdates(await reloaded.json());
+  const usage = replay.map((params) => params.update).filter(isRecord)
+    .find((update) => update.sessionUpdate === "usage_update");
+  assert.equal(usage?.size, 968_000);
+  assert.equal((await server.requests()).some((request) => request.method === "session/load"), false);
+});
+
+test("serializes concurrent API model switches and rejects prompts until configuration finishes", async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true, context: "long_context", loadDelayMs: 100
+  });
+  assert.equal((await server.post("messages", { text: "first" })).status, 200);
+  const changes = Promise.all([
+    server.post("config", { configId: "model", value: "claude-opus-5.5" }),
+    server.post("config", { configId: "model", value: "gpt-6-luna" })
+  ]);
+  const deadline = Date.now() + 5_000;
+  while (!(await server.requests()).some((request) => request.method === "session/load")) {
+    assert.ok(Date.now() < deadline, "The profile switch did not start");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal((await server.post("messages", { text: "blocked during configuration" })).status, 409);
+  for (const response of await changes) {
+    assert.equal(response.status, 200);
+  }
+  assert.equal((await server.post("messages", { text: "after concurrent changes" })).status, 200);
+  assert.equal((await server.post("config", { configId: "model", value: "claude-opus-5.5" })).status, 200);
+  assert.equal((await server.post("messages", { text: "after returning to opus" })).status, 200);
+  const saved = await server.session(server.sessionId);
+  assert.ok(isRecord(saved));
+  assert.deepEqual(saved.messages, ["first", "after concurrent changes", "after returning to opus"]);
+  assert.equal(saved.context, "long_context");
+});
 
 test("reloads MCP natively before retrying without restarting the ACP process", async (t) => {
   const server = await startTestServer(t);
@@ -614,11 +789,7 @@ const chromePath = process.env.CHROME_BIN ?? (
     : "/usr/bin/google-chrome"
 );
 
-test("keeps tools recovery available for successful refusals and after page refresh", {
-  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
-  timeout: 20_000
-}, async (t) => {
-  const server = await startTestServer(t);
+async function startTestBrowser(t: TestContext, baseUrl: string) {
   const profile = await mkdtemp(path.join(tmpdir(), "copilot-web-browser-test-"));
   const browser = spawn(chromePath, [
     "--headless=new",
@@ -709,7 +880,7 @@ test("keeps tools recovery available for successful refusals and after page refr
       }));
     })
   );
-  const target = await command("Target.createTarget", { url: server.baseUrl });
+  const target = await command("Target.createTarget", { url: baseUrl });
   assert.equal(typeof target.targetId, "string");
   const attached = await command("Target.attachToTarget", { targetId: target.targetId, flatten: true });
   assert.equal(typeof attached.sessionId, "string");
@@ -730,6 +901,97 @@ test("keeps tools recovery available for successful refusals and after page refr
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
   };
+  return { command, sessionId, evaluate, waitFor };
+}
+
+test("preserves the draft and attachments when an empty conversation changes model and context", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true, context: "long_context" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const activeId = `window.localStorage.getItem("copilot-web-active-session")`;
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="${server.sessionId}"]'))`);
+  await waitFor(`document.querySelector('#model-select').disabled === false`);
+  await evaluate(`
+    (() => {
+      const context = document.querySelector('#context-select');
+      context.value = "long_context";
+      context.dispatchEvent(new Event("change"));
+    })();
+  `);
+  await waitFor(`document.querySelector('#model-select').disabled === false`);
+  await evaluate(`document.querySelector('button.session-item[data-session-id="${server.sessionId}"]').click()`);
+  await waitFor(`${activeId} === "${server.sessionId}" && document.querySelector('#model-select').disabled === false`);
+  const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=";
+  await evaluate(`
+    const input = document.querySelector("#prompt-input");
+    input.value = "keep this draft";
+    input.dispatchEvent(new Event("input"));
+    const files = new DataTransfer();
+    const image = Uint8Array.from(atob("${imageData}"), (character) => character.charCodeAt(0));
+    files.items.add(new File([image], "draft.png", { type: "image/png" }));
+    const fileInput = document.querySelector("#file-input");
+    fileInput.files = files.files;
+    fileInput.dispatchEvent(new Event("change"));
+  `);
+  await waitFor(`document.querySelector('#attachment-list').textContent.includes('draft.png')`);
+  await evaluate(`
+    const model = document.querySelector("#model-select");
+    model.value = "claude-opus-5.5";
+    model.dispatchEvent(new Event("change"));
+  `);
+  await waitFor(`${activeId} !== "${server.sessionId}" && document.querySelector('#model-select').disabled === false`);
+  const opusId = await evaluate(activeId);
+  assert.equal(typeof opusId, "string");
+  assert.equal(await evaluate(`document.querySelector('#prompt-input').value`), "keep this draft");
+  assert.equal(await evaluate(`document.querySelector('#attachment-list').textContent.includes('draft.png')`), true);
+  assert.equal(await evaluate(`document.querySelector('#model-select').value`), "claude-opus-5.5");
+  assert.equal(await evaluate(`document.querySelector('#reasoning-select').value`), "low");
+  await evaluate(`
+    (() => {
+      const context = document.querySelector('#context-select');
+      context.value = "default";
+      context.dispatchEvent(new Event("change"));
+    })();
+  `);
+  await waitFor(`${activeId} !== "${opusId}" && document.querySelector('#model-select').disabled === false`);
+  const defaultId = await evaluate(activeId);
+  await evaluate(`
+    (() => {
+      const context = document.querySelector('#context-select');
+      context.value = "long_context";
+      context.dispatchEvent(new Event("change"));
+    })();
+  `);
+  await waitFor(`${activeId} !== "${defaultId}" && document.querySelector('#model-select').disabled === false`);
+  const longId = await evaluate(activeId);
+  assert.equal(typeof longId, "string");
+  assert.equal(await evaluate(`document.querySelectorAll('button.session-item').length`), 1);
+  assert.equal(await evaluate(`document.querySelector('#prompt-input').value`), "keep this draft");
+  assert.equal(await evaluate(`document.querySelector('#attachment-list').textContent.includes('draft.png')`), true);
+  await evaluate(`document.querySelector('#send-prompt').click()`);
+  await waitFor(`document.querySelector('#messages').textContent.includes('Done.') &&
+    document.querySelector('#model-select').disabled === false`);
+  const saved = await server.session(String(longId));
+  assert.ok(isRecord(saved));
+  assert.deepEqual(saved.messages, ["keep this draft"]);
+  assert.equal(saved.model, "claude-opus-5.5");
+  assert.equal(saved.context, "long_context");
+  assert.equal(saved.reasoningEffort, "low");
+  const prompt = (await server.requests()).find((request) => request.method === "session/prompt");
+  assert.ok(prompt && Array.isArray(prompt.prompt) && isRecord(prompt.prompt[1]));
+  assert.equal(prompt.prompt[1].type, "image");
+  assert.equal(prompt.prompt[1].data, imageData);
+  assert.match(String(await evaluate(`document.querySelector('#usage-context').textContent`)), /968K/);
+});
+
+test("keeps tools recovery available for successful refusals and after page refresh", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
 
   await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="session-1"]'))`);
   await evaluate(`document.querySelector('button.session-item[data-session-id="session-1"]').click()`);
