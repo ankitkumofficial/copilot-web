@@ -1138,6 +1138,88 @@ const mockScreenWakeLock = `
   });
 `;
 
+const mockSpeechRecognition = `
+  window.speechRecognitionTest = { instances: [], startErrorName: null };
+  window.SpeechRecognition = class {
+    constructor() {
+      this.stopCalls = 0;
+      window.speechRecognitionTest.instances.push(this);
+    }
+    start() {
+      const errorName = window.speechRecognitionTest.startErrorName;
+      if (errorName) {
+        throw new DOMException('Microphone permission denied', errorName);
+      }
+      this.onstart?.({ type: 'start' });
+    }
+    stop() {
+      this.stopCalls += 1;
+      this.onend?.({ type: 'end' });
+    }
+    abort() {
+      this.onend?.({ type: 'end' });
+    }
+    emit(transcripts) {
+      const results = transcripts.map(({ transcript, isFinal }) => {
+        const result = [{ transcript }];
+        result.isFinal = isFinal;
+        return result;
+      });
+      this.onresult?.({ results, resultIndex: 0 });
+    }
+  };
+`;
+
+test("streams speech into the composer and stops from the microphone button", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, mockSpeechRecognition);
+  const button = `document.querySelector('#voice-input')`;
+  const input = `document.querySelector('#prompt-input')`;
+  const status = `document.querySelector('#voice-input-status')`;
+  await waitFor(`${button}?.dataset.state === 'idle' && !${button}.disabled`);
+  await evaluate(`
+    const input = ${input};
+    input.value = 'Draft: ';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.setSelectionRange(input.value.length, input.value.length);
+  `);
+  await waitFor(`${button}.dataset.state === 'idle' && !${button}.disabled`);
+  await evaluate(`${button}.click()`);
+  await waitFor(`${button}.dataset.state === 'recording'`);
+  assert.equal(await evaluate(`${button}.getAttribute('aria-label')`), "Stop voice input");
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "true");
+  assert.equal(await evaluate(`${status}.textContent`), "Listening… Click the cross button to stop.");
+
+  await evaluate(`window.speechRecognitionTest.instances[0].emit([
+    { transcript: 'Copilot', isFinal: false }
+  ])`);
+  assert.equal(await evaluate(`${input}.value`), "Draft: Copilot");
+  await evaluate(`window.speechRecognitionTest.instances[0].emit([
+    { transcript: 'Copilot ', isFinal: true },
+    { transcript: 'Web', isFinal: false }
+  ])`);
+  assert.equal(await evaluate(`${input}.value`), "Draft: Copilot Web");
+
+  await evaluate(`${button}.click()`);
+  await waitFor(`${button}.dataset.state === 'idle'`);
+  assert.equal(await evaluate(`${button}.dataset.icon`), "microphone");
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "false");
+  assert.equal(await evaluate(`window.speechRecognitionTest.instances[0].stopCalls`), 1);
+  assert.equal(await evaluate(`${input}.value`), "Draft: Copilot Web");
+  assert.equal(await evaluate(`${status}.hidden`), true);
+
+  await evaluate(`
+    window.speechRecognitionTest.startErrorName = 'NotAllowedError';
+    ${button}.click();
+  `);
+  await waitFor(`${button}.dataset.state === 'error'`);
+  assert.equal(await evaluate(`${status}.textContent`), "Microphone access was denied. Allow microphone access in your browser and try again.");
+  assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "false");
+});
+
 test("toggles a native screen wake lock from the message bar", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
