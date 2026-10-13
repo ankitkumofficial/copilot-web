@@ -156,6 +156,12 @@
                 </svg>
               </button>
               <input id="file-input" type="file" accept="image/*,.pdf,application/pdf" multiple hidden>
+              <button id="voice-input" class="secondary-button icon-button" type="button" data-icon="microphone" aria-label="Start voice input" aria-pressed="false" aria-describedby="voice-input-status" title="Start voice input" disabled>
+                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z"></path>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2m7 9v3m-4 0h8"></path>
+                </svg>
+              </button>
               <button id="cancel-prompt" class="secondary-button icon-button" type="button" aria-label="Cancel current prompt" title="Cancel current prompt" disabled>
                 <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
                   <path d="m6 6 12 12M18 6 6 18"></path>
@@ -168,6 +174,7 @@
               </button>
             </div>
           </div>
+          <p id="voice-input-status" class="voice-input-status" role="status" aria-live="polite" hidden></p>
           <p id="keep-awake-status" class="keep-awake-status visually-hidden" role="status"></p>
         </form>
       </main>
