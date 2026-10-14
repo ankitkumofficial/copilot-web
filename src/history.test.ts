@@ -240,6 +240,7 @@ test("normalizes native messages, reconstructs inline attachments, and deduplica
     }
   });
   assert.deepEqual(withActivity?.toolCallIds, ["tool-1"]);
+  assert.equal(withActivity?.reasoningText, "Need to inspect the file.");
   assert.equal(collection.eventIds.size, 5);
   assert.deepEqual(collection.order, [
     "user:user-1",
@@ -293,7 +294,11 @@ test("merges persisted and buffered events without letting stale live text repla
     id: "assistant-final",
     type: "assistant.message",
     timestamp: "2026-10-14T10:00:03.000Z",
-    data: { messageId: "assistant-1", content: "Final answer" }
+    data: {
+      messageId: "assistant-1",
+      content: "Final answer",
+      reasoningText: "Thought before the answer"
+    }
   }];
   const buffered = [{
     id: "late-delta",
@@ -317,4 +322,16 @@ test("merges persisted and buffered events without letting stale live text repla
   assert.equal(messages[0]?.content, "Final answer");
   assert.equal(messages[0]?.completion, "completed");
   assert.equal(messages[0]?.timestamp, "2026-10-14T10:00:03.000Z");
+
+  const newerLiveMessage: NativeMessage = {
+    ...staleLiveMessage,
+    content: "Updated final answer",
+    completion: "completed",
+    eventId: "live-final",
+    revision: 10,
+    updatedAt: "2026-10-14T10:00:04.500Z"
+  };
+  const mergedWithNewerLive = mergeNativeMessages(persisted, [], [newerLiveMessage]);
+  assert.equal(mergedWithNewerLive[0]?.content, "Updated final answer");
+  assert.equal(mergedWithNewerLive[0]?.reasoningText, "Thought before the answer");
 });

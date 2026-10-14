@@ -43,6 +43,7 @@ export interface NativeMessage {
   completion: "streaming" | "completed";
   eventId: string;
   revision: number;
+  reasoningText?: string;
   updatedAt?: string;
   timestamp?: string;
   clientPromptId?: string;
@@ -432,6 +433,10 @@ export function applyNativeMessageEvent(
   const key = nativeMessageKey(role, messageId);
   const previous = collection.messages.get(key);
   const revision = (previous?.revision ?? 0) + 1;
+  const reasoningText = typeof event.data.reasoningText === "string"
+    ? event.data.reasoningText
+    : previous?.reasoningText;
+  const reasoning = reasoningText === undefined ? {} : { reasoningText };
   let message: NativeMessage;
 
   if (event.type === "user.message") {
@@ -461,6 +466,7 @@ export function applyNativeMessageEvent(
       completion: "streaming",
       eventId,
       revision,
+      ...reasoning,
       ...(validTimestamp(event.timestamp) ? { updatedAt: event.timestamp } : {})
     };
   } else if (event.type === "assistant.message_delta") {
@@ -477,6 +483,7 @@ export function applyNativeMessageEvent(
       completion: "streaming",
       eventId,
       revision,
+      ...reasoning,
       ...(validTimestamp(event.timestamp) ? { updatedAt: event.timestamp } : {})
     };
   } else {
@@ -488,6 +495,7 @@ export function applyNativeMessageEvent(
       completion: "completed",
       eventId,
       revision,
+      ...reasoning,
       ...(validTimestamp(event.timestamp) ? {
         timestamp: event.timestamp,
         updatedAt: event.timestamp
@@ -587,7 +595,14 @@ export function mergeNativeMessages(
       }
       continue;
     }
-    messages[index] = copyNativeMessage(liveMessage);
+    const newerMessage = copyNativeMessage(liveMessage);
+    if (
+      newerMessage.reasoningText === undefined &&
+      persistedMessage.reasoningText !== undefined
+    ) {
+      newerMessage.reasoningText = persistedMessage.reasoningText;
+    }
+    messages[index] = newerMessage;
   }
   return messages;
 }

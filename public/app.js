@@ -2865,6 +2865,18 @@ function toolStatusClass(status) {
     .replace(/[^a-z0-9_-]+/g, "-");
 }
 
+function createToolGroup(toolGroupKey) {
+  return {
+    role: "tool",
+    text: "",
+    toolGroupKey,
+    toolActivities: [],
+    toolActivitiesExpanded: false,
+    thinkingText: "",
+    thinkingExpanded: false
+  };
+}
+
 function ensureToolGroup(conversation = activeConversation() ?? state.composer) {
   conversation.lastStreamRole = "tool";
   if (!conversation.currentToolGroupKey) {
@@ -2877,15 +2889,7 @@ function ensureToolGroup(conversation = activeConversation() ?? state.composer) 
     message.toolGroupKey === conversation.currentToolGroupKey
   ));
   if (!group) {
-    group = {
-      role: "tool",
-      text: "",
-      toolGroupKey: conversation.currentToolGroupKey,
-      toolActivities: [],
-      toolActivitiesExpanded: false,
-      thinkingText: "",
-      thinkingExpanded: false
-    };
+    group = createToolGroup(conversation.currentToolGroupKey);
     conversation.messages.push(group);
   }
   return group;
@@ -4378,6 +4382,49 @@ function updateNativeMessageTurn(message, conversation) {
   }
 }
 
+function upsertNativeReasoning(record, conversation, assistantMessage) {
+  const reasoningText = typeof record.reasoningText === "string"
+    ? record.reasoningText
+    : "";
+  if (reasoningText.length === 0) {
+    return;
+  }
+
+  const assistantIndex = assistantMessage
+    ? conversation.messages.indexOf(assistantMessage)
+    : -1;
+  let group = assistantIndex > 0 &&
+    conversation.messages[assistantIndex - 1]?.role === "tool"
+    ? conversation.messages[assistantIndex - 1]
+    : null;
+  if (group?.thinkingText) {
+    return;
+  }
+
+  const toolGroupKey = `tool-group:native:${record.messageId}`;
+  if (!group) {
+    group = conversation.messages.find((message) => (
+      message.role === "tool" &&
+      message.toolGroupKey === toolGroupKey
+    ));
+  }
+  if (!group) {
+    group = createToolGroup(toolGroupKey);
+    const insertionIndex = assistantIndex >= 0
+      ? assistantIndex
+      : conversation.messages.length;
+    conversation.messages.splice(insertionIndex, 0, group);
+    for (const [key, index] of conversation.messageKeys) {
+      if (index >= insertionIndex) {
+        conversation.messageKeys.set(key, index + 1);
+      }
+    }
+  }
+
+  group.thinkingText = reasoningText;
+  scheduleMessagesRender(conversation, group);
+}
+
 function ingestNativeMessage(record, conversation) {
   if (
     !record ||
@@ -4475,11 +4522,17 @@ function ingestNativeMessage(record, conversation) {
       conversation.messageKeys.set(key, index);
     }
     updateNativeMessageTurn(message, conversation);
+    if (record.role === "assistant") {
+      upsertNativeReasoning(record, conversation, message);
+    }
     scheduleMessagesRender(conversation, message);
     return;
   }
 
   if (!content && attachments.length === 0) {
+    if (record.role === "assistant") {
+      upsertNativeReasoning(record, conversation, null);
+    }
     return;
   }
   message = {
@@ -4514,6 +4567,9 @@ function ingestNativeMessage(record, conversation) {
     restoreSelectionMessageMetadata(message, conversation);
   }
   updateNativeMessageTurn(message, conversation);
+  if (record.role === "assistant") {
+    upsertNativeReasoning(record, conversation, message);
+  }
   scheduleMessagesRender(conversation, message);
 }
 
