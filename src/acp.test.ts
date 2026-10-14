@@ -283,7 +283,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
 });
 `;
 
-test("subscribes to native user and assistant message events", async () => {
+test("subscribes to native message and reasoning events", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-native-events-test-"));
   const command = path.join(directory, "copilot-fake");
   await writeFile(command, fakeCopilot);
@@ -299,7 +299,9 @@ test("subscribes to native user and assistant message events", async () => {
       "user.message",
       "assistant.message_start",
       "assistant.message_delta",
-      "assistant.message"
+      "assistant.message",
+      "assistant.reasoning_delta",
+      "assistant.reasoning"
     ]) {
       assert.ok(events.includes(event), `Expected native event subscription for ${event}`);
     }
