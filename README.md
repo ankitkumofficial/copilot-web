@@ -143,11 +143,11 @@ configuration activity.
 
 Persisted-history reading depends on an experimental SDK/CLI API, available in
 the tested Copilot CLI 1.0.97 release. If the API is unsupported or a history
-read fails, Copilot Web displays a warning and falls back to ACP replay;
-timestamps are unavailable for those ACP-only messages. A message without a
+read fails, Copilot Web falls back to ACP replay; older ACP-only messages may
+not have timestamps. A message without a
 recorded event timestamp never receives an inferred or current time. Copilot
 does not record command output such as `/mcp reload` (used by **Reconnect
-tools**), so it is shown without a timestamp and without a warning.
+tools**), so it is shown without a timestamp.
 
 ## Running
 
@@ -238,13 +238,13 @@ brand mark uses `C`.
   by the bridge's short request timeout.
 - Native persisted-message history is experimental and depends on the installed
   SDK and Copilot CLI supporting `sessions.readPersistedEvents`. If it is
-  unavailable or unreadable, ACP replay remains available with an explicit
-  warning, but it cannot supply recorded message timestamps.
+  unavailable or unreadable, ACP replay remains available, but older messages
+  may not have recorded timestamps.
 - When loading history, native messages are placed beside ACP tool and
   reasoning activity by conversation turn, using the tool-call IDs both sources
   share. If a turn's native and ACP messages cannot be matched exactly, that
-  part of the transcript is shown from ACP without timestamps, with a warning,
-  rather than risking shifted or duplicated messages.
+  part of the transcript is shown from ACP rather than risking shifted or
+  duplicated messages.
 - Tool recovery requires the CLI to advertise the native `/mcp` command through
   ACP. Recovery waits up to five seconds for delayed command metadata and
   reports an explicit timeout if it never arrives. Cancelling during that wait
