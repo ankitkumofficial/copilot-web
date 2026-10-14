@@ -2,7 +2,11 @@ const defaultBrandName = "Copilot Web";
 const defaultBrandInitial = "C";
 const contextStorageKey = "copilot-web-context";
 const activeSessionStorageKey = "copilot-web-active-session";
+const selectionMessageMetadataStorageKey = "copilot-web-selection-messages";
 const screenWakeLockStorageKey = "copilot-web-keep-awake";
+const messageSelectionHighlightName = "copilot-web-source-selection";
+const maximumSelectionMessageMetadataEntries = 500;
+const selectionNoticeDurationMs = 4000;
 const contextPreferences = ["default", "long_context"];
 const maximumAttachmentCount = 10;
 const maximumAttachmentBytes = 8 * 1024 * 1024;
@@ -67,6 +71,8 @@ function createConversationState(sessionId = null) {
     messages: [],
     messageKeys: new Map(),
     attachments: [],
+    selections: [],
+    nextSelectionNumber: 1,
     draft: "",
     promptQueue: [],
     syntheticMessageCounter: 0,
@@ -105,6 +111,330 @@ function createConversationState(sessionId = null) {
     pendingPermission: null,
     drainPromise: null
   };
+}
+
+function copySelectionReference(selection) {
+  return {
+    ...selection,
+    startPath: [...selection.startPath],
+    endPath: [...selection.endPath]
+  };
+}
+
+function isStoredSelectionReference(value) {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    typeof value.id === "string" &&
+    Number.isInteger(value.number) &&
+    value.number > 0 &&
+    typeof value.text === "string" &&
+    (value.sessionId === null || typeof value.sessionId === "string") &&
+    Number.isInteger(value.messageIndex) &&
+    value.messageIndex >= 0 &&
+    Array.isArray(value.startPath) &&
+    value.startPath.every((index) => Number.isInteger(index) && index >= 0) &&
+    Number.isInteger(value.startOffset) &&
+    value.startOffset >= 0 &&
+    Array.isArray(value.endPath) &&
+    value.endPath.every((index) => Number.isInteger(index) && index >= 0) &&
+    Number.isInteger(value.endOffset) &&
+    value.endOffset >= 0 &&
+    (
+      value.sourceOrdinal === undefined ||
+      (Number.isInteger(value.sourceOrdinal) && value.sourceOrdinal >= 0)
+    )
+  );
+}
+
+function compactSelectionText(text) {
+  return text.replace(/\s+/g, "");
+}
+
+function readSelectionMessageMetadata() {
+  try {
+    const stored = window.localStorage.getItem(selectionMessageMetadataStorageKey);
+    if (!stored) {
+      return Object.create(null);
+    }
+    const parsed = JSON.parse(stored);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return Object.create(null);
+    }
+    const metadata = Object.create(null);
+    for (const [sessionId, entries] of Object.entries(parsed)) {
+      if (!/^[A-Za-z0-9_-]+$/.test(sessionId) || !Array.isArray(entries)) {
+        continue;
+      }
+      metadata[sessionId] = entries.filter((entry) => (
+        entry &&
+        typeof entry === "object" &&
+        typeof entry.promptText === "string" &&
+        typeof entry.displayText === "string" &&
+        Array.isArray(entry.selections) &&
+        entry.selections.length > 0 &&
+        entry.selections.every(isStoredSelectionReference)
+      )).map((entry) => ({
+        promptText: entry.promptText,
+        displayText: entry.displayText,
+        selections: entry.selections.map(copySelectionReference),
+        createdAt: Number.isFinite(entry.createdAt) ? entry.createdAt : 0
+      }));
+      if (metadata[sessionId].length === 0) {
+        delete metadata[sessionId];
+      }
+    }
+    return metadata;
+  } catch (error) {
+    console.warn("Unable to restore selected-message formatting", error);
+    return Object.create(null);
+  }
+}
+
+let selectionMessageMetadata = readSelectionMessageMetadata();
+const selectionMessageRestorationCounts = new Map();
+
+function selectionMessageMetadataEntries() {
+  return Object.entries(selectionMessageMetadata).flatMap(([sessionId, entries]) => (
+    entries.map((entry) => ({ sessionId, entry }))
+  ));
+}
+
+function removeOldestSelectionMessageMetadata(count, protectedEntry = null) {
+  const oldest = selectionMessageMetadataEntries()
+    .filter(({ entry }) => entry !== protectedEntry)
+    .sort((left, right) => left.entry.createdAt - right.entry.createdAt)
+    .slice(0, count);
+  for (const { sessionId, entry } of oldest) {
+    const entries = selectionMessageMetadata[sessionId];
+    const index = entries?.indexOf(entry) ?? -1;
+    if (index >= 0) {
+      entries.splice(index, 1);
+    }
+    if (entries?.length === 0) {
+      delete selectionMessageMetadata[sessionId];
+    }
+  }
+  return oldest.length;
+}
+
+function writeSelectionMessageMetadata(protectedEntry = null) {
+  const overflow = selectionMessageMetadataEntries().length - maximumSelectionMessageMetadataEntries;
+  if (overflow > 0) {
+    removeOldestSelectionMessageMetadata(overflow, protectedEntry);
+  }
+  while (true) {
+    try {
+      if (Object.keys(selectionMessageMetadata).length === 0) {
+        window.localStorage.removeItem(selectionMessageMetadataStorageKey);
+      } else {
+        window.localStorage.setItem(
+          selectionMessageMetadataStorageKey,
+          JSON.stringify(selectionMessageMetadata)
+        );
+      }
+      return true;
+    } catch (error) {
+      const evictable = selectionMessageMetadataEntries()
+        .filter(({ entry }) => entry !== protectedEntry)
+        .length;
+      if (evictable === 0) {
+        console.warn("Unable to persist selected-message formatting", error);
+        return false;
+      }
+      removeOldestSelectionMessageMetadata(Math.max(1, Math.ceil(evictable / 4)), protectedEntry);
+    }
+  }
+}
+
+function persistSelectionMessageMetadata(sessionId, promptText, displayText, selections) {
+  const entries = selectionMessageMetadata[sessionId] ?? [];
+  selectionMessageMetadata[sessionId] = entries;
+  const entry = {
+    promptText,
+    displayText,
+    selections: selections.map(copySelectionReference),
+    createdAt: Date.now()
+  };
+  entries.push(entry);
+  if (writeSelectionMessageMetadata(entry)) {
+    return true;
+  }
+  const index = entries.indexOf(entry);
+  if (index >= 0) {
+    entries.splice(index, 1);
+  }
+  if (entries.length === 0) {
+    delete selectionMessageMetadata[sessionId];
+  }
+  return false;
+}
+
+function pruneSelectionMessageMetadata(listedSessionIds, requestStartedAt) {
+  let changed = false;
+  for (const [sessionId, entries] of Object.entries(selectionMessageMetadata)) {
+    if (
+      listedSessionIds.has(sessionId) ||
+      state.conversations.has(sessionId) ||
+      entries.some((entry) => entry.createdAt >= requestStartedAt)
+    ) {
+      continue;
+    }
+    delete selectionMessageMetadata[sessionId];
+    selectionMessageRestorationCounts.delete(sessionId);
+    changed = true;
+  }
+  if (changed) {
+    writeSelectionMessageMetadata();
+  }
+}
+
+function parseSelectionPrompt(text) {
+  const marker = "\n\nSelected passages from the conversation:\n";
+  const markerIndex = text.lastIndexOf(marker);
+  if (markerIndex < 0) {
+    return null;
+  }
+  const selectionText = text.slice(markerIndex + marker.length);
+  const headers = Array.from(
+    selectionText.matchAll(/(?:^|\n\n)Selection (\d+):\n/g)
+  );
+  if (headers.length === 0 || headers[0].index !== 0) {
+    return null;
+  }
+
+  const selections = [];
+  for (const [index, header] of headers.entries()) {
+    const nextHeader = headers[index + 1];
+    const contentStart = header.index + header[0].length;
+    const contentEnd = nextHeader?.index ?? selectionText.length;
+    const lines = selectionText.slice(contentStart, contentEnd).split("\n");
+    if (!lines.every((line) => line.startsWith("> "))) {
+      return null;
+    }
+    const selectedText = lines.map((line) => line.slice(2)).join("\n").trim();
+    const number = Number(header[1]);
+    if (!selectedText || !Number.isInteger(number) || number < 1) {
+      return null;
+    }
+    selections.push({ number, text: selectedText });
+  }
+  return {
+    displayText: text.slice(0, markerIndex),
+    selections
+  };
+}
+
+function messageSelectionSearchText(message) {
+  if (message.role !== "assistant") {
+    return message.text;
+  }
+  const rendered = document.createElement("div");
+  rendered.innerHTML = renderMarkdown(message.text);
+  return rendered.textContent ?? "";
+}
+
+function findSelectionSourceMessageIndex(conversation, beforeIndex, selectedText) {
+  const compactSelection = compactSelectionText(selectedText);
+  if (!compactSelection) {
+    return -1;
+  }
+  for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+    const message = conversation.messages[index];
+    if (!message || (message.role !== "user" && message.role !== "assistant")) {
+      continue;
+    }
+    if (compactSelectionText(messageSelectionSearchText(message)).includes(compactSelection)) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function restoreSelectionMessageMetadata(message, conversation) {
+  if (
+    !conversation.loading ||
+    !conversation.sessionId ||
+    message.role !== "user" ||
+    message.selectionMetadataRestored
+  ) {
+    return;
+  }
+  const promptText = message.rawSelectionPromptText ?? message.text;
+  const entries = (selectionMessageMetadata[conversation.sessionId] ?? [])
+    .filter((entry) => entry.promptText === promptText);
+  const sessionCounts = selectionMessageRestorationCounts.get(conversation.sessionId) ?? new Map();
+  const matchingIndex = sessionCounts.get(promptText) ?? 0;
+  const entry = entries[matchingIndex];
+  if (entry) {
+    sessionCounts.set(promptText, matchingIndex + 1);
+    selectionMessageRestorationCounts.set(conversation.sessionId, sessionCounts);
+    message.text = entry.displayText;
+    message.selections = entry.selections.map(copySelectionReference);
+    message.selectionMetadataRestored = true;
+    return;
+  }
+
+  const recovered = parseSelectionPrompt(promptText);
+  if (!recovered) {
+    return;
+  }
+  const messageIndex = conversation.messages.indexOf(message);
+  const selections = recovered.selections.map((selection) => {
+    const sourceIndex = findSelectionSourceMessageIndex(
+      conversation,
+      messageIndex,
+      selection.text
+    );
+    if (sourceIndex < 0) {
+      return null;
+    }
+    return {
+      id: `selection-${selection.number}`,
+      number: selection.number,
+      text: selection.text,
+      sessionId: conversation.sessionId,
+      messageIndex: sourceIndex,
+      startPath: [],
+      startOffset: 0,
+      endPath: [],
+      endOffset: 0
+    };
+  });
+  if (selections.some((selection) => selection === null)) {
+    return;
+  }
+  message.text = recovered.displayText;
+  message.selections = selections;
+  message.selectionMetadataRestored = true;
+}
+
+function moveSelectionMessageMetadata(previousSessionId, nextSessionId) {
+  const entries = selectionMessageMetadata[previousSessionId];
+  if (entries) {
+    selectionMessageMetadata[nextSessionId] = [
+      ...(selectionMessageMetadata[nextSessionId] ?? []),
+      ...entries.map((entry) => ({
+        ...entry,
+        selections: entry.selections.map((selection) => ({
+          ...copySelectionReference(selection),
+          sessionId: selection.sessionId === previousSessionId
+            ? nextSessionId
+            : selection.sessionId
+        }))
+      }))
+    ];
+    delete selectionMessageMetadata[previousSessionId];
+    writeSelectionMessageMetadata();
+  }
+  selectionMessageRestorationCounts.delete(previousSessionId);
+  selectionMessageRestorationCounts.delete(nextSessionId);
+}
+
+function clearSelectionMessageMetadata(sessionId) {
+  delete selectionMessageMetadata[sessionId];
+  selectionMessageRestorationCounts.delete(sessionId);
+  writeSelectionMessageMetadata();
 }
 
 const state = {
@@ -169,6 +499,13 @@ const serverPromptStates = new Map();
 let serverPromptRevision = 0;
 let serverPromptRequestId = 0;
 let lastSessionListRequestId = 0;
+let pendingMessageSelection = null;
+let pointerSelectionInProgress = false;
+let keyboardSelectionInProgress = false;
+let messageSelectionHighlightTimer = null;
+let activeMessageSelectionHighlight = null;
+let selectionNoticeTimer = null;
+let renderedMessagesConversation = null;
 
 const elements = {
   statusFavicon: document.querySelector("#app-favicon"),
@@ -193,6 +530,9 @@ const elements = {
   usageContext: document.querySelector("#usage-context"),
   messages: document.querySelector("#messages"),
   scrollToBottom: document.querySelector("#scroll-to-bottom"),
+  askSelection: document.querySelector("#ask-selection"),
+  selectionList: document.querySelector("#selection-list"),
+  selectionStatus: document.querySelector("#selection-status"),
   emptyState: document.querySelector("#empty-state"),
   loadingState: document.querySelector("#loading-state"),
   composer: document.querySelector("#composer"),
@@ -1960,6 +2300,58 @@ function renderAttachmentList() {
   updateAttachmentControls();
 }
 
+function renderSelectionList() {
+  const conversation = currentComposerConversation();
+  elements.selectionList.replaceChildren();
+  for (const selection of conversation.selections) {
+    const card = document.createElement("div");
+    card.className = "selection-card";
+
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "selection-card-open";
+    open.title = `Jump to Selection ${selection.number}`;
+    open.setAttribute("aria-label", `Jump to Selection ${selection.number} at its source`);
+    open.addEventListener("click", () => {
+      jumpToSelection(selection);
+    });
+
+    const text = document.createElement("span");
+    text.className = "selection-card-text";
+    text.textContent = selection.text;
+
+    const label = document.createElement("span");
+    label.className = "selection-card-label";
+    label.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-6l-5 4v-4a2 2 0 0 1-3-2V6a2 2 0 0 1 2-2Z"></path><path d="M9 8h6m-6 3h4"></path></svg>';
+    const number = document.createElement("span");
+    number.textContent = `Selection ${selection.number}`;
+    label.append(number);
+    open.append(text, label);
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "selection-card-remove";
+    remove.textContent = "×";
+    remove.title = `Remove Selection ${selection.number}`;
+    remove.setAttribute("aria-label", `Remove Selection ${selection.number}`);
+    remove.addEventListener("click", () => {
+      removeSelection(selection.id);
+    });
+
+    card.append(open, remove);
+    elements.selectionList.append(card);
+  }
+  elements.input.placeholder = conversation.selections.length > 0
+    ? "Ask Copilot about these selections..."
+    : "Message Copilot...";
+}
+
+function removeSelection(id) {
+  const conversation = currentComposerConversation();
+  conversation.selections = conversation.selections.filter((selection) => selection.id !== id);
+  renderSelectionList();
+}
+
 function removeAttachment(id) {
   const conversation = currentComposerConversation();
   conversation.attachments = conversation.attachments.filter((attachment) => attachment.id !== id);
@@ -2889,6 +3281,493 @@ function restoreMessagePanelScroll(article, message, positions) {
   });
 }
 
+function hideAskSelection() {
+  pendingMessageSelection = null;
+  elements.askSelection.hidden = true;
+  elements.askSelection.style.removeProperty("left");
+  elements.askSelection.style.removeProperty("top");
+  elements.askSelection.style.removeProperty("visibility");
+}
+
+function selectionMatchesRange(selection, range) {
+  if (!selection || selection.rangeCount !== 1) {
+    return false;
+  }
+  const currentRange = selection.getRangeAt(0);
+  return currentRange.startContainer === range.startContainer &&
+    currentRange.startOffset === range.startOffset &&
+    currentRange.endContainer === range.endContainer &&
+    currentRange.endOffset === range.endOffset;
+}
+
+function clearMessageSelectionHighlight() {
+  if (messageSelectionHighlightTimer !== null) {
+    window.clearTimeout(messageSelectionHighlightTimer);
+    messageSelectionHighlightTimer = null;
+  }
+  const highlight = activeMessageSelectionHighlight;
+  activeMessageSelectionHighlight = null;
+  if (!highlight) {
+    return;
+  }
+  highlight.body.classList.remove("selection-flash");
+  if (highlight.custom) {
+    window.CSS?.highlights?.delete(messageSelectionHighlightName);
+  }
+  const selection = window.getSelection();
+  if (!highlight.custom && selection && selectionMatchesRange(selection, highlight.range)) {
+    selection.removeAllRanges();
+  }
+}
+
+function messageBodyForSelectionNode(node) {
+  const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+  return element?.closest(".message-body") ?? null;
+}
+
+function selectionNodePath(root, node) {
+  const path = [];
+  let current = node;
+  while (current && current !== root) {
+    const parent = current.parentNode;
+    if (!parent) {
+      return null;
+    }
+    const index = Array.prototype.indexOf.call(parent.childNodes, current);
+    if (index < 0) {
+      return null;
+    }
+    path.unshift(index);
+    current = parent;
+  }
+  return current === root ? path : null;
+}
+
+function selectableMessageArticles() {
+  return Array.from(elements.messages.querySelectorAll(".message.user, .message.assistant"));
+}
+
+function messageSelectionReference(selection) {
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+    return null;
+  }
+  const text = selection.toString().trim();
+  const range = selection.getRangeAt(0);
+  const body = messageBodyForSelectionNode(range.startContainer);
+  const message = body?.closest(".message");
+  if (
+    !text ||
+    !body ||
+    body !== messageBodyForSelectionNode(range.endContainer) ||
+    !elements.messages.contains(body) ||
+    !message ||
+    (!message.classList.contains("user") && !message.classList.contains("assistant"))
+  ) {
+    return null;
+  }
+
+  const conversation = currentComposerConversation();
+  const messageIndex = Number(message.dataset.messageIndex);
+  const startPath = selectionNodePath(body, range.startContainer);
+  const endPath = selectionNodePath(body, range.endContainer);
+  if (
+    !Number.isInteger(messageIndex) ||
+    !conversation.messages[messageIndex] ||
+    startPath === null ||
+    endPath === null
+  ) {
+    return null;
+  }
+  return {
+    range,
+    reference: {
+      text,
+      sessionId: conversation.sessionId,
+      messageIndex,
+      sourceOrdinal: selectableMessageArticles().indexOf(message),
+      startPath,
+      startOffset: range.startOffset,
+      endPath,
+      endOffset: range.endOffset
+    }
+  };
+}
+
+function updateAskSelection() {
+  if (pointerSelectionInProgress || keyboardSelectionInProgress) {
+    hideAskSelection();
+    return;
+  }
+  const selection = window.getSelection();
+  if (
+    selection &&
+    activeMessageSelectionHighlight &&
+    !activeMessageSelectionHighlight.custom &&
+    selectionMatchesRange(selection, activeMessageSelectionHighlight.range)
+  ) {
+    hideAskSelection();
+    return;
+  }
+  const selected = messageSelectionReference(selection);
+  if (!selected) {
+    hideAskSelection();
+    return;
+  }
+
+  const selectionBounds = selected.range.getBoundingClientRect();
+  if (
+    (selectionBounds.width === 0 && selectionBounds.height === 0) ||
+    selectionBounds.bottom < 0 ||
+    selectionBounds.top > window.innerHeight
+  ) {
+    hideAskSelection();
+    return;
+  }
+
+  pendingMessageSelection = selected.reference;
+  elements.askSelection.hidden = false;
+  elements.askSelection.style.visibility = "hidden";
+  const actionBounds = elements.askSelection.getBoundingClientRect();
+  const edge = 8;
+  const gap = 9;
+  const maxLeft = Math.max(edge, window.innerWidth - actionBounds.width - edge);
+  const left = Math.min(
+    Math.max(selectionBounds.left + selectionBounds.width / 2 - actionBounds.width / 2, edge),
+    maxLeft
+  );
+  let top = selectionBounds.top - actionBounds.height - gap;
+  if (top < edge) {
+    top = selectionBounds.bottom + gap;
+  }
+  const maxTop = Math.max(edge, window.innerHeight - actionBounds.height - edge);
+  top = Math.min(Math.max(top, edge), maxTop);
+  elements.askSelection.style.left = `${Math.round(left)}px`;
+  elements.askSelection.style.top = `${Math.round(top)}px`;
+  elements.askSelection.style.visibility = "";
+}
+
+function attachSelectedText() {
+  if (!pendingMessageSelection) {
+    return;
+  }
+
+  const conversation = currentComposerConversation();
+  const number = conversation.nextSelectionNumber;
+  conversation.nextSelectionNumber += 1;
+  conversation.selections.push({
+    ...pendingMessageSelection,
+    id: `selection-${number}`,
+    number,
+    startPath: [...pendingMessageSelection.startPath],
+    endPath: [...pendingMessageSelection.endPath]
+  });
+  hideAskSelection();
+  window.getSelection()?.removeAllRanges();
+  renderSelectionList();
+  elements.input.focus();
+}
+
+function selectionNodeAtPath(root, path) {
+  let node = root;
+  for (const index of path) {
+    node = node.childNodes[index];
+    if (!node) {
+      return null;
+    }
+  }
+  return node;
+}
+
+function validSelectionOffset(node, offset) {
+  const length = node.nodeType === Node.TEXT_NODE
+    ? node.textContent.length
+    : node.childNodes.length;
+  return Number.isInteger(offset) && offset >= 0 && offset <= length;
+}
+
+function findSelectionTextRange(body, text) {
+  const target = compactSelectionText(text);
+  if (!target) {
+    return null;
+  }
+  const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+  const positions = [];
+  let content = "";
+  let node;
+  while ((node = walker.nextNode())) {
+    const value = node.textContent ?? "";
+    for (let offset = 0; offset < value.length; offset += 1) {
+      const character = value[offset];
+      if (!/\s/.test(character)) {
+        content += character;
+        positions.push({ node, offset });
+      }
+    }
+  }
+
+  const start = content.indexOf(target);
+  if (start < 0) {
+    return null;
+  }
+  const first = positions[start];
+  const last = positions[start + target.length - 1];
+  const range = document.createRange();
+  range.setStart(first.node, first.offset);
+  range.setEnd(last.node, last.offset + 1);
+  return range;
+}
+
+function selectionRangeForReference(body, reference) {
+  const startNode = selectionNodeAtPath(body, reference.startPath);
+  const endNode = selectionNodeAtPath(body, reference.endPath);
+  if (
+    startNode &&
+    endNode &&
+    validSelectionOffset(startNode, reference.startOffset) &&
+    validSelectionOffset(endNode, reference.endOffset)
+  ) {
+    const range = document.createRange();
+    range.setStart(startNode, reference.startOffset);
+    range.setEnd(endNode, reference.endOffset);
+    if (
+      !range.collapsed &&
+      compactSelectionText(range.toString()) === compactSelectionText(reference.text)
+    ) {
+      return range;
+    }
+  }
+  return findSelectionTextRange(body, reference.text);
+}
+
+function preferredSelectionMessageIndex(reference, articles) {
+  if (Number.isInteger(reference.sourceOrdinal)) {
+    const article = articles[reference.sourceOrdinal];
+    const index = Number(article?.dataset.messageIndex);
+    if (Number.isInteger(index)) {
+      return index;
+    }
+  }
+  return reference.messageIndex;
+}
+
+function locateSelectionReference(reference, { exactOnly = false } = {}) {
+  const conversation = currentComposerConversation();
+  if (reference.sessionId && reference.sessionId !== conversation.sessionId) {
+    return null;
+  }
+  const articles = selectableMessageArticles();
+  const preferredIndex = preferredSelectionMessageIndex(reference, articles);
+  const candidates = articles
+    .map((article) => ({ article, index: Number(article.dataset.messageIndex) }))
+    .filter(({ index }) => Number.isInteger(index))
+    .filter(({ index }) => !exactOnly || index === preferredIndex)
+    .sort((left, right) => (
+      Math.abs(left.index - preferredIndex) - Math.abs(right.index - preferredIndex) ||
+      left.index - right.index
+    ));
+  for (const { article, index } of candidates) {
+    const body = article.querySelector(".message-body");
+    if (!body) {
+      continue;
+    }
+    const range = index === preferredIndex
+      ? selectionRangeForReference(body, reference)
+      : findSelectionTextRange(body, reference.text);
+    if (range) {
+      return { article, body, range };
+    }
+  }
+  return null;
+}
+
+function showSelectionNotice(message) {
+  if (selectionNoticeTimer !== null) {
+    window.clearTimeout(selectionNoticeTimer);
+  }
+  elements.selectionStatus.textContent = message;
+  elements.selectionStatus.hidden = false;
+  selectionNoticeTimer = window.setTimeout(() => {
+    selectionNoticeTimer = null;
+    elements.selectionStatus.hidden = true;
+    elements.selectionStatus.textContent = "";
+  }, selectionNoticeDurationMs);
+}
+
+function paintMessageSelectionHighlight(body, range) {
+  if (typeof window.Highlight === "function" && window.CSS?.highlights) {
+    window.CSS.highlights.set(messageSelectionHighlightName, new window.Highlight(range));
+    return true;
+  }
+  const selection = window.getSelection();
+  if (!selection) {
+    return null;
+  }
+  selection.removeAllRanges();
+  selection.addRange(range);
+  body.classList.add("selection-flash");
+  return false;
+}
+
+function messageSelectionHighlightIsCurrent(highlight) {
+  return highlight.body.isConnected &&
+    !highlight.range.collapsed &&
+    compactSelectionText(highlight.range.toString()) ===
+      compactSelectionText(highlight.reference.text) &&
+    (
+      highlight.custom ||
+      selectionMatchesRange(window.getSelection(), highlight.range)
+    );
+}
+
+function restoreMessageSelectionHighlight() {
+  const highlight = activeMessageSelectionHighlight;
+  if (!highlight || messageSelectionHighlightIsCurrent(highlight)) {
+    return;
+  }
+  const located = locateSelectionReference(highlight.reference);
+  highlight.body.classList.remove("selection-flash");
+  if (!located) {
+    clearMessageSelectionHighlight();
+    return;
+  }
+  const custom = paintMessageSelectionHighlight(located.body, located.range);
+  if (custom === null) {
+    clearMessageSelectionHighlight();
+    return;
+  }
+  highlight.body = located.body;
+  highlight.range = located.range;
+  highlight.custom = custom;
+}
+
+function jumpToSelection(reference) {
+  const conversation = currentComposerConversation();
+  if (reference.sessionId && reference.sessionId !== conversation.sessionId) {
+    if (!state.sessions.some((session) => session.sessionId === reference.sessionId)) {
+      showSelectionNotice("The selected text's conversation is no longer available.");
+      return;
+    }
+    void loadConversation(reference.sessionId).then((loaded) => {
+      if (loaded) {
+        jumpToSelection(reference);
+      } else {
+        showSelectionNotice("The selected text's conversation could not be opened.");
+      }
+    });
+    return;
+  }
+
+  const located = locateSelectionReference(reference);
+  if (!located) {
+    showSelectionNotice("The selected text is no longer available in this conversation.");
+    return;
+  }
+
+  clearMessageSelectionHighlight();
+  const { body, range } = located;
+  const selectedBounds = range.getBoundingClientRect();
+  const messagesBounds = elements.messages.getBoundingClientRect();
+  const top = elements.messages.scrollTop +
+    selectedBounds.top -
+    messagesBounds.top -
+    (elements.messages.clientHeight - selectedBounds.height) / 2;
+  elements.messages.scrollTop = top;
+  const custom = paintMessageSelectionHighlight(body, range);
+  if (custom === null) {
+    showSelectionNotice("Text highlighting is not supported by this browser.");
+    return;
+  }
+  activeMessageSelectionHighlight = {
+    body,
+    range,
+    custom,
+    reference: copySelectionReference(reference)
+  };
+  messageSelectionHighlightTimer = window.setTimeout(clearMessageSelectionHighlight, 2000);
+}
+
+function preserveMessageTextSelection(conversation) {
+  if (renderedMessagesConversation !== conversation || pointerSelectionInProgress) {
+    return null;
+  }
+  const selection = window.getSelection();
+  const highlight = activeMessageSelectionHighlight;
+  if (selection && highlight && !highlight.custom && selectionMatchesRange(selection, highlight.range)) {
+    return null;
+  }
+  const selected = messageSelectionReference(selection);
+  if (!selected) {
+    return null;
+  }
+  return {
+    reference: selected.reference,
+    askVisible: !elements.askSelection.hidden
+  };
+}
+
+function restoreMessageTextSelection(preserved) {
+  if (!preserved) {
+    if (!elements.askSelection.hidden) {
+      updateAskSelection();
+    }
+    return;
+  }
+  const selection = window.getSelection();
+  const current = messageSelectionReference(selection);
+  if (
+    !current ||
+    compactSelectionText(current.reference.text) !== compactSelectionText(preserved.reference.text)
+  ) {
+    const located = locateSelectionReference(preserved.reference, { exactOnly: true });
+    if (!located || !selection) {
+      hideAskSelection();
+      return;
+    }
+    selection.removeAllRanges();
+    selection.addRange(located.range);
+  }
+  if (preserved.askVisible) {
+    updateAskSelection();
+  }
+}
+
+function scheduleAskSelectionUpdate() {
+  window.setTimeout(updateAskSelection, 0);
+}
+
+function handleMessageSelectionKeydown(event) {
+  const selectionKeys = ["ArrowDown", "ArrowLeft", "ArrowRight", "ArrowUp", "End", "Home"];
+  if (event.key === "Shift" || (event.shiftKey && selectionKeys.includes(event.key))) {
+    keyboardSelectionInProgress = true;
+    hideAskSelection();
+    clearMessageSelectionHighlight();
+  }
+}
+
+function handleMessageSelectionKeyup(event) {
+  if (
+    keyboardSelectionInProgress &&
+    (event.key === "Shift" || !event.shiftKey)
+  ) {
+    keyboardSelectionInProgress = false;
+    scheduleAskSelectionUpdate();
+  }
+}
+
+function promptWithSelections(text, selections) {
+  if (selections.length === 0) {
+    return text;
+  }
+  const excerpts = selections.map((selection) => (
+    `Selection ${selection.number}:\n${selection.text
+      .split(/\r\n?|\n/)
+      .map((line) => `> ${line}`)
+      .join("\n")}`
+  )).join("\n\n");
+  const question = text.trim() ? text : "Please explain these selected passages.";
+  return `${question}\n\nSelected passages from the conversation:\n${excerpts}`;
+}
+
 function messagesAreAtBottom() {
   return elements.messages.scrollHeight -
     elements.messages.scrollTop -
@@ -2925,6 +3804,7 @@ function updateMessagesInPlace(conversation, messages) {
   const wasAtBottom = messagesAreAtBottom();
   const previousScrollTop = elements.messages.scrollTop;
   const previousScrollLeft = elements.messages.scrollLeft;
+  const preservedSelection = preserveMessageTextSelection(conversation);
   for (const update of updates) {
     renderMessageBody(update.body, update.message);
   }
@@ -2934,20 +3814,104 @@ function updateMessagesInPlace(conversation, messages) {
     elements.messages.scrollTop = previousScrollTop;
     elements.messages.scrollLeft = previousScrollLeft;
   }
+  restoreMessageSelectionHighlight();
+  restoreMessageTextSelection(preservedSelection);
   updateScrollToBottomButton();
   return true;
+}
+
+function renderMessageSelectionSummary(message, messageIndex) {
+  const selections = Array.isArray(message.selections) ? message.selections : [];
+  if (message.role !== "user" || selections.length === 0) {
+    return null;
+  }
+
+  const row = document.createElement("div");
+  row.className = "message-selection-row";
+
+  const summary = document.createElement("button");
+  summary.type = "button";
+  summary.className = "message-selection-summary";
+  summary.title = selections.length === 1
+    ? "Jump to the selected text"
+    : "Choose a selected passage";
+  summary.setAttribute(
+    "aria-label",
+    selections.length === 1
+      ? "Jump to selected text in this message"
+      : `Show ${selections.length} selections attached to this message`
+  );
+  summary.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-6l-5 4v-4a2 2 0 0 1-3-2V6a2 2 0 0 1 2-2Z"></path><path d="M9 8h6m-6 3h4"></path></svg>';
+  const label = document.createElement("span");
+  label.textContent = `${selections.length} selection${selections.length === 1 ? "" : "s"}`;
+  summary.append(label);
+
+  let menu = null;
+  if (selections.length > 1) {
+    menu = document.createElement("div");
+    menu.className = "message-selection-menu";
+    menu.id = `message-selection-menu-${messageIndex}`;
+    menu.setAttribute("role", "group");
+    menu.setAttribute("aria-label", "Selections attached to this message");
+    menu.hidden = true;
+    summary.setAttribute("aria-controls", menu.id);
+    summary.setAttribute("aria-expanded", "false");
+    for (const selection of selections) {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = "message-selection-option";
+      option.setAttribute(
+        "aria-label",
+        `Jump to Selection ${selection.number} at its source`
+      );
+      const optionLabel = document.createElement("span");
+      optionLabel.className = "message-selection-option-label";
+      optionLabel.textContent = `Selection ${selection.number}`;
+      const optionText = document.createElement("span");
+      optionText.className = "message-selection-option-text";
+      optionText.textContent = selection.text;
+      option.append(optionLabel, optionText);
+      option.addEventListener("click", () => {
+        menu.hidden = true;
+        summary.setAttribute("aria-expanded", "false");
+        jumpToSelection(selection);
+      });
+      menu.append(option);
+    }
+  }
+
+  summary.addEventListener("click", () => {
+    if (selections.length === 1) {
+      jumpToSelection(selections[0]);
+      return;
+    }
+    menu.hidden = !menu.hidden;
+    summary.setAttribute("aria-expanded", String(!menu.hidden));
+  });
+  row.append(summary);
+  if (menu) {
+    row.append(menu);
+  }
+  return row;
 }
 
 function renderMessages(conversation = activeConversation()) {
   if (conversation !== activeConversation()) {
     return;
   }
+  const preservedSelection = preserveMessageTextSelection(conversation);
+  if (renderedMessagesConversation !== conversation) {
+    clearMessageSelectionHighlight();
+  }
   const wasAtBottom = messagesAreAtBottom();
   const previousScrollTop = elements.messages.scrollTop;
   const previousScrollLeft = elements.messages.scrollLeft;
   const panelScrollPositions = captureMessagePanelScroll(conversation);
   elements.messages.replaceChildren();
+  renderedMessagesConversation = conversation;
   if (conversation?.loading === true) {
+    clearMessageSelectionHighlight();
+    hideAskSelection();
     elements.loadingState.hidden = false;
     elements.messages.append(elements.loadingState);
     elements.emptyState.hidden = true;
@@ -2959,6 +3923,8 @@ function renderMessages(conversation = activeConversation()) {
   elements.loadingState.hidden = true;
   elements.messages.setAttribute("aria-busy", "false");
   if (!conversation || conversation.messages.length === 0) {
+    clearMessageSelectionHighlight();
+    hideAskSelection();
     elements.messages.append(elements.emptyState);
     elements.emptyState.hidden = false;
     updateScrollToBottomButton();
@@ -3000,7 +3966,12 @@ function renderMessages(conversation = activeConversation()) {
     const body = document.createElement("div");
     body.className = "message-body";
     renderMessageBody(body, message);
-    article.append(header, body);
+    article.append(header);
+    const selectionSummary = renderMessageSelectionSummary(message, index);
+    if (selectionSummary) {
+      article.append(selectionSummary);
+    }
+    article.append(body);
     elements.messages.append(article);
     restoreMessagePanelScroll(article, message, panelScrollPositions);
   }
@@ -3010,6 +3981,8 @@ function renderMessages(conversation = activeConversation()) {
     elements.messages.scrollTop = previousScrollTop;
     elements.messages.scrollLeft = previousScrollLeft;
   }
+  restoreMessageSelectionHighlight();
+  restoreMessageTextSelection(preservedSelection);
   updateScrollToBottomButton();
 }
 
@@ -3208,17 +4181,32 @@ function addMessage(
   text,
   key = null,
   attachments = [],
-  conversation = activeConversation() ?? state.composer
+  conversation = activeConversation() ?? state.composer,
+  selections = []
 ) {
-  if (!text && attachments.length === 0) {
+  if (!text && attachments.length === 0 && selections.length === 0) {
     return;
   }
   if (key && conversation.messageKeys.has(key)) {
     const message = conversation.messages[conversation.messageKeys.get(key)];
     if (message) {
-      message.text += text;
+      if (role === "user" && conversation.loading) {
+        message.rawSelectionPromptText = (message.rawSelectionPromptText ?? message.text) + text;
+        if (!message.selectionMetadataRestored) {
+          message.text = message.rawSelectionPromptText;
+          restoreSelectionMessageMetadata(message, conversation);
+        }
+      } else {
+        message.text += text;
+      }
       if (attachments.length > 0) {
         message.attachments = [...(message.attachments ?? []), ...attachments];
+      }
+      if (selections.length > 0) {
+        message.selections = [
+          ...(message.selections ?? []),
+          ...selections.map(copySelectionReference)
+        ];
       }
       scheduleMessagesRender(conversation, message);
       return;
@@ -3226,10 +4214,22 @@ function addMessage(
   }
 
   const message = { role, text, attachments: [...attachments] };
+  const restoreSelectionMetadata = selections.length === 0 &&
+    role === "user" &&
+    conversation.loading;
+  if (selections.length > 0) {
+    message.selections = selections.map(copySelectionReference);
+    message.selectionMetadataRestored = true;
+  } else if (restoreSelectionMetadata) {
+    message.rawSelectionPromptText = text;
+  }
   const index = conversation.messages.length;
   conversation.messages.push(message);
   if (key) {
     conversation.messageKeys.set(key, index);
+  }
+  if (restoreSelectionMetadata) {
+    restoreSelectionMessageMetadata(message, conversation);
   }
   scheduleMessagesRender(conversation, message);
 }
@@ -3645,6 +4645,7 @@ async function deleteConversation(sessionId) {
       ? result.persistenceWarnings.filter((warning) => typeof warning === "string")
       : [];
     state.conversations.delete(sessionId);
+    clearSelectionMessageMetadata(sessionId);
     if (sessionId === state.activeSessionId) {
       activeConversationDeleted = true;
       startNewConversation({ discardDraft: true });
@@ -3678,6 +4679,7 @@ async function deleteConversation(sessionId) {
 
 async function refreshSessions() {
   const request = beginServerPromptStateRequest();
+  const requestStartedAt = Date.now();
   const result = await api("/api/sessions");
   if (request.requestId < lastSessionListRequestId) {
     return;
@@ -3711,6 +4713,9 @@ async function refreshSessions() {
     };
   });
   const listedSessions = new Set(sessions.map((session) => session.sessionId));
+  if (Array.isArray(result.sessions)) {
+    pruneSelectionMessageMetadata(listedSessions, requestStartedAt);
+  }
   for (const sessionId of serverPromptStates.keys()) {
     if (!listedSessions.has(sessionId)) {
       applyServerPromptState(sessionId, { busy: false }, request);
@@ -3807,6 +4812,7 @@ function activateConversation(sessionId) {
   renderSessionList();
   renderConversationControls();
   renderAttachmentList();
+  renderSelectionList();
   renderUsage(conversation);
   renderMessages(conversation);
   setStatus(conversation.status ?? "Ready", conversation);
@@ -3831,6 +4837,7 @@ function activateComposerConversation(conversation = state.composer) {
   renderSessionList();
   renderConversationControls();
   renderAttachmentList();
+  renderSelectionList();
   renderUsage(conversation);
   renderMessages(conversation);
   setStatus(conversation.status ?? "Ready", conversation);
@@ -3864,9 +4871,15 @@ async function startNewConversation({ discardDraft = false } = {}) {
   const pendingAttachments = discardDraft
     ? []
     : state.composer.attachments.map((attachment) => ({ ...attachment }));
+  const pendingSelections = discardDraft
+    ? []
+    : state.composer.selections.map(copySelectionReference);
+  const pendingSelectionNumber = discardDraft ? 1 : state.composer.nextSelectionNumber;
   state.composer = createConversationState();
   state.composer.draft = pendingDraft;
   state.composer.attachments = pendingAttachments;
+  state.composer.selections = pendingSelections;
+  state.composer.nextSelectionNumber = pendingSelectionNumber;
   state.composer.loaded = true;
   state.composer.sessionContext = state.selectedContext;
   state.composer.activeSessionIsNew = true;
@@ -3886,7 +4899,8 @@ function applyFallbackConversationTitle(queuedPrompt, conversation) {
   const attachmentNames = queuedPrompt.attachments
     .filter((attachment) => typeof attachment.name === "string")
     .map((attachment) => attachment.name);
-  const source = queuedPrompt.text.trim() ||
+  const source = queuedPrompt.displayText.trim() ||
+    queuedPrompt.text.trim() ||
     (attachmentNames.length > 0 ? attachmentNames.join(", ") : "");
   const compact = source.replace(/\s+/g, " ").trim();
   if (!compact) {
@@ -3913,6 +4927,12 @@ async function createServerConversation() {
   const pendingAttachments = state.activeSessionId
     ? []
     : state.composer.attachments.map((attachment) => ({ ...attachment }));
+  const pendingSelections = state.activeSessionId
+    ? []
+    : state.composer.selections.map(copySelectionReference);
+  const pendingSelectionNumber = state.activeSessionId
+    ? 1
+    : state.composer.nextSelectionNumber;
   const configOverrides = state.activeSessionId
     ? {}
     : selectedNewSessionConfigOverrides(state.composer);
@@ -3930,6 +4950,8 @@ async function createServerConversation() {
     conversation.loaded = true;
     conversation.draft = pendingDraft;
     conversation.attachments = pendingAttachments;
+    conversation.selections = pendingSelections;
+    conversation.nextSelectionNumber = pendingSelectionNumber;
     conversation.activeSessionIsNew = true;
     conversation.activeSessionTitleOverride = null;
     conversation.messages = [];
@@ -3993,12 +5015,25 @@ function applySessionReplacement(result, previousSessionId) {
   if (conversation) {
     state.conversations.delete(previousSessionId);
     conversation.sessionId = session.sessionId;
+    for (const selection of conversation.selections) {
+      if (selection.sessionId === previousSessionId) {
+        selection.sessionId = session.sessionId;
+      }
+    }
+    for (const message of conversation.messages) {
+      for (const selection of message.selections ?? []) {
+        if (selection.sessionId === previousSessionId) {
+          selection.sessionId = session.sessionId;
+        }
+      }
+    }
     state.conversations.set(session.sessionId, conversation);
     for (const prompt of conversation.promptQueue) {
       prompt.sessionId = session.sessionId;
     }
     applySessionSetup(result, result.context, conversation);
   }
+  moveSelectionMessageMetadata(previousSessionId, session.sessionId);
   state.sessions = state.sessions.filter((item) => item.sessionId !== previousSessionId);
   pendingPromptCompletions.delete(previousSessionId);
   if (wasActive) {
@@ -4050,6 +5085,7 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
   }
 
   activateConversation(sessionId);
+  selectionMessageRestorationCounts.delete(sessionId);
   conversation.loaded = false;
   conversation.activeSessionIsNew = false;
   conversation.messages = [];
@@ -4353,14 +5389,21 @@ async function sendPrompt(event) {
 async function submitPrompt() {
   let conversation = currentComposerConversation();
   const text = elements.input.value;
+  const selections = conversation.selections.map(copySelectionReference);
   if (
-    (!text.trim() && conversation.attachments.length === 0) ||
+    (!text.trim() && conversation.attachments.length === 0 && selections.length === 0) ||
     conversation.loading ||
     conversation.configurationBusy ||
     conversation.attachmentBusy
   ) {
     return;
   }
+  const promptText = promptWithSelections(text, selections);
+  const displayText = text.trim()
+    ? text
+    : selections.length > 0
+      ? "Please explain these selected passages."
+      : text;
   const attachments = conversation.attachments.map((attachment) => ({ ...attachment }));
   const capabilityError = attachmentCapabilityError(attachments);
   if (capabilityError) {
@@ -4382,24 +5425,48 @@ async function submitPrompt() {
     return;
   }
 
+  if (selections.length > 0) {
+    const persisted = persistSelectionMessageMetadata(
+      conversation.sessionId,
+      promptText,
+      displayText,
+      selections
+    );
+    if (!persisted) {
+      showSelectionNotice(
+        "Selections were sent, but browser storage is unavailable; their chips may expand after a refresh."
+      );
+    }
+  }
   elements.input.value = "";
   conversation.draft = "";
   resizePromptInput();
   conversation.attachments = [];
+  conversation.selections = [];
+  conversation.nextSelectionNumber = 1;
   renderAttachmentList();
-  enqueuePrompt(conversation, text, attachments);
+  renderSelectionList();
+  enqueuePrompt(conversation, promptText, attachments, false, displayText, selections);
 }
 
-function enqueuePrompt(conversation, text, attachments, reconnect = false) {
+function enqueuePrompt(
+  conversation,
+  text,
+  attachments,
+  reconnect = false,
+  displayText = text,
+  selections = []
+) {
   const messageKey = nextSyntheticMessageKey("local-user", conversation);
   const queuedPrompt = {
     sessionId: conversation.sessionId,
     text,
+    displayText,
     attachments,
     messageKey,
     reconnect
   };
-  addMessage("user", text, messageKey, attachments, conversation);
+  addMessage("user", displayText, messageKey, attachments, conversation, selections);
   conversation.promptQueue.push(queuedPrompt);
   renderSessionList();
   if (promptIsActive(conversation)) {
@@ -4661,8 +5728,48 @@ elements.newChat.addEventListener("click", () => {
   startNewConversation();
 });
 elements.messages.addEventListener("scroll", updateScrollToBottomButton, { passive: true });
+elements.messages.addEventListener("keydown", handleMessageSelectionKeydown);
+elements.messages.addEventListener("scroll", updateAskSelection, { passive: true });
 elements.messages.addEventListener("load", updateScrollToBottomButton, true);
 elements.messages.addEventListener("toggle", updateScrollToBottomButton, true);
+elements.askSelection.addEventListener("mousedown", (event) => {
+  event.preventDefault();
+});
+elements.askSelection.addEventListener("click", attachSelectedText);
+document.addEventListener("pointerdown", (event) => {
+  keyboardSelectionInProgress = false;
+  for (const row of elements.messages.querySelectorAll(".message-selection-row")) {
+    const menu = row.querySelector(".message-selection-menu");
+    if (menu && !row.contains(event.target)) {
+      menu.hidden = true;
+      row.querySelector(".message-selection-summary").setAttribute("aria-expanded", "false");
+    }
+  }
+  if (elements.askSelection.contains(event.target)) {
+    return;
+  }
+  if (elements.messages.contains(event.target)) {
+    pointerSelectionInProgress = true;
+    hideAskSelection();
+    clearMessageSelectionHighlight();
+  } else {
+    pointerSelectionInProgress = false;
+    hideAskSelection();
+  }
+});
+document.addEventListener("pointerup", () => {
+  if (!pointerSelectionInProgress) {
+    return;
+  }
+  pointerSelectionInProgress = false;
+  scheduleAskSelectionUpdate();
+});
+document.addEventListener("pointercancel", () => {
+  pointerSelectionInProgress = false;
+  hideAskSelection();
+});
+document.addEventListener("keyup", handleMessageSelectionKeyup);
+window.addEventListener("resize", updateAskSelection);
 elements.scrollToBottom.addEventListener("click", () => {
   elements.messages.scrollTo({
     top: elements.messages.scrollHeight,
@@ -4872,6 +5979,7 @@ if (typeof systemThemeQuery.addEventListener === "function") {
 renderSessionList();
 renderConversationControls();
 renderAttachmentList();
+renderSelectionList();
 renderUsage();
 resizePromptInput();
 renderMessages();
