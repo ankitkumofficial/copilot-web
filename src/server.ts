@@ -30,6 +30,16 @@ import {
   type SessionSetup,
   type SessionInfo
 } from "./acp.js";
+import {
+  applyNativeMessageEvent,
+  CopilotHistoryReader,
+  createNativeMessageCollection,
+  isNativeMessageEvent,
+  isRootAgentMessageEvent,
+  mergeNativeMessages,
+  type NativeMessage,
+  type NativeMessageCollection
+} from "./history.js";
 import { SerialTaskQueue } from "./persistence.js";
 
 const applicationVersion = "0.1.0";
@@ -94,8 +104,23 @@ interface BusyPrompt {
   promptId: string;
   clientPromptId?: string;
   userMessageId?: string;
+  nativeUserMessageId?: string;
+  nativeAssistantHasContent?: boolean;
+  acpAssistantUpdates?: JsonObject[];
   cancelController: AbortController;
   reloadingMcp: boolean;
+}
+
+interface NativeHistoryRead {
+  promise: Promise<JsonObject[]>;
+  bufferedEvents: JsonObject[];
+  consumers: number;
+}
+
+interface NativeHistoryReadHandle {
+  promise: Promise<JsonObject[]>;
+  bufferedEvents: JsonObject[];
+  release(): void;
 }
 
 interface SessionUsage {
@@ -895,6 +920,20 @@ async function main(): Promise<void> {
     allowAll
   });
   await acp.start();
+  const copilotHistory = new CopilotHistoryReader({
+    ...(copilotSdkPath === undefined ? {} : { sdkPath: copilotSdkPath }),
+    command: copilotExecutable,
+    cwd: projectsDirectory,
+    allowAll
+  });
+  await copilotHistory.initialize();
+  if (!copilotHistory.available) {
+    console.warn(
+      `[history] Native message history is unavailable: ${
+        copilotHistory.unavailableReason ?? "unknown error"
+      }. ACP fallback messages do not have recorded timestamps.`
+    );
+  }
 
   const browserCapabilities = () => {
     const capabilities = acp.getCapabilities();
@@ -914,6 +953,9 @@ async function main(): Promise<void> {
   const sessionActivityWrites = new SerialTaskQueue();
   const replayingSessions = new Map<string, JsonObject[]>();
   const busySessions = new Map<string, BusyPrompt>();
+  const nativeMessageStates = new Map<string, NativeMessageCollection>();
+  const nativePipelineModes = new Map<string, boolean>();
+  const nativeHistoryReads = new Map<string, NativeHistoryRead>();
   const deletingSessions = new Set<string>();
   const deletedSessions = new Set<string>();
   const activeSessionOperations = new Map<string, number>();
@@ -921,6 +963,59 @@ async function main(): Promise<void> {
   const sessionOperationWaiters = new Map<string, Set<() => void>>();
   const sseClients = new Set<SseClient>();
   const browserToken = randomBytes(32).toString("hex");
+
+  const nativeMessageState = (sessionId: string): NativeMessageCollection => {
+    let state = nativeMessageStates.get(sessionId);
+    if (!state) {
+      state = createNativeMessageCollection();
+      nativeMessageStates.set(sessionId, state);
+    }
+    return state;
+  };
+
+  const startNativeHistoryRead = (sessionId: string): NativeHistoryReadHandle | undefined => {
+    if (!copilotHistory.available || acp.isSessionUnprompted(sessionId)) {
+      return undefined;
+    }
+    let read = nativeHistoryReads.get(sessionId);
+    if (!read) {
+      read = {
+        promise: copilotHistory.read(sessionId),
+        bufferedEvents: [],
+        consumers: 0
+      };
+      nativeHistoryReads.set(sessionId, read);
+    }
+    read.consumers += 1;
+    let released = false;
+    return {
+      promise: read.promise,
+      bufferedEvents: read.bufferedEvents,
+      release: () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        read.consumers -= 1;
+        if (read.consumers === 0 && nativeHistoryReads.get(sessionId) === read) {
+          nativeHistoryReads.delete(sessionId);
+        }
+      }
+    };
+  };
+
+  const nativeMessagesForState = (state: NativeMessageCollection): NativeMessage[] => (
+    state.order.flatMap((key) => {
+      const message = state.messages.get(key);
+      return message
+        ? [{ ...message, attachments: message.attachments.map((attachment) => ({ ...attachment })) }]
+        : [];
+    })
+  );
+
+  const historyFallbackWarning = (reason: string): string => (
+    `Native message history is unavailable (${reason}). Showing ACP history; recorded message timestamps are unavailable.`
+  );
 
   const ensureSessionAvailable = (sessionId: string): void => {
     if (deletedSessions.has(sessionId)) {
@@ -1134,6 +1229,9 @@ async function main(): Promise<void> {
     sessionCache.set(setup.sessionId, replacement);
     sessionCache.delete(previousSessionId);
     sessionReplayCache.delete(previousSessionId);
+    nativeMessageStates.delete(previousSessionId);
+    nativePipelineModes.delete(previousSessionId);
+    nativePipelineModes.set(setup.sessionId, copilotHistory.available);
     sessionUsageCache.delete(previousSessionId);
     const activity = sessionActivityCache.get(previousSessionId) ?? session.updatedAt;
     sessionActivityCache.delete(previousSessionId);
@@ -1174,6 +1272,12 @@ async function main(): Promise<void> {
       session: replacement,
       context: acp.getSessionContext(setup.sessionId),
       configOptions: setup.configOptions,
+      nativeMessageHistoryAvailable: copilotHistory.available,
+      ...(!copilotHistory.available
+        ? { historyWarning: historyFallbackWarning(
+          copilotHistory.unavailableReason ?? "the installed Copilot SDK is unavailable"
+        ) }
+        : {}),
       ...(persistenceWarnings.length > 0 ? { persistenceWarnings } : {})
     }, previousSessionId);
     for (const client of sseClients) {
@@ -1228,11 +1332,28 @@ async function main(): Promise<void> {
     ) {
       touchSessionActivity(sessionId);
     }
+    const replaying = replayingSessions.has(sessionId ?? "");
+    const activePrompt = !replaying && sessionId
+      ? busySessions.get(sessionId)
+      : undefined;
+    const update = isRecord(event.params.update) ? event.params.update : undefined;
+    if (
+      sessionId &&
+      activePrompt &&
+      !activePrompt.nativeAssistantHasContent &&
+      nativePipelineModes.get(sessionId) === true &&
+      update?.sessionUpdate === "agent_message_chunk"
+    ) {
+      activePrompt.acpAssistantUpdates ??= [];
+      activePrompt.acpAssistantUpdates.push(event.params);
+    }
+    const activePromptId = activePrompt?.clientPromptId;
+    const updateParams = activePromptId
+      ? { ...event.params, clientPromptId: activePromptId }
+      : event.params;
     publish(
       "session-update",
-      replayingSessions.has(sessionId ?? "")
-        ? { ...event.params, _replay: true }
-        : event.params,
+      replaying ? { ...updateParams, _replay: true } : updateParams,
       sessionId
     );
   });
@@ -1259,6 +1380,60 @@ async function main(): Promise<void> {
       ) {
         touchSessionActivity(sessionId);
       }
+    }
+    if (isNativeMessageEvent(event.params)) {
+      if (
+        !sessionId ||
+        !copilotHistory.available ||
+        nativePipelineModes.get(sessionId) === false ||
+        !isRootAgentMessageEvent(event.params)
+      ) {
+        return;
+      }
+      const busyPrompt = busySessions.get(sessionId);
+      const eventData = isRecord(event.params.data) ? event.params.data : undefined;
+      if (typeof eventData?.messageId !== "string" || !eventData.messageId) {
+        console.warn(
+          `[history] Ignoring ${String(event.params.type)} event for ${sessionId}: native message id is missing`
+        );
+        return;
+      }
+      // Live ACP session events omit the event id; persisted history keeps it.
+      const liveEventId = typeof event.params.id === "string" && event.params.id
+        ? undefined
+        : `live:${randomBytes(12).toString("hex")}`;
+      const nativeMessage = applyNativeMessageEvent(
+        nativeMessageState(sessionId),
+        event.params,
+        {
+          ...(busyPrompt?.clientPromptId ? { clientPromptId: busyPrompt.clientPromptId } : {}),
+          ...(liveEventId ? { liveEventId } : {})
+        }
+      );
+      if (!nativeMessage) {
+        return;
+      }
+      if (nativeMessage.role === "user" && busyPrompt) {
+        busyPrompt.nativeUserMessageId = nativeMessage.messageId;
+      }
+      if (
+        nativeMessage.role === "assistant" &&
+        nativeMessage.content.trim().length > 0 &&
+        busyPrompt
+      ) {
+        busyPrompt.nativeAssistantHasContent = true;
+        busyPrompt.acpAssistantUpdates = [];
+      }
+      // Loads merge buffered events with their snapshot; other clients still need the live update.
+      nativeHistoryReads.get(sessionId)?.bufferedEvents.push(
+        liveEventId ? { ...event.params, id: liveEventId } : event.params
+      );
+      nativePipelineModes.set(sessionId, true);
+      publish("native-message", { ...nativeMessage, sessionId }, sessionId);
+      if (!busyPrompt) {
+        touchSessionActivity(sessionId);
+      }
+      return;
     }
     publish("session-event", event.params, sessionId);
   });
@@ -1363,6 +1538,12 @@ async function main(): Promise<void> {
         projectsDirectory,
         capabilities: browserCapabilities(),
         contexts: contextOptions,
+        nativeMessageHistoryAvailable: copilotHistory.available,
+        ...(!copilotHistory.available
+          ? { historyWarning: historyFallbackWarning(
+            copilotHistory.unavailableReason ?? "the persisted-history API is unavailable"
+          ) }
+          : {}),
         newSessionDefaults
       });
       return true;
@@ -1409,6 +1590,12 @@ async function main(): Promise<void> {
         brandInitial: branding.brandInitial,
         projectsDirectory,
         contexts: contextOptions,
+        nativeMessageHistoryAvailable: copilotHistory.available,
+        ...(!copilotHistory.available
+          ? { historyWarning: historyFallbackWarning(
+            copilotHistory.unavailableReason ?? "the persisted-history API is unavailable"
+          ) }
+          : {}),
         newSessionDefaults
       }));
       sseClients.add(client);
@@ -1450,6 +1637,12 @@ async function main(): Promise<void> {
           }),
         capabilities: browserCapabilities(),
         contexts: contextOptions,
+        nativeMessageHistoryAvailable: copilotHistory.available,
+        ...(!copilotHistory.available
+          ? { historyWarning: historyFallbackWarning(
+            copilotHistory.unavailableReason ?? "the persisted-history API is unavailable"
+          ) }
+          : {}),
         newSessionDefaults
       });
       return true;
@@ -1499,19 +1692,29 @@ async function main(): Promise<void> {
       deletedSessions.delete(setup.sessionId);
       sessionCache.set(setup.sessionId, session);
       sessionActivityCache.set(setup.sessionId, createdAt);
+      nativePipelineModes.set(setup.sessionId, copilotHistory.available);
       void queueSessionActivitySave().catch(() => {});
       const sessionView = {
         ...session,
         context,
         lastActivityAt: createdAt
       };
-      publish("session-created", sessionView, setup.sessionId);
+      publish("session-created", {
+        ...sessionView,
+        nativeMessageHistoryAvailable: copilotHistory.available
+      }, setup.sessionId);
       jsonResponse(response, 201, {
         session: sessionView,
         context,
         configOptions: setup.configOptions,
         models: setup.models,
         modes: setup.modes,
+        nativeMessageHistoryAvailable: copilotHistory.available,
+        ...(!copilotHistory.available
+          ? { historyWarning: historyFallbackWarning(
+            copilotHistory.unavailableReason ?? "the persisted-history API is unavailable"
+          ) }
+          : {}),
         newSessionDefaults
       });
       return true;
@@ -1584,6 +1787,8 @@ async function main(): Promise<void> {
         deletedSessions.add(sessionId);
         sessionCache.delete(sessionId);
         sessionReplayCache.delete(sessionId);
+        nativeMessageStates.delete(sessionId);
+        nativePipelineModes.delete(sessionId);
         busySessions.delete(sessionId);
         replayingSessions.delete(sessionId);
         sessionActivityCache.delete(sessionId);
@@ -1651,55 +1856,129 @@ async function main(): Promise<void> {
 
     if (request.method === "POST" && subroute === "load") {
       const body = await readJsonBody(request);
-      const previousContext = acp.getSessionContext(sessionId);
-      const busyPrompt = busySessions.get(sessionId);
-      const busy = busyPrompt !== undefined;
-      const requestedContext = parseContext(body.context ?? previousContext);
-      const context = busy
-        ? previousContext ?? requestedContext
-        : requestedContext;
-      let setup: SessionSetup;
-      let persistenceWarnings: string[] = [];
-      if (busy) {
-        setup = {
-          sessionId,
-          configOptions: acp.getConfigOptions(sessionId)
-        };
-      } else {
-        setup = await withSessionOperation(sessionId, async () => {
-          const loaded = await acp.loadSession(session, context);
-          const replacement = await replaceEmptySession(session, loaded);
-          session = replacement.session;
-          persistenceWarnings = replacement.persistenceWarnings;
-          return loaded;
-        }, true);
-        ensureSessionAvailable(setup.sessionId);
+      const sessionWasUnprompted = acp.isSessionUnprompted(sessionId);
+      const nativeHistoryRead = startNativeHistoryRead(sessionId);
+      let persistedNativeEvents: JsonObject[] = [];
+      let nativeHistoryReadSucceeded = sessionWasUnprompted && copilotHistory.available;
+      let nativeHistoryReadError: string | undefined;
+      try {
+        if (nativeHistoryRead) {
+          persistedNativeEvents = await nativeHistoryRead.promise;
+          nativeHistoryReadSucceeded = true;
+        } else if (!sessionWasUnprompted && copilotHistory.available) {
+          nativeHistoryReadError = "A persisted-history read could not be started";
+        }
+      } catch (error) {
+        nativeHistoryReadError = error instanceof Error ? error.message : String(error);
+        console.warn(
+          `[history] Unable to read persisted messages for ${sessionId}: ${nativeHistoryReadError}`
+        );
       }
-      const sessionView = {
-        ...session,
-        context,
-        lastActivityAt: sessionActivityCache.get(setup.sessionId) ?? session.updatedAt
-      };
-      if (!busy) {
-        publish("session-loaded", {
+
+      try {
+        ensureSessionAvailable(sessionId);
+        const previousContext = acp.getSessionContext(sessionId);
+        const busyPrompt = busySessions.get(sessionId);
+        const busy = busyPrompt !== undefined;
+        const requestedContext = parseContext(body.context ?? previousContext);
+        const context = busy
+          ? previousContext ?? requestedContext
+          : requestedContext;
+        let setup: SessionSetup;
+        let persistenceWarnings: string[] = [];
+        if (busy) {
+          setup = {
+            sessionId,
+            configOptions: acp.getConfigOptions(sessionId)
+          };
+        } else {
+          setup = await withSessionOperation(sessionId, async () => {
+            const loaded = await acp.loadSession(session, context);
+            const replacement = await replaceEmptySession(session, loaded);
+            session = replacement.session;
+            persistenceWarnings = replacement.persistenceWarnings;
+            return loaded;
+          }, true);
+          ensureSessionAvailable(setup.sessionId);
+        }
+        const sessionView = {
+          ...session,
+          context,
+          lastActivityAt: sessionActivityCache.get(setup.sessionId) ?? session.updatedAt
+        };
+        if (!busy) {
+          publish("session-loaded", {
+            session: sessionView,
+            context,
+            configOptions: setup.configOptions
+          }, setup.sessionId);
+        }
+        const state = nativeMessageState(setup.sessionId);
+        const nativeMessagesActive = copilotHistory.available && (
+          nativeHistoryReadSucceeded ||
+          state.messages.size > 0
+        );
+        nativePipelineModes.set(setup.sessionId, nativeMessagesActive);
+        let nativeMessages: NativeMessage[] = [];
+        let historyWarning: string | undefined;
+        if (nativeMessagesActive) {
+          if (nativeHistoryReadSucceeded) {
+            for (const event of persistedNativeEvents) {
+              if (
+                isNativeMessageEvent(event) &&
+                isRootAgentMessageEvent(event) &&
+                typeof event.id === "string"
+              ) {
+                state.eventIds.add(event.id);
+              }
+            }
+            nativeMessages = mergeNativeMessages(
+              persistedNativeEvents,
+              nativeHistoryRead?.bufferedEvents ?? [],
+              nativeMessagesForState(state)
+            );
+          } else {
+            nativeMessages = nativeMessagesForState(state);
+            historyWarning = `Copilot persisted history could not be read (${nativeHistoryReadError ?? "unknown error"}). Earlier messages may be missing; timestamps are shown only when available from native events.`;
+          }
+          if (
+            busyPrompt?.nativeUserMessageId &&
+            busyPrompt.clientPromptId
+          ) {
+            for (const message of nativeMessages) {
+              if (
+                message.role === "user" &&
+                message.messageId === busyPrompt.nativeUserMessageId
+              ) {
+                message.clientPromptId = busyPrompt.clientPromptId;
+              }
+            }
+          }
+        } else {
+          const reason = nativeHistoryReadError ??
+            copilotHistory.unavailableReason ??
+            "the persisted-history API is unavailable";
+          historyWarning = historyFallbackWarning(reason);
+        }
+        jsonResponse(response, 200, {
           session: sessionView,
           context,
-          configOptions: setup.configOptions
-        }, setup.sessionId);
+          configOptions: setup.configOptions,
+          models: setup.models,
+          modes: setup.modes,
+          busy,
+          ...(busyPrompt ? { promptId: busyPrompt.promptId } : {}),
+          usage: sessionUsageCache.get(setup.sessionId) ?? null,
+          replayUpdates: [...(sessionReplayCache.get(setup.sessionId) ?? [])],
+          nativeMessagesActive,
+          ...(nativeMessagesActive ? { nativeMessages } : {}),
+          ...(historyWarning ? { historyWarning } : {}),
+          ...(persistenceWarnings.length > 0 ? { persistenceWarnings } : {})
+        });
+        return true;
+      } finally {
+        nativeHistoryRead?.release();
       }
-      jsonResponse(response, 200, {
-        session: sessionView,
-        context,
-        configOptions: setup.configOptions,
-        models: setup.models,
-        modes: setup.modes,
-        busy,
-        ...(busyPrompt ? { promptId: busyPrompt.promptId } : {}),
-        usage: sessionUsageCache.get(setup.sessionId) ?? null,
-        replayUpdates: [...(sessionReplayCache.get(setup.sessionId) ?? [])],
-        ...(persistenceWarnings.length > 0 ? { persistenceWarnings } : {})
-      });
-      return true;
     }
 
     if (request.method === "GET" && subroute === "status") {
@@ -1762,6 +2041,7 @@ async function main(): Promise<void> {
         busyPrompt.clientPromptId = clientPromptId;
       }
       busySessions.set(sessionId, busyPrompt);
+      const userReplayEntries: JsonObject[] = [];
       let stopReason: string | undefined;
       let errorMessage: string | undefined;
       try {
@@ -1773,14 +2053,19 @@ async function main(): Promise<void> {
         const userMessageId = `web-${randomBytes(12).toString("hex")}`;
         busyPrompt.userMessageId = userMessageId;
         for (const content of prompt) {
-          replay.push({
+          const entry: JsonObject = {
             sessionId,
+            ...(busyPrompt.clientPromptId
+              ? { clientPromptId: busyPrompt.clientPromptId }
+              : {}),
             update: {
               sessionUpdate: "user_message_chunk",
               messageId: userMessageId,
               content
             }
-          });
+          };
+          userReplayEntries.push(entry);
+          replay.push(entry);
         }
         sessionReplayCache.set(sessionId, replay);
         touchSessionActivity(sessionId);
@@ -1801,6 +2086,30 @@ async function main(): Promise<void> {
         throw error;
       } finally {
         if (busySessions.get(sessionId)?.promptId === promptId) {
+          if (nativePipelineModes.get(sessionId) === true) {
+            // Commands such as /mcp reload record no native messages, so their output has no
+            // recorded time and is not a history mismatch.
+            const commandPrompt = busyPrompt.nativeUserMessageId === undefined;
+            if (commandPrompt) {
+              for (const entry of userReplayEntries) {
+                entry.nativeCommand = true;
+              }
+            }
+            if (!busyPrompt.nativeAssistantHasContent) {
+              for (const update of busyPrompt.acpAssistantUpdates ?? []) {
+                if (commandPrompt) {
+                  update.nativeCommand = true;
+                }
+                publish("session-update", {
+                  ...update,
+                  ...(busyPrompt.clientPromptId
+                    ? { clientPromptId: busyPrompt.clientPromptId }
+                    : {}),
+                  ...(commandPrompt ? { nativeCommand: true } : { nativeFallback: true })
+                }, sessionId);
+              }
+            }
+          }
           busySessions.delete(sessionId);
         }
         touchSessionActivity(sessionId);
@@ -1875,6 +2184,12 @@ async function main(): Promise<void> {
         session,
         context: acp.getSessionContext(setup.sessionId) ?? "default",
         configOptions: setup.configOptions,
+        nativeMessageHistoryAvailable: copilotHistory.available,
+        ...(!copilotHistory.available
+          ? { historyWarning: historyFallbackWarning(
+            copilotHistory.unavailableReason ?? "the persisted-history API is unavailable"
+          ) }
+          : {}),
         ...(persistenceWarnings.length > 0 ? { persistenceWarnings } : {})
       });
       return true;
@@ -1961,12 +2276,16 @@ async function main(): Promise<void> {
     try {
       await acp.stop();
     } finally {
-      await serverClosed;
-      await Promise.all([
-        sessionTitleWrites.flush(),
-        sessionUsageWrites.flush(),
-        sessionActivityWrites.flush()
-      ]);
+      try {
+        await copilotHistory.stop();
+      } finally {
+        await serverClosed;
+        await Promise.all([
+          sessionTitleWrites.flush(),
+          sessionUsageWrites.flush(),
+          sessionActivityWrites.flush()
+        ]);
+      }
     }
   };
 

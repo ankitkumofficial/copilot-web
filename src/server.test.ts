@@ -21,6 +21,10 @@ const args = process.argv.slice(2);
 const startupModel = args.includes("--model") ? args[args.indexOf("--model") + 1] : undefined;
 const context = args[args.indexOf("--context") + 1];
 const sessions = new Map();
+const nativeMessages = process.env.TEST_NATIVE_MESSAGES === "true";
+const nativeHistoryPath = path.join(process.cwd(), "native-history.json");
+const nativeTimestamp = process.env.TEST_NATIVE_TIMESTAMP ?? "2026-10-14T10:00:00.000Z";
+const pendingNativePrompts = new Map();
 const sessionFile = (id) => path.join(process.cwd(), "profile-session-" + id + ".json");
 const configOptions = (session) => profiles ? [
   {
@@ -37,6 +41,137 @@ const configOptions = (session) => profiles ? [
     options: ["low", "medium", "max"].map((value) => ({ value, name: value }))
   }
 ] : [];
+function createNativeEvent(type, messageId, data, offset = 0) {
+  return {
+    id: require("node:crypto").randomUUID(),
+    type,
+    timestamp: new Date(Date.parse(nativeTimestamp) + offset).toISOString(),
+    parentId: null,
+    data: { messageId, ...data }
+  };
+}
+function persistNativeEvent(sessionId, event) {
+  let history = {};
+  try {
+    history = JSON.parse(fs.readFileSync(nativeHistoryPath, "utf8"));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  history[sessionId] ??= [];
+  history[sessionId].push(event);
+  fs.writeFileSync(nativeHistoryPath, JSON.stringify(history));
+}
+function readNativeHistory(sessionId) {
+  try {
+    const history = JSON.parse(fs.readFileSync(nativeHistoryPath, "utf8"));
+    return Array.isArray(history[sessionId]) ? history[sessionId] : [];
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    return [];
+  }
+}
+function replayNativeHistoryThroughAcp(sessionId, update) {
+  let firstUser = true;
+  for (const event of readNativeHistory(sessionId)) {
+    if (event.agentId || event.data?.testAcpHidden) continue;
+    if (event.type === "user.message") {
+      update(sessionId, {
+        sessionUpdate: "user_message_chunk",
+        content: { type: "text", text: event.data.content }
+      });
+      for (const attachment of event.data.attachments ?? []) {
+        if (attachment.data && attachment.mimeType?.startsWith("image/")) {
+          update(sessionId, {
+            sessionUpdate: "user_message_chunk",
+            content: { type: "image", data: attachment.data, mimeType: attachment.mimeType }
+          });
+        }
+      }
+      if (firstUser) {
+        firstUser = false;
+        update(sessionId, {
+          sessionUpdate: "tool_call",
+          toolCallId: "history-tool",
+          title: "History lookup",
+          kind: "read",
+          status: "completed"
+        });
+      }
+    } else if (event.type === "assistant.message") {
+      if (event.data.content) {
+        update(sessionId, {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: event.data.content }
+        });
+      }
+      for (const toolRequest of event.data.toolRequests ?? []) {
+        update(sessionId, {
+          sessionUpdate: "tool_call",
+          toolCallId: toolRequest.toolCallId,
+          title: toolRequest.name,
+          kind: "read",
+          status: "completed"
+        });
+      }
+    }
+  }
+}
+function emitNativeEvent(sessionId, event, persist = false, duplicate = false) {
+  if (persist) persistNativeEvent(sessionId, event);
+  // Like the CLI, live ACP session events omit the persisted event id and parent id.
+  const { id: _id, parentId: _parentId, ...liveEvent } = event;
+  const encoded = JSON.stringify({
+    jsonrpc: "2.0",
+    method: "github.com/copilot/sessionEvent",
+    params: { sessionId, ...liveEvent }
+  }) + "\\n";
+  process.stdout.write(encoded);
+  if (duplicate) process.stdout.write(encoded);
+}
+function emitNativePrompt(request, sessionId, reply) {
+  const prompt = request.params.prompt;
+  const promptText = prompt.find((block) => block.type === "text")?.text ?? "";
+  const userMessageId = require("node:crypto").randomUUID();
+  const assistantMessageId = require("node:crypto").randomUUID();
+  const attachments = prompt.flatMap((block) => {
+    if (block.type === "image") {
+      return [{
+        type: "blob",
+        displayName: "prompt-image.png",
+        mimeType: block.mimeType,
+        data: block.data
+      }];
+    }
+    if (block.type === "resource") {
+      return [{
+        type: "blob",
+        displayName: "prompt-document.pdf",
+        mimeType: block.resource.mimeType,
+        data: block.resource.blob
+      }];
+    }
+    return [];
+  });
+  emitNativeEvent(sessionId, createNativeEvent("user.message", userMessageId, {
+    content: promptText,
+    attachments
+  }, 0), true);
+  emitNativeEvent(sessionId, createNativeEvent(
+    "assistant.message_start",
+    assistantMessageId,
+    {},
+    100
+  ));
+  return {
+    assistantMessageId,
+    delta: createNativeEvent("assistant.message_delta", assistantMessageId, {
+      deltaContent: reply
+    }, 200),
+    final: createNativeEvent("assistant.message", assistantMessageId, {
+      content: reply
+    }, 300)
+  };
+}
 let startCount = 1;
 try {
   startCount = Number(fs.readFileSync(startCountFile, "utf8")) + 1;
@@ -118,16 +253,20 @@ input.on("line", (line) => {
         break;
       }
       commands(request.params.sessionId);
-      update(request.params.sessionId, {
-        sessionUpdate: "user_message_chunk",
-        messageId: "history-user",
-        content: { type: "text", text: "Check GoCD pipelines" }
-      });
-      update(request.params.sessionId, {
-        sessionUpdate: "agent_message_chunk",
-        messageId: "history-assistant",
-        content: { type: "text", text: process.env.TEST_HISTORY_TEXT ?? "GoCD tools are unavailable." }
-      });
+      if (nativeMessages) {
+        replayNativeHistoryThroughAcp(request.params.sessionId, update);
+      } else {
+        update(request.params.sessionId, {
+          sessionUpdate: "user_message_chunk",
+          messageId: "history-user",
+          content: { type: "text", text: "Check GoCD pipelines" }
+        });
+        update(request.params.sessionId, {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "history-assistant",
+          content: { type: "text", text: process.env.TEST_HISTORY_TEXT ?? "GoCD tools are unavailable." }
+        });
+      }
       setTimeout(
         () => {
           if (process.env.TEST_FAIL_RECOVERY_LOADS === "true" && startCount > 1) {
@@ -198,18 +337,36 @@ input.on("line", (line) => {
         }) + "\\n");
         break;
       }
-      setTimeout(() => {
+      const reply = reload
+        ? "MCP configuration reloaded and servers restarted."
+        : "Done.";
+      // Like the CLI, commands such as /mcp reload record and emit no native messages.
+      const nativeEvents = nativeMessages && !reload
+        ? emitNativePrompt(request, request.params.sessionId, reply)
+        : null;
+      const delay = reload
+        ? Number(process.env.TEST_MCP_RELOAD_DELAY_MS ?? 200)
+        : Number(process.env.TEST_PROMPT_DELAY_MS ?? 20);
+      const timer = setTimeout(() => {
+        pendingNativePrompts.delete(request.params.sessionId);
+        if (nativeEvents) {
+          emitNativeEvent(request.params.sessionId, nativeEvents.delta);
+          // A repeated final event must stay idempotent.
+          emitNativeEvent(request.params.sessionId, nativeEvents.final, true, true);
+        }
         update(request.params.sessionId, {
           sessionUpdate: "agent_message_chunk",
-          content: {
-            type: "text",
-            text: reload ? "MCP configuration reloaded and servers restarted." : "Done."
-          }
+          content: { type: "text", text: reply }
         });
         respond({ stopReason: "end_turn" });
-      }, reload
-        ? Number(process.env.TEST_MCP_RELOAD_DELAY_MS ?? 200)
-        : Number(process.env.TEST_PROMPT_DELAY_MS ?? 20));
+      }, delay);
+      if (nativeEvents) {
+        pendingNativePrompts.set(request.params.sessionId, {
+          timer,
+          requestId: request.id,
+          assistantMessageId: nativeEvents.assistantMessageId
+        });
+      }
       if (profiles) {
         const session = sessions.get(request.params.sessionId);
         session.messages.push(request.params.prompt[0].text);
@@ -239,6 +396,27 @@ input.on("line", (line) => {
       respond({});
       break;
     case "session/cancel":
+      if (nativeMessages) {
+        const pendingPrompt = pendingNativePrompts.get(request.params.sessionId);
+        if (pendingPrompt) {
+          clearTimeout(pendingPrompt.timer);
+          pendingNativePrompts.delete(request.params.sessionId);
+          emitNativeEvent(
+            request.params.sessionId,
+            createNativeEvent(
+              "assistant.message_delta",
+              pendingPrompt.assistantMessageId,
+              { deltaContent: "Partial response before cancellation." },
+              200
+            )
+          );
+          process.stdout.write(JSON.stringify({
+            jsonrpc: "2.0",
+            id: pendingPrompt.requestId,
+            result: { stopReason: "cancelled" }
+          }) + "\\n");
+        }
+      }
       break;
     case "session/list":
       if (profiles) {
@@ -260,6 +438,77 @@ input.on("line", (line) => {
       respond({});
   }
 });
+`;
+
+const fakeCopilotSdk = `import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
+export const RuntimeConnection = {
+  forStdio(options) {
+    return options;
+  }
+};
+
+export class CopilotClient {
+  constructor(options) {
+    this.options = options;
+    writeFileSync(
+      path.join(options.workingDirectory, "native-sdk-connection.json"),
+      JSON.stringify({
+        path: options.connection.path,
+        args: options.connection.args,
+        workingDirectory: options.workingDirectory
+      })
+    );
+    this.rpc = {
+      sessions: {
+        readPersistedEvents: async ({ sessionId, cursor }) => {
+          const requestPath = path.join(options.workingDirectory, "native-history-requests.jsonl");
+          appendFileSync(requestPath, JSON.stringify({ sessionId, cursor }) + "\\n");
+          if (process.env.TEST_HISTORY_UNSUPPORTED === "true") {
+            const error = new Error("Method not found: sessions.readPersistedEvents");
+            error.code = -32601;
+            throw error;
+          }
+          if (sessionId === "session-1" && process.env.TEST_HISTORY_READ_ERROR === "true") {
+            throw new Error("Persisted event journal is unavailable for session session-1");
+          }
+          const historyPath = path.join(options.workingDirectory, "native-history.json");
+          let history = {};
+          try {
+            history = JSON.parse(readFileSync(historyPath, "utf8"));
+          } catch (error) {
+            if (error.code !== "ENOENT") throw error;
+          }
+          const events = (history[sessionId] ?? []).filter((event) => !event.data?.testNativeHidden);
+          const offset = cursor === undefined ? 0 : Number(cursor);
+          if (cursor !== undefined && process.env.TEST_HISTORY_CURSOR_EXPIRED === "true") {
+            return { events: [], cursor: "", cursorStatus: "expired", hasMore: false };
+          }
+          const pageSize = Number(process.env.TEST_HISTORY_PAGE_SIZE ?? 200);
+          const pageEvents = events.slice(offset, offset + pageSize);
+          const nextOffset = offset + pageEvents.length;
+          const hasMore = nextOffset < events.length;
+          if (sessionId === "session-1" && process.env.TEST_HISTORY_READ_DELAY_MS) {
+            await new Promise((resolve) => setTimeout(
+              resolve,
+              Number(process.env.TEST_HISTORY_READ_DELAY_MS)
+            ));
+          }
+          return {
+            events: pageEvents,
+            cursor: hasMore ? String(nextOffset) : "",
+            cursorStatus: "ok",
+            hasMore
+          };
+        }
+      }
+    };
+  }
+
+  async start() {}
+  async stop() {}
+}
 `;
 
 async function unusedPort(): Promise<number> {
@@ -313,11 +562,22 @@ async function startTestServer(t: TestContext, options: {
   reloadDelayMs?: number;
   historyText?: string;
   context?: "default" | "long_context";
+  nativeMessages?: boolean;
+  nativeHistory?: {
+    events?: JsonObject[];
+    pageSize?: number;
+    readDelayMs?: number;
+    readError?: boolean;
+    cursorExpired?: boolean;
+    unsupported?: boolean;
+    timestamp?: string;
+  };
 } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-server-reconnect-test-"));
   const home = path.join(directory, "home");
   const projects = path.join(directory, "projects");
   const copilotHome = path.join(home, ".copilot");
+  const copilotSdk = path.join(directory, "copilot-sdk");
   const fakeCommand = path.join(directory, "copilot-fake");
   const port = await unusedPort();
   await mkdir(home);
@@ -325,6 +585,15 @@ async function startTestServer(t: TestContext, options: {
   await mkdir(copilotHome);
   await writeFile(fakeCommand, fakeCopilot);
   await chmod(fakeCommand, 0o700);
+  if (options.nativeHistory) {
+    await mkdir(copilotSdk);
+    await writeFile(path.join(copilotSdk, "package.json"), JSON.stringify({ type: "module" }));
+    await writeFile(path.join(copilotSdk, "index.js"), fakeCopilotSdk);
+    await writeFile(
+      path.join(projects, "native-history.json"),
+      JSON.stringify({ "session-1": options.nativeHistory.events ?? [] })
+    );
+  }
 
   const serverEntry = fileURLToPath(new URL("./server.js", import.meta.url));
   const child = spawn(process.execPath, [serverEntry], {
@@ -335,6 +604,10 @@ async function startTestServer(t: TestContext, options: {
       COPILOT_HOME: copilotHome,
       COPILOT_PROJECTS_DIR: projects,
       COPILOT_BIN: fakeCommand,
+      COPILOT_ALLOW_ALL: "false",
+      COPILOT_SDK_PATH: options.nativeHistory
+        ? path.join(copilotSdk, "index.js")
+        : "",
       COPILOT_NATIVE_SESSION_DELETE: "false",
       TEST_MCP_COMMAND: String(options.advertiseMcp ?? true),
       TEST_MCP_RELOAD_ERROR: String(options.failReload ?? false),
@@ -343,6 +616,13 @@ async function startTestServer(t: TestContext, options: {
       TEST_LOAD_DELAY_MS: String(options.loadDelayMs ?? 0),
       TEST_FAIL_RECOVERY_LOADS: String(options.failRecoveryLoads ?? false),
       TEST_PROFILE_SESSIONS: String(options.profileSessions ?? false),
+      TEST_NATIVE_MESSAGES: String(options.nativeMessages ?? false),
+      TEST_NATIVE_TIMESTAMP: options.nativeHistory?.timestamp ?? "2026-10-14T10:00:00.000Z",
+      TEST_HISTORY_PAGE_SIZE: String(options.nativeHistory?.pageSize ?? 200),
+      TEST_HISTORY_READ_DELAY_MS: String(options.nativeHistory?.readDelayMs ?? 0),
+      TEST_HISTORY_READ_ERROR: String(options.nativeHistory?.readError ?? false),
+      TEST_HISTORY_CURSOR_EXPIRED: String(options.nativeHistory?.cursorExpired ?? false),
+      TEST_HISTORY_UNSUPPORTED: String(options.nativeHistory?.unsupported ?? false),
       TEST_PROMPT_DELAY_MS: String(options.promptDelayMs ?? 20),
       TEST_MCP_RELOAD_DELAY_MS: String(options.reloadDelayMs ?? 200),
       ...(options.historyText ? { TEST_HISTORY_TEXT: options.historyText } : {}),
@@ -405,6 +685,16 @@ async function startTestServer(t: TestContext, options: {
     session: (id: string) => readFile(path.join(projects, `profile-session-${id}.json`), "utf8")
       .then((content) => JSON.parse(content) as unknown),
     metadata: (name: string) => readFile(path.join(home, ".copilot-web", name), "utf8")
+      .then((content) => JSON.parse(content) as unknown),
+    nativeHistory: () => readFile(path.join(projects, "native-history.json"), "utf8")
+      .then((content) => JSON.parse(content) as unknown),
+    historyReads: () => readFile(path.join(projects, "native-history-requests.jsonl"), "utf8")
+      .then((content) => content.trim().split("\n").map((line) => JSON.parse(line) as unknown))
+      .catch((error: unknown) => {
+        if (isRecord(error) && error.code === "ENOENT") return [];
+        throw error;
+      }),
+    sdkConnection: () => readFile(path.join(projects, "native-sdk-connection.json"), "utf8")
       .then((content) => JSON.parse(content) as unknown),
     async requests(): Promise<JsonObject[]> {
       const log = await readFile(path.join(projects, "copilot-requests.log"), "utf8");
@@ -773,6 +1063,360 @@ function replayUpdates(value: unknown): JsonObject[] {
   assert.ok(value.replayUpdates.every(isRecord));
   return value.replayUpdates;
 }
+
+const nativeImageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=";
+
+function nativeHistoryEvents(): JsonObject[] {
+  return [
+    {
+      id: "persisted-user-event",
+      type: "user.message",
+      timestamp: "2026-10-13T12:00:00.000Z",
+      parentId: null,
+      data: {
+        messageId: "native-user-1",
+        content: "Native historical prompt",
+        attachments: [{
+          type: "blob",
+          displayName: "diagram.png",
+          mimeType: "image/png",
+          data: nativeImageData
+        }]
+      }
+    },
+    {
+      id: "persisted-assistant-event",
+      type: "assistant.message",
+      timestamp: "2026-10-13T12:00:05.123Z",
+      parentId: "persisted-user-event",
+      data: {
+        messageId: "native-assistant-1",
+        content: "Native historical reply"
+      }
+    },
+    {
+      id: "persisted-subagent-event",
+      type: "assistant.message",
+      agentId: "subagent-1",
+      timestamp: "2026-10-13T12:00:06.000Z",
+      parentId: "persisted-assistant-event",
+      data: {
+        messageId: "native-subagent-1",
+        content: "This subagent message is not part of the root transcript"
+      }
+    }
+  ];
+}
+
+test("loads root-agent native history sequentially with IDs, timestamps, and attachments", async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: { events: nativeHistoryEvents(), pageSize: 1 }
+  });
+  const response = await server.post("load", { context: "default" });
+  assert.equal(response.status, 200);
+  const loaded: unknown = await response.json();
+  assert.ok(isRecord(loaded));
+  assert.equal(loaded.nativeMessagesActive, true);
+  assert.ok(Array.isArray(loaded.nativeMessages));
+  assert.equal(loaded.nativeMessages.length, 2);
+
+  const user = loaded.nativeMessages[0];
+  const assistant = loaded.nativeMessages[1];
+  assert.ok(isRecord(user) && isRecord(assistant));
+  assert.equal(user.messageId, "native-user-1");
+  assert.equal(user.content, "Native historical prompt");
+  assert.ok(Array.isArray(user.attachments));
+  assert.deepEqual(user.attachments[0], {
+    name: "diagram.png",
+    mimeType: "image/png",
+    data: nativeImageData
+  });
+  assert.equal(assistant.messageId, "native-assistant-1");
+  assert.equal(assistant.content, "Native historical reply");
+  assert.equal(assistant.timestamp, "2026-10-13T12:00:05.123Z");
+  assert.equal(assistant.completion, "completed");
+
+  const reads = (await server.historyReads()).filter((request) => (
+    isRecord(request) && request.sessionId === "session-1"
+  ));
+  assert.deepEqual(reads.map((request) => (
+    isRecord(request) ? request.cursor ?? null : null
+  )), [null, "1", "2"]);
+  const connection: unknown = await server.sdkConnection();
+  assert.ok(isRecord(connection));
+  assert.equal(String(connection.path).endsWith("copilot-fake"), true);
+  assert.deepEqual(connection.args, []);
+});
+
+test("does not read a persisted journal for an empty unprompted conversation", async (t) => {
+  const server = await startTestServer(t, {
+    nativeHistory: { events: [] }
+  });
+  const response = await server.post("load", { context: "default" });
+  assert.equal(response.status, 200);
+  const loaded: unknown = await response.json();
+  assert.ok(isRecord(loaded) && Array.isArray(loaded.nativeMessages));
+  assert.equal(loaded.nativeMessagesActive, true);
+  assert.deepEqual(loaded.nativeMessages, []);
+  assert.equal(
+    (await server.historyReads()).filter((request) => (
+      isRecord(request) && request.sessionId === server.sessionId
+    )).length,
+    0
+  );
+});
+
+function openEventStream(baseUrl: string, headers: Record<string, string>) {
+  const controller = new AbortController();
+  const events: Array<{ event: string; data: unknown }> = [];
+  void (async () => {
+    try {
+      const response = await fetch(`${baseUrl}/api/events`, { headers, signal: controller.signal });
+      const reader = response.body?.getReader();
+      if (!reader) return;
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        buffer += decoder.decode(value, { stream: true });
+        let separator = buffer.indexOf("\n\n");
+        while (separator >= 0) {
+          const block = buffer.slice(0, separator);
+          buffer = buffer.slice(separator + 2);
+          const event = /^event: (.*)$/m.exec(block)?.[1];
+          const data = /^data: (.*)$/m.exec(block)?.[1];
+          if (event && data) {
+            events.push({ event, data: JSON.parse(data) as unknown });
+          }
+          separator = buffer.indexOf("\n\n");
+        }
+      }
+    } catch {
+      // The stream is aborted when the test finishes.
+    }
+  })();
+  return { events, close: () => controller.abort() };
+}
+
+test("merges events buffered during a persisted-history read", async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    promptDelayMs: 250,
+    nativeHistory: {
+      events: nativeHistoryEvents().slice(0, 2),
+      readDelayMs: 1_000
+    }
+  });
+  const stream = openEventStream(server.baseUrl, server.headers);
+  t.after(stream.close);
+  const streamDeadline = Date.now() + 2_000;
+  while (!stream.events.some((event) => event.event === "ready")) {
+    assert.ok(Date.now() < streamDeadline, "Event stream did not connect");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  let loadFinished = false;
+  const loading = server.post("load", { context: "default" }).finally(() => {
+    loadFinished = true;
+  });
+  const deadline = Date.now() + 2_000;
+  while (!(await server.historyReads()).some((request) => (
+    isRecord(request) && request.sessionId === "session-1"
+  ))) {
+    assert.ok(Date.now() < deadline, "Persisted-history reading did not start");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const prompt = server.post("messages", {
+    text: "arrive while history is loading",
+    clientPromptId: "live-prompt-1"
+  });
+  assert.equal((await prompt).status, 200);
+  const liveDeadline = Date.now() + 2_000;
+  let liveFinal: { event: string; data: unknown } | undefined;
+  while (!liveFinal) {
+    liveFinal = stream.events.find((event) => (
+      event.event === "native-message" &&
+      isRecord(event.data) &&
+      event.data.role === "assistant" &&
+      event.data.completion === "completed" &&
+      event.data.content === "Done."
+    ));
+    assert.ok(Date.now() < liveDeadline, "The live reply was not published during the load");
+    if (!liveFinal) await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(loadFinished, false, "The live reply should arrive while history is still loading");
+  assert.ok(isRecord(liveFinal.data));
+  assert.equal(liveFinal.data.timestamp, "2026-10-14T10:00:00.300Z");
+
+  const response = await loading;
+  assert.equal(response.status, 200);
+  const loaded: unknown = await response.json();
+  assert.ok(isRecord(loaded) && Array.isArray(loaded.nativeMessages));
+  const messages = loaded.nativeMessages.filter(isRecord);
+  assert.equal(messages.length, 4);
+  const liveUser = messages.find((message) => message.clientPromptId === "live-prompt-1");
+  const liveAssistant = messages.find((message) => (
+    message.role === "assistant" && message.content === "Done."
+  ));
+  assert.equal(liveUser?.content, "arrive while history is loading");
+  assert.equal(liveAssistant?.timestamp, "2026-10-14T10:00:00.300Z");
+});
+
+test("reports unsupported and failed native history instead of silently omitting timestamps", async (t) => {
+  for (const [name, nativeHistory] of [
+    ["unsupported API", { events: nativeHistoryEvents(), unsupported: true }],
+    ["read failure", { events: nativeHistoryEvents(), readError: true }],
+    ["expired cursor", { events: nativeHistoryEvents(), pageSize: 1, cursorExpired: true }]
+  ] as const) {
+    await t.test(name, async (t) => {
+      const server = await startTestServer(t, {
+        existingSession: true,
+        nativeMessages: true,
+        nativeHistory
+      });
+      const response = await server.post("load", { context: "default" });
+      assert.equal(response.status, 200);
+      const loaded: unknown = await response.json();
+      assert.ok(isRecord(loaded));
+      assert.equal(loaded.nativeMessagesActive, false);
+      assert.equal(typeof loaded.historyWarning, "string");
+      assert.match(String(loaded.historyWarning), /timestamps are unavailable/);
+      const replay = replayUpdates(loaded);
+      const idlessUser = replay.find((params) => (
+        isRecord(params.update) &&
+        params.update.sessionUpdate === "user_message_chunk"
+      ));
+      const idlessAssistant = replay.find((params) => (
+        isRecord(params.update) &&
+        params.update.sessionUpdate === "agent_message_chunk"
+      ));
+      assert.ok(idlessUser && isRecord(idlessUser.update));
+      assert.ok(idlessAssistant && isRecord(idlessAssistant.update));
+      assert.equal(idlessUser.update.messageId, undefined);
+      assert.equal(idlessAssistant.update.messageId, undefined);
+      assert.equal(idlessAssistant.timestamp, undefined);
+    });
+  }
+});
+
+test("keeps repeated final events idempotent and marks command-only replies as untimed", async (t) => {
+  const server = await startTestServer(t, {
+    nativeMessages: true,
+    nativeHistory: { events: [], timestamp: "2026-10-14T10:00:00.000Z" },
+    promptDelayMs: 20
+  });
+  const stream = openEventStream(server.baseUrl, server.headers);
+  t.after(stream.close);
+  const streamDeadline = Date.now() + 2_000;
+  while (!stream.events.some((event) => event.event === "ready")) {
+    assert.ok(Date.now() < streamDeadline, "Event stream did not connect");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const createdResponse = await fetch(`${server.baseUrl}/api/sessions`, {
+    method: "POST",
+    headers: server.headers,
+    body: JSON.stringify({ context: "default" })
+  });
+  assert.equal(createdResponse.status, 201);
+  const created: unknown = await createdResponse.json();
+  assert.ok(isRecord(created) && isRecord(created.session));
+  const sessionId = String(created.session.sessionId);
+
+  const prompt = await server.post("messages", {
+    text: "native live response",
+    clientPromptId: "live-prompt-2"
+  }, sessionId);
+  assert.equal(prompt.status, 200);
+  const loadedResponse = await server.post("load", { context: "default" }, sessionId);
+  assert.equal(loadedResponse.status, 200);
+  const loaded: unknown = await loadedResponse.json();
+  assert.ok(isRecord(loaded) && Array.isArray(loaded.nativeMessages));
+  const messages = loaded.nativeMessages.filter(isRecord);
+  assert.equal(messages.length, 2);
+  assert.equal(messages[0]?.clientPromptId, "live-prompt-2");
+  assert.equal(messages[1]?.content, "Done.");
+  assert.equal(messages[1]?.timestamp, "2026-10-14T10:00:00.300Z");
+
+  const reloadReply = "MCP configuration reloaded and servers restarted.";
+  const reload = await server.post("messages", {
+    text: "/mcp reload",
+    reconnect: true,
+    clientPromptId: "reload-prompt-1"
+  }, sessionId);
+  assert.equal(reload.status, 200);
+  const liveDeadline = Date.now() + 2_000;
+  const liveCommandReply = () => stream.events.find((event) => (
+    event.event === "session-update" &&
+    isRecord(event.data) &&
+    event.data.nativeCommand === true &&
+    isRecord(event.data.update) &&
+    isRecord(event.data.update.content) &&
+    event.data.update.content.text === reloadReply
+  ));
+  while (!liveCommandReply()) {
+    assert.ok(Date.now() < liveDeadline, "The command reply was not published");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(stream.events.some((event) => (
+    event.event === "session-update" && isRecord(event.data) && event.data.nativeFallback === true
+  )), false);
+
+  const afterReload = await server.post("load", { context: "default" }, sessionId);
+  assert.equal(afterReload.status, 200);
+  const reloaded: unknown = await afterReload.json();
+  assert.ok(isRecord(reloaded) && Array.isArray(reloaded.nativeMessages));
+  assert.equal(reloaded.historyWarning, undefined);
+  assert.equal(reloaded.nativeMessages.some((message) => (
+    isRecord(message) && message.content === reloadReply
+  )), false);
+  const chatReplay = replayUpdates(reloaded).filter((params) => (
+    isRecord(params.update) &&
+    (params.update.sessionUpdate === "user_message_chunk" ||
+      params.update.sessionUpdate === "agent_message_chunk")
+  )).map((params) => ({
+    command: params.nativeCommand === true,
+    text: isRecord(params.update) && isRecord(params.update.content)
+      ? params.update.content.text
+      : undefined
+  }));
+  assert.deepEqual(chatReplay, [
+    { command: false, text: "native live response" },
+    { command: false, text: "Done." },
+    { command: true, text: "/mcp reload" },
+    { command: true, text: reloadReply }
+  ]);
+});
+
+test("recovers native message identity and timestamps after the ACP process restarts", async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: { events: nativeHistoryEvents(), pageSize: 1 }
+  });
+  const beforeResponse = await server.post("load", { context: "default" });
+  assert.equal(beforeResponse.status, 200);
+  const before: unknown = await beforeResponse.json();
+  assert.ok(isRecord(before) && Array.isArray(before.nativeMessages));
+  const beforeMessages = before.nativeMessages.filter(isRecord);
+  const assistantBefore = beforeMessages.find((message) => message.role === "assistant");
+  assert.equal(assistantBefore?.messageId, "native-assistant-1");
+  assert.equal(assistantBefore?.timestamp, "2026-10-13T12:00:05.123Z");
+
+  assert.equal((await server.post("messages", { text: "crash" })).status, 500);
+  const afterResponse = await server.post("load", { context: "default" });
+  assert.equal(afterResponse.status, 200);
+  const after: unknown = await afterResponse.json();
+  assert.ok(isRecord(after) && Array.isArray(after.nativeMessages));
+  const afterMessages = after.nativeMessages.filter(isRecord);
+  const assistantAfter = afterMessages.find((message) => message.role === "assistant");
+  assert.equal(afterMessages.length, beforeMessages.length);
+  assert.equal(assistantAfter?.messageId, assistantBefore?.messageId);
+  assert.equal(assistantAfter?.timestamp, assistantBefore?.timestamp);
+  assert.equal(await server.starts(), "2");
+});
 
 test("rebuilds crash-recovery history once and preserves the current prompt", async (t) => {
   for (const body of [
@@ -1504,6 +2148,508 @@ test("keeps the screen wake lock toggle usable and reports unavailable preferenc
   await evaluate(`${button}.click()`);
   await waitFor(`${button}.dataset.status === 'off' && !${button}.disabled`);
   assert.equal(await evaluate(`window.wakeLockTest.sentinels[0].released`), true);
+});
+
+test("shows the timestamp limitation when native history falls back to ACP replay", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: {
+      events: nativeHistoryEvents(),
+      unsupported: true
+    }
+  });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes(
+    "Native historical reply"
+  )`);
+  assert.equal(await evaluate(`document.querySelector("#history-warning").hidden`), false);
+  assert.equal(
+    await evaluate(`document.querySelector("#history-warning").textContent.includes(
+      "recorded message timestamps are unavailable"
+    )`),
+    true
+  );
+  assert.equal(
+    await evaluate(`document.querySelectorAll(".message.assistant time.message-timestamp").length`),
+    0
+  );
+  assert.equal(
+    await evaluate(`document.querySelector(".message.assistant .message-body").textContent`),
+    "Native historical reply"
+  );
+  assert.equal(
+    await evaluate(`document.querySelector(".message.tool") !== null`),
+    true
+  );
+});
+
+test("renders native completion times outside message content through refresh", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 30_000
+}, async (t) => {
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const historicalUserDate = new Date(yesterday);
+  historicalUserDate.setHours(11, 59, 55, 0);
+  const historicalUserTimestamp = historicalUserDate.toISOString();
+  const historicalAssistantDate = new Date(yesterday);
+  historicalAssistantDate.setHours(12, 0, 5, 123);
+  const historicalTimestamp = historicalAssistantDate.toISOString();
+  const todayTimestamp = new Date(Date.now() - 60_000).toISOString();
+  const historicalEvents = nativeHistoryEvents().map((event) => {
+    if (event.id === "persisted-assistant-event") {
+      return { ...event, timestamp: historicalTimestamp };
+    }
+    if (event.id === "persisted-user-event") {
+      return { ...event, timestamp: historicalUserTimestamp };
+    }
+    return event;
+  });
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: {
+      events: [
+        ...historicalEvents,
+        {
+          id: "untimed-assistant-event",
+          type: "assistant.message",
+          data: {
+            messageId: "native-assistant-untimed",
+            content: "Untimed native reply"
+          }
+        }
+      ],
+      pageSize: 1,
+      timestamp: todayTimestamp
+    },
+    promptDelayMs: 20
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const assistantBodies = `[
+    ...document.querySelectorAll(".message.assistant .message-body")
+  ]`;
+  const timestamps = `[
+    ...document.querySelectorAll(".message.assistant time.message-timestamp")
+  ]`;
+  const userTimestamps = `[
+    ...document.querySelectorAll(".message.user time.message-timestamp")
+  ]`;
+
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`${assistantBodies}.some((body) => body.textContent === "Native historical reply")`);
+  await waitFor(`${timestamps}.length === 1`);
+  await waitFor(`${userTimestamps}.length === 1`);
+  assert.equal(
+    await evaluate(`${userTimestamps}[0].dateTime`),
+    historicalUserTimestamp
+  );
+  assert.equal(
+    await evaluate(`${userTimestamps}[0].textContent`),
+    await evaluate(`new Date(${JSON.stringify(historicalUserTimestamp)}).toLocaleString(undefined, {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      hour: "numeric",
+      minute: "2-digit"
+    })`)
+  );
+  assert.equal(
+    await evaluate(`${timestamps}[0].dateTime`),
+    historicalTimestamp
+  );
+  assert.equal(
+    await evaluate(`${timestamps}[0].textContent`),
+    await evaluate(`new Date(${JSON.stringify(historicalTimestamp)}).toLocaleString(undefined, {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      hour: "numeric",
+      minute: "2-digit"
+    })`)
+  );
+  assert.equal(await evaluate(`
+    (() => {
+      const time = ${timestamps}[0];
+      const body = time.closest(".message").querySelector(".message-body");
+      return !body.contains(time) &&
+        body.textContent === "Native historical reply" &&
+        time.title === new Date(${JSON.stringify(historicalTimestamp)}).toLocaleString(undefined, {
+          dateStyle: "full",
+          timeStyle: "long"
+        });
+    })()
+  `), true);
+  assert.equal(await evaluate(`
+    (() => {
+      const time = ${userTimestamps}[0];
+      const body = time.closest(".message").querySelector(".message-body");
+      return !body.contains(time) &&
+        body.querySelector(".message-attachment-image")?.alt === "diagram.png" &&
+        time.title === new Date(${JSON.stringify(historicalUserTimestamp)}).toLocaleString(undefined, {
+          dateStyle: "full",
+          timeStyle: "long"
+        });
+    })()
+  `), true);
+  assert.deepEqual(await evaluate(`
+    (() => {
+      const messages = [...document.querySelectorAll("#messages > .message")];
+      return messages.map((message) => message.classList.contains("user")
+        ? "user"
+        : message.classList.contains("tool")
+          ? "tool"
+          : "assistant"
+      );
+    })()
+  `), ["user", "tool", "assistant", "assistant"]);
+  assert.equal(await evaluate(`
+    (() => {
+      const article = [...document.querySelectorAll(".message.assistant")]
+        .find((candidate) => candidate.querySelector(".message-body")?.textContent ===
+          "Untimed native reply");
+      return Boolean(article) &&
+        article.querySelector("time.message-timestamp") === null;
+    })()
+  `), true);
+  assert.equal(await evaluate(
+    `document.querySelector(".message.user .message-attachment-image")?.alt`
+  ), "diagram.png");
+  assert.equal(await evaluate(
+    `document.querySelector("#messages").textContent.includes("subagent message is not")`
+  ), false);
+
+  await evaluate(`
+    (() => {
+      const input = document.querySelector("#prompt-input");
+      input.value = "native live response";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector("#composer").requestSubmit();
+    })();
+  `);
+  await waitFor(`${assistantBodies}.some((body) => body.textContent === "Done.")`);
+  await waitFor(`${timestamps}.length === 2`);
+  await waitFor(`${userTimestamps}.length === 2`);
+  assert.equal(await evaluate(`document.querySelector("#history-warning").hidden`), true);
+  const todayCompletionTimestamp = new Date(Date.parse(todayTimestamp) + 300).toISOString();
+  assert.equal(
+    await evaluate(`${timestamps}[1].dateTime`),
+    todayCompletionTimestamp
+  );
+  const todayLocalTime = await evaluate(`new Date(${JSON.stringify(todayCompletionTimestamp)})
+    .toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })`);
+  assert.equal(
+    await evaluate(`${timestamps}[1].textContent`),
+    `Today, ${String(todayLocalTime)}`
+  );
+  const todayUserTime = await evaluate(`new Date(${JSON.stringify(todayTimestamp)})
+    .toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })`);
+  assert.equal(await evaluate(`${userTimestamps}[1].dateTime`), todayTimestamp);
+  assert.equal(
+    await evaluate(`${userTimestamps}[1].textContent`),
+    `Today, ${String(todayUserTime)}`
+  );
+  assert.equal(await evaluate(`
+    [...document.querySelectorAll(".message.assistant .message-body")]
+      .filter((body) => body.textContent === "Done.").length
+  `), 1);
+  assert.equal(
+    await evaluate(`document.querySelectorAll(".message.user").length`),
+    2
+  );
+
+  await evaluate("window.beforeNativeHistoryReload = true");
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`
+    window.beforeNativeHistoryReload !== true &&
+    ${assistantBodies}.some((body) => body.textContent === "Done.") &&
+    ${timestamps}.length === 2 &&
+    ${userTimestamps}.length === 2
+  `);
+  assert.equal(
+    await evaluate(`${timestamps}[1].dateTime`),
+    todayCompletionTimestamp
+  );
+  assert.equal(
+    await evaluate(`${userTimestamps}[1].dateTime`),
+    todayTimestamp
+  );
+  assert.equal(
+    await evaluate(`document.querySelectorAll(".message.assistant .message-body").length`),
+    3
+  );
+});
+
+test("shows command-only replies untimed without the history warning", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: { events: nativeHistoryEvents() }
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const reloadReply = "MCP configuration reloaded and servers restarted.";
+  const chatTranscript = `[...document.querySelectorAll(
+    "#messages > .message.user, #messages > .message.assistant"
+  )].map((message) => ({
+    role: message.classList.contains("user") ? "user" : "assistant",
+    text: message.querySelector(".message-body").textContent,
+    timed: Boolean(message.querySelector("time.message-timestamp"))
+  }))`;
+  const expected = [
+    { role: "user", text: "Native historical prompt", timed: true },
+    { role: "assistant", text: "Native historical reply", timed: true },
+    { role: "user", text: "/mcp reload", timed: false },
+    { role: "assistant", text: reloadReply, timed: false }
+  ];
+
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`
+    document.querySelector("#messages").textContent.includes("Native historical reply") &&
+    !document.querySelector("#reconnect-tools").disabled
+  `);
+  await evaluate(`document.querySelector("#reconnect-tools").click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes(${JSON.stringify(reloadReply)})`);
+  await waitFor(`!document.querySelector("#reconnect-tools").disabled`);
+  assert.deepEqual(await evaluate(chatTranscript), expected);
+  assert.equal(await evaluate(`document.querySelector("#history-warning").hidden`), true);
+
+  await evaluate("window.beforeCommandReload = true");
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`
+    window.beforeCommandReload !== true &&
+    document.querySelector("#messages")?.textContent.includes(${JSON.stringify(reloadReply)})
+  `);
+  assert.deepEqual(await evaluate(chatTranscript), expected);
+  assert.equal(await evaluate(`document.querySelector("#history-warning").hidden`), true);
+});
+
+function nativeTranscriptEvent(
+  type: "user.message" | "assistant.message",
+  messageId: string,
+  content: string,
+  minute: number,
+  data: JsonObject = {}
+): JsonObject {
+  return {
+    id: `${messageId}-event`,
+    type,
+    timestamp: new Date(Date.UTC(2026, 9, 13, 9, minute)).toISOString(),
+    parentId: null,
+    data: { messageId, content, ...data }
+  };
+}
+
+test("does not shift or duplicate messages when native and ACP histories differ", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 40_000
+}, async (t) => {
+  const chatTranscript = `[...document.querySelectorAll(
+    "#messages > .message.user, #messages > .message.assistant"
+  )].map((message) => ({
+    role: message.classList.contains("user") ? "user" : "assistant",
+    text: message.querySelector(".message-body").textContent,
+    timed: Boolean(message.querySelector("time.message-timestamp"))
+  }))`;
+  const scenarios: Array<{
+    name: string;
+    events: JsonObject[];
+    expected: Array<{ role: string; text: string; timed: boolean }>;
+    warning: boolean;
+  }> = [
+    {
+      name: "tool calls separate replies within a turn",
+      events: [
+        nativeTranscriptEvent("user.message", "user-1", "Inspect and run", 0),
+        nativeTranscriptEvent("assistant.message", "assistant-1", "I will look at the file.", 1, {
+          toolRequests: [{ toolCallId: "call-view", name: "view" }]
+        }),
+        nativeTranscriptEvent("assistant.message", "assistant-2", "I looked at it.", 2, {
+          reasoningText: "Now run the command.",
+          toolRequests: [{ toolCallId: "call-bash", name: "bash" }]
+        }),
+        nativeTranscriptEvent("assistant.message", "assistant-3", "Second answer", 3)
+      ],
+      expected: [
+        { role: "user", text: "Inspect and run", timed: true },
+        { role: "assistant", text: "I will look at the file.", timed: true },
+        { role: "assistant", text: "I looked at it.", timed: true },
+        { role: "assistant", text: "Second answer", timed: true }
+      ],
+      warning: false
+    },
+    {
+      name: "assistant messages differ within a turn",
+      events: [
+        nativeTranscriptEvent("user.message", "user-1", "First question", 0),
+        nativeTranscriptEvent("assistant.message", "assistant-1", "First answer", 1, {
+          toolRequests: [{ toolCallId: "lookup-1", name: "Lookup" }]
+        }),
+        nativeTranscriptEvent("assistant.message", "assistant-acp-only", "ACP-only reply", 2, {
+          testNativeHidden: true
+        }),
+        nativeTranscriptEvent("user.message", "user-2", "Second question", 3),
+        nativeTranscriptEvent("assistant.message", "assistant-2", "Second answer", 4)
+      ],
+      expected: [
+        { role: "user", text: "First question", timed: true },
+        { role: "assistant", text: "First answer", timed: true },
+        { role: "assistant", text: "ACP-only reply", timed: false },
+        { role: "user", text: "Second question", timed: true },
+        { role: "assistant", text: "Second answer", timed: true }
+      ],
+      warning: true
+    },
+    {
+      name: "a native-only turn is missing from ACP",
+      events: [
+        nativeTranscriptEvent("user.message", "user-1", "First question", 0),
+        nativeTranscriptEvent("assistant.message", "assistant-1", "First answer", 1),
+        nativeTranscriptEvent("user.message", "user-hidden", "Hidden native prompt", 2, {
+          testAcpHidden: true
+        }),
+        nativeTranscriptEvent("assistant.message", "assistant-hidden", "Hidden native answer", 3, {
+          testAcpHidden: true
+        }),
+        nativeTranscriptEvent("user.message", "user-2", "Second question", 4),
+        nativeTranscriptEvent("assistant.message", "assistant-2", "Second answer", 5)
+      ],
+      expected: [
+        { role: "user", text: "First question", timed: false },
+        { role: "assistant", text: "First answer", timed: false },
+        { role: "user", text: "Second question", timed: false },
+        { role: "assistant", text: "Second answer", timed: false }
+      ],
+      warning: true
+    }
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async (t) => {
+      const server = await startTestServer(t, {
+        existingSession: true,
+        nativeMessages: true,
+        nativeHistory: { events: scenario.events }
+      });
+      const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+      await waitFor(`Boolean(document.querySelector(
+        'button.session-item[data-session-id="${server.sessionId}"]'
+      ))`);
+      await evaluate(`document.querySelector(
+        'button.session-item[data-session-id="${server.sessionId}"]'
+      ).click()`);
+      await waitFor(`document.querySelector("#messages").textContent.includes("Second answer")`);
+      assert.deepEqual(await evaluate(chatTranscript), scenario.expected);
+      assert.equal(
+        await evaluate(`document.querySelector("#history-warning").hidden`),
+        !scenario.warning
+      );
+      assert.equal(
+        await evaluate(`document.querySelector("#messages").textContent.includes("Hidden native")`),
+        false
+      );
+    });
+  }
+});
+
+test("maps queued prompts to native messages and leaves cancelled replies untimed", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    nativeMessages: true,
+    nativeHistory: {
+      events: [],
+      timestamp: "2026-10-14T10:00:00.000Z"
+    },
+    promptDelayMs: 500
+  });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const promptInput = `document.querySelector("#prompt-input")`;
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`!document.querySelector("#send-prompt").disabled`);
+
+  await evaluate(`
+    (() => {
+      const input = ${promptInput};
+      input.value = "first native prompt";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector("#composer").requestSubmit();
+    })();
+  `);
+  await server.waitForPrompt("first native prompt");
+  await evaluate(`
+    (() => {
+      const input = ${promptInput};
+      input.value = "second queued prompt";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector("#composer").requestSubmit();
+    })();
+  `);
+  await server.waitForPrompt("second queued prompt");
+  await waitFor(`
+    [...document.querySelectorAll(".message.user .message-body")]
+      .some((body) => body.textContent === "first native prompt") &&
+    [...document.querySelectorAll(".message.user .message-body")]
+      .some((body) => body.textContent === "second queued prompt") &&
+    [...document.querySelectorAll(".message.assistant .message-body")]
+      .some((body) => body.textContent === "Partial response before cancellation.") &&
+    [...document.querySelectorAll(".message.assistant .message-body")]
+      .some((body) => body.textContent === "Done.")
+  `);
+  await waitFor(`document.querySelectorAll(".message.assistant time.message-timestamp").length === 1`);
+
+  assert.deepEqual(await evaluate(`
+    [...document.querySelectorAll(".message.user .message-body")]
+      .map((body) => body.textContent)
+  `), ["first native prompt", "second queued prompt"]);
+  assert.deepEqual(await evaluate(`
+    [...document.querySelectorAll(".message.assistant .message-body")]
+      .map((body) => body.textContent)
+  `), ["Partial response before cancellation.", "Done."]);
+  assert.equal(
+    await evaluate(`document.querySelectorAll(".message.assistant time.message-timestamp").length`),
+    1
+  );
+  assert.equal(
+    await evaluate(`document.querySelector(".message.assistant time.message-timestamp").dateTime`),
+    "2026-10-14T10:00:00.300Z"
+  );
+  assert.deepEqual(
+    (await server.requests())
+      .filter((request) => request.method === "session/prompt")
+      .map((request) => request.text),
+    ["first native prompt", "second queued prompt"]
+  );
 });
 
 test("sizes composer selectors to their labels and wraps usage without overlap", {

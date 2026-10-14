@@ -57,6 +57,12 @@ input.on("line", (line) => {
   );
   switch (request.method) {
     case "initialize":
+      fs.writeFileSync(
+        path.join(process.cwd(), "copilot-client-events.json"),
+        JSON.stringify(
+          request.params.clientCapabilities._meta["github.com/copilot"].events
+        )
+      );
       respond({
         protocolVersion: 1,
         agentCapabilities: {
@@ -276,6 +282,32 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   }
 });
 `;
+
+test("subscribes to native user and assistant message events", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-native-events-test-"));
+  const command = path.join(directory, "copilot-fake");
+  await writeFile(command, fakeCopilot);
+  await chmod(command, 0o700);
+  const acp = new AcpConnection({ command, cwd: directory, clientVersion: "test" });
+  try {
+    await acp.start();
+    const events = JSON.parse(
+      await readFile(path.join(directory, "copilot-client-events.json"), "utf8")
+    ) as unknown;
+    assert.ok(Array.isArray(events));
+    for (const event of [
+      "user.message",
+      "assistant.message_start",
+      "assistant.message_delta",
+      "assistant.message"
+    ]) {
+      assert.ok(events.includes(event), `Expected native event subscription for ${event}`);
+    }
+  } finally {
+    await acp.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 const recoveringCopilot = `#!/usr/bin/env node
 const fs = require("node:fs");
