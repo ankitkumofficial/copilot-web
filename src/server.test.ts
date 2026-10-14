@@ -1265,7 +1265,7 @@ test("merges events buffered during a persisted-history read", async (t) => {
   assert.equal(liveAssistant?.timestamp, "2026-10-14T10:00:00.300Z");
 });
 
-test("reports unsupported and failed native history instead of silently omitting timestamps", async (t) => {
+test("falls back to ACP replay when native history is unavailable", async (t) => {
   for (const [name, nativeHistory] of [
     ["unsupported API", { events: nativeHistoryEvents(), unsupported: true }],
     ["read failure", { events: nativeHistoryEvents(), readError: true }],
@@ -1282,8 +1282,6 @@ test("reports unsupported and failed native history instead of silently omitting
       const loaded: unknown = await response.json();
       assert.ok(isRecord(loaded));
       assert.equal(loaded.nativeMessagesActive, false);
-      assert.equal(typeof loaded.historyWarning, "string");
-      assert.match(String(loaded.historyWarning), /timestamps are unavailable/);
       const replay = replayUpdates(loaded);
       const idlessUser = replay.find((params) => (
         isRecord(params.update) &&
@@ -1368,7 +1366,6 @@ test("keeps repeated final events idempotent and marks command-only replies as u
   assert.equal(afterReload.status, 200);
   const reloaded: unknown = await afterReload.json();
   assert.ok(isRecord(reloaded) && Array.isArray(reloaded.nativeMessages));
-  assert.equal(reloaded.historyWarning, undefined);
   assert.equal(reloaded.nativeMessages.some((message) => (
     isRecord(message) && message.content === reloadReply
   )), false);
@@ -2150,7 +2147,7 @@ test("keeps the screen wake lock toggle usable and reports unavailable preferenc
   assert.equal(await evaluate(`window.wakeLockTest.sentinels[0].released`), true);
 });
 
-test("shows the timestamp limitation when native history falls back to ACP replay", {
+test("uses untimed ACP replay when native history is unavailable", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
 }, async (t) => {
@@ -2172,13 +2169,6 @@ test("shows the timestamp limitation when native history falls back to ACP repla
   await waitFor(`document.querySelector("#messages").textContent.includes(
     "Native historical reply"
   )`);
-  assert.equal(await evaluate(`document.querySelector("#history-warning").hidden`), false);
-  assert.equal(
-    await evaluate(`document.querySelector("#history-warning").textContent.includes(
-      "recorded message timestamps are unavailable"
-    )`),
-    true
-  );
   assert.equal(
     await evaluate(`document.querySelectorAll(".message.assistant time.message-timestamp").length`),
     0
@@ -2347,7 +2337,6 @@ test("renders native completion times outside message content through refresh", 
   await waitFor(`${assistantBodies}.some((body) => body.textContent === "Done.")`);
   await waitFor(`${timestamps}.length === 2`);
   await waitFor(`${userTimestamps}.length === 2`);
-  assert.equal(await evaluate(`document.querySelector("#history-warning").hidden`), true);
   const todayCompletionTimestamp = new Date(Date.parse(todayTimestamp) + 300).toISOString();
   assert.equal(
     await evaluate(`${timestamps}[1].dateTime`),
@@ -2397,7 +2386,7 @@ test("renders native completion times outside message content through refresh", 
   );
 });
 
-test("shows command-only replies untimed without the history warning", {
+test("shows command-only replies untimed", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 30_000
 }, async (t) => {
@@ -2436,7 +2425,6 @@ test("shows command-only replies untimed without the history warning", {
   await waitFor(`document.querySelector("#messages").textContent.includes(${JSON.stringify(reloadReply)})`);
   await waitFor(`!document.querySelector("#reconnect-tools").disabled`);
   assert.deepEqual(await evaluate(chatTranscript), expected);
-  assert.equal(await evaluate(`document.querySelector("#history-warning").hidden`), true);
 
   await evaluate("window.beforeCommandReload = true");
   await command("Page.reload", {}, sessionId);
@@ -2445,7 +2433,6 @@ test("shows command-only replies untimed without the history warning", {
     document.querySelector("#messages")?.textContent.includes(${JSON.stringify(reloadReply)})
   `);
   assert.deepEqual(await evaluate(chatTranscript), expected);
-  assert.equal(await evaluate(`document.querySelector("#history-warning").hidden`), true);
 });
 
 function nativeTranscriptEvent(
@@ -2479,7 +2466,6 @@ test("does not shift or duplicate messages when native and ACP histories differ"
     name: string;
     events: JsonObject[];
     expected: Array<{ role: string; text: string; timed: boolean }>;
-    warning: boolean;
   }> = [
     {
       name: "tool calls separate replies within a turn",
@@ -2499,8 +2485,7 @@ test("does not shift or duplicate messages when native and ACP histories differ"
         { role: "assistant", text: "I will look at the file.", timed: true },
         { role: "assistant", text: "I looked at it.", timed: true },
         { role: "assistant", text: "Second answer", timed: true }
-      ],
-      warning: false
+      ]
     },
     {
       name: "assistant messages differ within a turn",
@@ -2521,8 +2506,7 @@ test("does not shift or duplicate messages when native and ACP histories differ"
         { role: "assistant", text: "ACP-only reply", timed: false },
         { role: "user", text: "Second question", timed: true },
         { role: "assistant", text: "Second answer", timed: true }
-      ],
-      warning: true
+      ]
     },
     {
       name: "a native-only turn is missing from ACP",
@@ -2543,8 +2527,7 @@ test("does not shift or duplicate messages when native and ACP histories differ"
         { role: "assistant", text: "First answer", timed: false },
         { role: "user", text: "Second question", timed: false },
         { role: "assistant", text: "Second answer", timed: false }
-      ],
-      warning: true
+      ]
     }
   ];
 
@@ -2564,10 +2547,6 @@ test("does not shift or duplicate messages when native and ACP histories differ"
       ).click()`);
       await waitFor(`document.querySelector("#messages").textContent.includes("Second answer")`);
       assert.deepEqual(await evaluate(chatTranscript), scenario.expected);
-      assert.equal(
-        await evaluate(`document.querySelector("#history-warning").hidden`),
-        !scenario.warning
-      );
       assert.equal(
         await evaluate(`document.querySelector("#messages").textContent.includes("Hidden native")`),
         false

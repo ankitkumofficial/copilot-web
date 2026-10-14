@@ -74,7 +74,6 @@ function createConversationState(sessionId = null) {
     nativeModeKnown: false,
     nativeEventIds: new Set(),
     pendingNativeMessages: [],
-    historyWarning: null,
     attachments: [],
     selections: [],
     nextSelectionNumber: 1,
@@ -541,7 +540,6 @@ const elements = {
   askSelection: document.querySelector("#ask-selection"),
   selectionList: document.querySelector("#selection-list"),
   selectionStatus: document.querySelector("#selection-status"),
-  historyWarning: document.querySelector("#history-warning"),
   emptyState: document.querySelector("#empty-state"),
   loadingState: document.querySelector("#loading-state"),
   composer: document.querySelector("#composer"),
@@ -3152,14 +3150,6 @@ function renderMessageTimestamp(article, message) {
   article.querySelector(".message-body")?.after(timestamp);
 }
 
-function renderHistoryWarning(conversation) {
-  const message = typeof conversation?.historyWarning === "string"
-    ? conversation.historyWarning
-    : "";
-  elements.historyWarning.textContent = message;
-  elements.historyWarning.hidden = message.length === 0;
-}
-
 let messagesRenderScheduled = false;
 const pendingMessageUpdates = new Map();
 
@@ -3969,7 +3959,6 @@ function renderMessages(conversation = activeConversation()) {
   const panelScrollPositions = captureMessagePanelScroll(conversation);
   elements.messages.replaceChildren();
   renderedMessagesConversation = conversation;
-  renderHistoryWarning(conversation);
   if (conversation?.loading === true) {
     clearMessageSelectionHighlight();
     hideAskSelection();
@@ -4798,13 +4787,6 @@ function handleSessionUpdate(params, expectedSessionId = null) {
     return;
   }
   const conversation = conversationState(sessionId);
-  if (params.nativeFallback === true && !conversation.historyWarning) {
-    conversation.historyWarning =
-      "Some messages are available only through ACP; their recorded timestamps are unavailable.";
-    if (isActiveConversation(conversation)) {
-      renderHistoryWarning(conversation);
-    }
-  }
   const update = params.update;
   const acpOnly = params.nativeFallback === true || params.nativeCommand === true;
   const chatRole = update.sessionUpdate === "user_message_chunk"
@@ -5524,7 +5506,6 @@ async function createServerConversation() {
     conversation.nativeModeKnown = true;
     conversation.nativeEventIds.clear();
     conversation.pendingNativeMessages = [];
-    conversation.historyWarning = result.historyWarning ?? null;
     conversation.promptQueue = [];
     resetRecoveredPrompt(conversation);
     resetStreamTracking(conversation);
@@ -5591,7 +5572,6 @@ function applySessionReplacement(result, previousSessionId) {
     if (typeof result.nativeMessageHistoryAvailable === "boolean") {
       conversation.nativeMessagesActive = result.nativeMessageHistoryAvailable;
       conversation.nativeModeKnown = true;
-      conversation.historyWarning = result.historyWarning ?? null;
     }
     for (const selection of conversation.selections) {
       if (selection.sessionId === previousSessionId) {
@@ -5672,7 +5652,6 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
   conversation.nativeModeKnown = false;
   conversation.nativeEventIds.clear();
   conversation.pendingNativeMessages = [];
-  conversation.historyWarning = null;
   conversation.promptQueue = [];
   resetStreamTracking(conversation);
   resetUsage(conversation);
@@ -5705,9 +5684,6 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
       : [];
     conversation.nativeMessagesActive = result.nativeMessagesActive === true;
     conversation.nativeModeKnown = true;
-    conversation.historyWarning = typeof result.historyWarning === "string"
-      ? result.historyWarning
-      : null;
     if (conversation.nativeMessagesActive || replayUpdates.length > 0) {
       conversation.messages = [];
       conversation.messageKeys.clear();

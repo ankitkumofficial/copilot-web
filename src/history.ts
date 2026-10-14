@@ -183,10 +183,6 @@ export class CopilotHistoryReader {
     return this.ready;
   }
 
-  public get unavailableReason(): string | undefined {
-    return this.failure;
-  }
-
   public async initialize(): Promise<void> {
     if (!this.options.sdkPath) {
       this.failure = "The installed Copilot SDK could not be found";
