@@ -539,7 +539,11 @@ export class AcpConnection {
               "user.message",
               "assistant.message_start",
               "assistant.message_delta",
-              "assistant.message"
+              "assistant.message",
+              // With native message events enabled, the CLI streams ACP thought chunks
+              // only when reasoning events are requested too.
+              "assistant.reasoning_delta",
+              "assistant.reasoning"
             ]
           }
         },

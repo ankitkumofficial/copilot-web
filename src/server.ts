@@ -1419,6 +1419,10 @@ async function main(): Promise<void> {
       }
       return;
     }
+    // ACP thought chunks drive the Reasoning panel; the raw native reasoning events are redundant.
+    if (event.params.type === "assistant.reasoning_delta" || event.params.type === "assistant.reasoning") {
+      return;
+    }
     publish("session-event", event.params, sessionId);
   });
   acp.events.on("permissionRequest", (event: ManagedPermissionRequestEvent) => {
