@@ -17,12 +17,18 @@ keeps the model, tools, authentication, and workspace local.
   into the browser.
 - Switch between conversations while another conversation is working; each
   conversation keeps its own transcript, prompt queue, draft, attachments,
-  cancellation state, streamed activities, and usage.
+  selected passages, cancellation state, streamed activities, and usage.
 - Recover an in-progress prompt after a browser refresh and continue showing
   its streamed result.
 - Reload a conversation after a CLI crash without duplicating its history or
   showing historical messages as new output.
 - Send prompts and receive streamed Copilot responses.
+- Select text in a user or Copilot message and choose **Ask Copilot** to attach
+  it as a numbered selection card; add multiple selections to one follow-up.
+  Composer cards and sent-message selection chips return to their source and
+  briefly highlight the selected text; sent-message formatting is restored
+  after a browser refresh. This formatting is stored in browser storage, capped
+  to recent entries, and pruned when a conversation no longer exists.
 - Dictate into the message composer with the microphone button; interim speech
   appears as text while recording, and the cross button stops recording while
   keeping the draft. This requires browser speech-recognition support and

@@ -1669,6 +1669,426 @@ test("shows a jump-to-bottom button without interrupting conversation scrolling"
   await waitFor(`${bottomDistance} < 1 && ${button}.hidden`);
 });
 
+test("attaches multiple selections and briefly highlights their source messages", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    historyText: "Earlier answer with a distinctive detail. Final response has the exact selected phrase."
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await command("Emulation.setDeviceMetricsOverride", {
+    width: 1200, height: 900, deviceScaleFactor: 1, mobile: false
+  }, sessionId);
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('button.session-item[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector('#messages').textContent.includes('distinctive detail')`);
+
+  const selectText = async (selector: string, text: string) => {
+    assert.equal(await evaluate(`
+      (() => {
+        document.querySelector("#messages").dispatchEvent(
+          new PointerEvent("pointerdown", { bubbles: true })
+        );
+        const root = document.querySelector(${JSON.stringify(selector)});
+        const selectedText = ${JSON.stringify(text)};
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        const selection = window.getSelection();
+        if (!selection) return false;
+        let node;
+        while ((node = walker.nextNode())) {
+          const start = node.textContent.indexOf(selectedText);
+          if (start < 0) continue;
+          const range = document.createRange();
+          range.setStart(node, start);
+          range.setEnd(node, start + selectedText.length);
+          selection.removeAllRanges();
+          selection.addRange(range);
+          return selection.toString() === selectedText;
+        }
+        return false;
+      })()
+    `), true, `Expected to select "${text}" in ${selector}`);
+    assert.equal(await evaluate(`document.querySelector("#ask-selection").hidden`), true);
+    await evaluate(`document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }))`);
+    await waitFor(`!document.querySelector('#ask-selection').hidden`);
+  };
+  const highlightedText = `(() => {
+    const highlight = window.CSS.highlights?.get("copilot-web-source-selection");
+    return highlight
+      ? [...highlight].map((range) => range.toString()).join("")
+      : window.getSelection().toString();
+  })()`;
+
+  await evaluate(`
+    (() => {
+      const input = document.querySelector("#prompt-input");
+      input.value = "Keep this question";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    })();
+  `);
+  await selectText(".message.user .message-body", "GoCD");
+  await evaluate(`document.querySelector("#ask-selection").click()`);
+  assert.equal(
+    await evaluate(`document.querySelector("#prompt-input").value`),
+    "Keep this question"
+  );
+  assert.equal(await evaluate(`document.querySelector("#selection-list").children.length`), 1);
+  assert.equal(
+    await evaluate(`document.querySelector(".selection-card-label").textContent`),
+    "Selection 1"
+  );
+
+  await selectText(
+    ".message.assistant .message-body",
+    "Final response has the exact selected phrase."
+  );
+  await evaluate(`document.querySelector("#ask-selection").click()`);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "Keep this question");
+  assert.deepEqual(await evaluate(`
+    [...document.querySelectorAll(".selection-card-label")].map((label) => label.textContent)
+  `), ["Selection 1", "Selection 2"]);
+
+  await evaluate(`document.querySelector('[aria-label="Jump to Selection 1 at its source"]').click()`);
+  await waitFor(`
+    ${highlightedText} === "GoCD" &&
+    (Boolean(window.CSS.highlights?.get("copilot-web-source-selection")) ||
+      document.querySelector(".message.user .message-body").classList.contains("selection-flash"))
+  `);
+  await waitFor(`
+    (() => {
+      const highlight = window.CSS.highlights?.get("copilot-web-source-selection");
+      const selection = window.getSelection();
+      const range = highlight
+        ? [...highlight][0]
+        : selection?.rangeCount
+          ? selection.getRangeAt(0)
+          : null;
+      if (!range) return false;
+      const rangeBounds = range.getBoundingClientRect();
+      const viewport = document.querySelector("#messages").getBoundingClientRect();
+      return rangeBounds.top >= viewport.top && rangeBounds.bottom <= viewport.bottom;
+    })()
+  `);
+  assert.equal(
+    await evaluate(`
+      (() => {
+        const custom = Boolean(window.CSS.highlights?.get("copilot-web-source-selection"));
+        const element = document.querySelector(".message.user .message-text");
+        const pseudo = custom
+          ? "::highlight(copilot-web-source-selection)"
+          : "::selection";
+        return getComputedStyle(element, pseudo).backgroundColor;
+      })()
+    `),
+    "rgb(245, 215, 126)"
+  );
+  await waitFor(`
+    !window.CSS.highlights?.has("copilot-web-source-selection") &&
+    window.getSelection().toString() === "" &&
+    !document.querySelector(".message.user .message-body").classList.contains("selection-flash")
+  `);
+
+  await evaluate(`document.querySelector('[aria-label="Jump to Selection 2 at its source"]').click()`);
+  await waitFor(`
+    ${highlightedText} === "Final response has the exact selected phrase." &&
+    (Boolean(window.CSS.highlights?.get("copilot-web-source-selection")) ||
+      document.querySelector(".message.assistant .message-body").classList.contains("selection-flash"))
+  `);
+  await waitFor(`
+    (() => {
+      const highlight = window.CSS.highlights?.get("copilot-web-source-selection");
+      const range = highlight
+        ? [...highlight][0]
+        : window.getSelection().getRangeAt(0);
+      const rangeBounds = range.getBoundingClientRect();
+      const viewport = document.querySelector("#messages").getBoundingClientRect();
+      return rangeBounds.top >= viewport.top && rangeBounds.bottom <= viewport.bottom;
+    })()
+  `);
+  await waitFor(`
+    !window.CSS.highlights?.has("copilot-web-source-selection") &&
+    window.getSelection().toString() === "" &&
+    !document.querySelector(".message.assistant .message-body").classList.contains("selection-flash")
+  `);
+
+  await evaluate(`document.querySelector("#composer").requestSubmit()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Done.")`);
+  const prompts = (await server.requests()).filter((request) => request.method === "session/prompt");
+  assert.equal(
+    prompts.at(-1)?.text,
+    "Keep this question\n\nSelected passages from the conversation:\nSelection 1:\n> GoCD\n\nSelection 2:\n> Final response has the exact selected phrase."
+  );
+  assert.equal(await evaluate(`document.querySelector("#selection-list").children.length`), 0);
+  assert.equal(
+    await evaluate(`document.querySelector(".message.user .message-selection-summary").textContent`),
+    "2 selections"
+  );
+  await evaluate(`document.querySelector(".message-selection-summary").click()`);
+  assert.equal(await evaluate(`document.querySelector(".message-selection-menu").hidden`), false);
+  await evaluate(`document.querySelector('[aria-label="Jump to Selection 2 at its source"]').click()`);
+  await waitFor(`
+    ${highlightedText} === "Final response has the exact selected phrase." &&
+    (Boolean(window.CSS.highlights?.get("copilot-web-source-selection")) ||
+      document.querySelector(".message.assistant .message-body").classList.contains("selection-flash"))
+  `);
+});
+
+test("keeps multi-block selections, Ask Copilot, and highlights through re-renders", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    promptDelayMs: 700,
+    historyText: "Intro paragraph text.\n\n- First list item\n- Second list item"
+  });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('button.session-item[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Second list item")`);
+
+  const compact = (value: string) => value.replace(/\s+/g, "");
+  const highlightedText = `(() => {
+    const highlight = window.CSS.highlights?.get("copilot-web-source-selection");
+    return highlight
+      ? [...highlight].map((range) => range.toString()).join("")
+      : window.getSelection().toString();
+  })()`;
+  const selectAcrossBlocks = `
+    (() => {
+      const body = document.querySelector(".message.assistant .message-body");
+      const paragraph = [...body.querySelectorAll("p")]
+        .find((element) => element.textContent.includes("paragraph text."));
+      const item = [...body.querySelectorAll("li")]
+        .find((element) => element.textContent.includes("Second list item"));
+      const startNode = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT).nextNode();
+      const endNode = document.createTreeWalker(item, NodeFilter.SHOW_TEXT).nextNode();
+      document.querySelector("#messages").dispatchEvent(
+        new PointerEvent("pointerdown", { bubbles: true })
+      );
+      const range = document.createRange();
+      range.setStart(startNode, startNode.textContent.indexOf("paragraph"));
+      range.setEnd(endNode, endNode.textContent.indexOf("Second") + "Second".length);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+      return selection.toString();
+    })()
+  `;
+
+  const selectedText = String(await evaluate(selectAcrossBlocks)).trim();
+  assert.equal(compact(selectedText), "paragraphtext.FirstlistitemSecond");
+  assert.match(selectedText, /\n/);
+  await waitFor(`!document.querySelector("#ask-selection").hidden`);
+  await evaluate(`document.querySelector("#ask-selection").click()`);
+  await evaluate(`document.querySelector('[aria-label="Jump to Selection 1 at its source"]').click()`);
+  await waitFor(`${highlightedText}.replace(/\\s+/g, "") === "paragraphtext.FirstlistitemSecond"`);
+  assert.equal(await evaluate(`document.querySelector("#selection-status").hidden`), true);
+
+  assert.equal((await server.post("messages", { text: "highlight survives rendering" })).status, 200);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Done.")`);
+  assert.equal(
+    compact(String(await evaluate(highlightedText))),
+    "paragraphtext.FirstlistitemSecond"
+  );
+  await waitFor(`
+    !window.CSS.highlights?.has("copilot-web-source-selection") &&
+    !document.querySelector(".message-body.selection-flash")
+  `);
+
+  await evaluate(selectAcrossBlocks);
+  await waitFor(`!document.querySelector("#ask-selection").hidden`);
+  const responsePosted = server.post("messages", { text: "selection survives streaming" });
+  await waitFor(`document.querySelector("#messages").textContent.match(/Done\\./g)?.length === 2`);
+  assert.equal((await responsePosted).status, 200);
+  assert.equal(await evaluate(`document.querySelector("#ask-selection").hidden`), false);
+  assert.equal(
+    compact(String(await evaluate(`window.getSelection().toString()`))),
+    "paragraphtext.FirstlistitemSecond"
+  );
+  await evaluate(`document.querySelector("#ask-selection").click()`);
+  assert.deepEqual(await evaluate(`
+    [...document.querySelectorAll(".selection-card-label")].map((label) => label.textContent)
+  `), ["Selection 1", "Selection 2"]);
+});
+
+test("restores sent selection chips and source links after a page refresh", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`
+    Boolean(document.querySelector("#send-prompt")) &&
+    !document.querySelector("#send-prompt").disabled
+  `);
+  await waitFor(`
+    document.querySelector("#model-select")?.disabled === false &&
+    !document.querySelector("#send-prompt").disabled
+  `);
+
+  await evaluate(`
+    (() => {
+      const input = document.querySelector("#prompt-input");
+      input.value = "The original source marker is here.";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector("#composer").requestSubmit();
+    })();
+  `);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Done.")`);
+  assert.equal(
+    await evaluate(`typeof window.localStorage.getItem("copilot-web-active-session")`),
+    "string"
+  );
+
+  await evaluate(`
+    (() => {
+      const messages = document.querySelector("#messages");
+      messages.scrollTop = 0;
+      messages.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      const root = document.querySelector(".message.user .message-body");
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const selection = window.getSelection();
+      let node;
+      while ((node = walker.nextNode())) {
+        const start = node.textContent.indexOf("source marker");
+        if (start < 0) continue;
+        const range = document.createRange();
+        range.setStart(node, start);
+        range.setEnd(node, start + "source marker".length);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        break;
+      }
+    })();
+  `);
+  assert.equal(await evaluate(`document.querySelector("#ask-selection").hidden`), true);
+  await evaluate(`document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }))`);
+  await waitFor(`!document.querySelector("#ask-selection").hidden`);
+  await evaluate(`document.querySelector("#ask-selection").click()`);
+  assert.equal(await evaluate(`document.querySelector("#selection-list").children.length`), 1);
+
+  await evaluate(`
+    (() => {
+      const input = document.querySelector("#prompt-input");
+      input.value = "Explain this selected passage.";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector("#composer").requestSubmit();
+    })();
+  `);
+  await waitFor(`document.querySelector("#messages").textContent.match(/Done\\./g)?.length === 2`);
+  assert.equal(
+    await evaluate(`Boolean(window.localStorage.getItem("copilot-web-selection-messages"))`),
+    true
+  );
+
+  await evaluate(`window.beforeSelectionReload = true`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`
+    !window.beforeSelectionReload &&
+    (() => {
+      const messages = document.querySelector("#messages");
+      if (!messages || messages.getAttribute("aria-busy") !== "false") return false;
+      const users = messages.querySelectorAll(".message.user");
+      const latest = users[users.length - 1];
+      return latest?.querySelector(".message-selection-summary")?.textContent === "1 selection" &&
+        latest.querySelector(".message-body")?.textContent === "Explain this selected passage.";
+    })()
+  `);
+
+  await evaluate(`document.querySelector(".message-selection-summary").click()`);
+  await waitFor(`
+    (window.CSS.highlights?.get("copilot-web-source-selection")
+      ? [...window.CSS.highlights.get("copilot-web-source-selection")].map((range) => range.toString()).join("")
+      : window.getSelection().toString()) === "source marker"
+  `);
+
+  await evaluate(`
+    (() => {
+      window.beforeStaleSelectionReload = true;
+      const key = "copilot-web-selection-messages";
+      const stored = JSON.parse(window.localStorage.getItem(key));
+      const [activeSessionId] = Object.keys(stored);
+      const entry = stored[activeSessionId][0];
+      const original = entry.selections[0];
+      entry.selections = [
+        { ...original, messageIndex: original.messageIndex + 3, sourceOrdinal: undefined },
+        {
+          ...original,
+          id: "selection-2",
+          number: 2,
+          text: "text that no longer exists",
+          startPath: [],
+          endPath: [],
+          startOffset: 0,
+          endOffset: 0
+        }
+      ];
+      stored["ghost-session"] = [{ ...entry, createdAt: 0 }];
+      window.localStorage.setItem(key, JSON.stringify(stored));
+    })();
+  `);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`
+    !window.beforeStaleSelectionReload &&
+    (() => {
+      const messages = document.querySelector("#messages");
+      const users = messages?.querySelectorAll(".message.user");
+      const latest = users?.[users.length - 1];
+      return messages?.getAttribute("aria-busy") === "false" &&
+        latest?.querySelector(".message-selection-summary")?.textContent === "2 selections";
+    })()
+  `);
+  await waitFor(`
+    !Object.hasOwn(
+      JSON.parse(window.localStorage.getItem("copilot-web-selection-messages")),
+      "ghost-session"
+    )
+  `);
+  await evaluate(`document.querySelector(".message-selection-summary").click()`);
+  await evaluate(`document.querySelector('[aria-label="Jump to Selection 1 at its source"]').click()`);
+  await waitFor(`
+    (window.CSS.highlights?.get("copilot-web-source-selection")
+      ? [...window.CSS.highlights.get("copilot-web-source-selection")].map((range) => range.toString()).join("")
+      : window.getSelection().toString()) === "source marker"
+  `);
+  assert.equal(await evaluate(`document.querySelector("#selection-status").hidden`), true);
+  await evaluate(`document.querySelector(".message-selection-summary").click()`);
+  await evaluate(`document.querySelector('[aria-label="Jump to Selection 2 at its source"]').click()`);
+  await waitFor(`
+    !document.querySelector("#selection-status").hidden &&
+    document.querySelector("#selection-status").textContent ===
+      "The selected text is no longer available in this conversation." &&
+    document.querySelector("#selection-status").getBoundingClientRect().height > 0
+  `);
+
+  await evaluate(`
+    window.beforeLegacySelectionReload = true;
+    window.localStorage.removeItem("copilot-web-selection-messages");
+  `);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`
+    !window.beforeLegacySelectionReload &&
+    (() => {
+      const messages = document.querySelector("#messages");
+      const users = messages?.querySelectorAll(".message.user");
+      const latest = users?.[users.length - 1];
+      return messages?.getAttribute("aria-busy") === "false" &&
+        latest?.querySelector(".message-selection-summary")?.textContent === "1 selection" &&
+        latest.querySelector(".message-body")?.textContent === "Explain this selected passage.";
+    })()
+  `);
+  await evaluate(`document.querySelector(".message-selection-summary").click()`);
+  await waitFor(`
+    (window.CSS.highlights?.get("copilot-web-source-selection")
+      ? [...window.CSS.highlights.get("copilot-web-source-selection")].map((range) => range.toString()).join("")
+      : window.getSelection().toString()) === "source marker"
+  `);
+});
+
 test("preserves the draft and attachments when an empty conversation changes model and context", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
