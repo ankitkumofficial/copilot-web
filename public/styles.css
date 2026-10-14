@@ -700,23 +700,6 @@ button:disabled {
   stroke-width: 1.8;
 }
 
-.message-retry {
-  margin-top: 8px;
-  padding: 5px 10px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: transparent;
-  color: var(--muted);
-  font-size: 0.78rem;
-}
-
-.message-retry:hover,
-.message-retry:focus-visible {
-  border-color: var(--accent);
-  background: var(--surface-hover);
-  color: var(--accent-strong);
-}
-
 .message-body {
   padding: 14px 16px;
   border: 1px solid var(--border);
@@ -1276,9 +1259,9 @@ button:disabled {
 }
 
 .composer-setting {
-  min-width: 100px;
-  max-width: 145px;
-  flex: 1 1 100px;
+  min-width: 0;
+  max-width: 100%;
+  flex: 0 1 auto;
 }
 
 .composer-setting span {
@@ -1286,7 +1269,7 @@ button:disabled {
 }
 
 .composer-setting select {
-  padding: 6px 22px 6px 8px;
+  padding: 6px 12px 6px 8px;
   font-size: 0.74rem;
 }
 

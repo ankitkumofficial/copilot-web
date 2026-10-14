@@ -93,7 +93,6 @@ function createConversationState(sessionId = null) {
     status: "Ready",
     busy: false,
     activePromptKey: null,
-    activePrompt: null,
     cancelRequested: false,
     recoveredPrompt: false,
     recoveredPromptId: null,
@@ -753,9 +752,6 @@ function renderConfigurationControls() {
   );
   const reloadDisabled = !canReloadMcp(conversation);
   elements.reconnectTools.disabled = reloadDisabled;
-  for (const retry of elements.messages.querySelectorAll(".message-retry")) {
-    retry.disabled = reloadDisabled;
-  }
 }
 
 function applySessionSetup(result, context, conversation = activeConversation() ?? state.composer) {
@@ -2015,7 +2011,6 @@ async function addFiles(fileList) {
 
   conversation.attachmentBusy = true;
   updateAttachmentControls();
-  renderRetryActions(conversation);
   const errors = [];
   let added = 0;
   try {
@@ -2072,7 +2067,6 @@ async function addFiles(fileList) {
     if (isActiveConversation(conversation) || conversation === state.composer) {
       updateAttachmentControls();
     }
-    renderRetryActions(conversation);
   }
 
   if (errors.length > 0) {
@@ -2505,24 +2499,6 @@ function updateContentText(update) {
   return typeof update.text === "string" ? update.text : "";
 }
 
-function isMcpFailure(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  const lines = message.split(/\r?\n/);
-  const mcpContext = /\bmcp(?:[ \t]*:|[ \t]+(?:server|connection|transport|protocol|client|session|reload|request|error|failure)\b)/i;
-  const failure = /\b(?:failed|failure|error|closed|disconnected|refused|unavailable|timed out|timeout|not connected|not running)\b/i;
-  return lines.some((line, index) => {
-    if (!mcpContext.test(line)) {
-      return false;
-    }
-    if (failure.test(line)) {
-      return true;
-    }
-    const nextLine = lines[index + 1] ?? "";
-    return /^\s*(?:error|failed|failure|connection|transport|protocol|timeout|timed out|disconnected)\b/i.test(nextLine) &&
-      failure.test(nextLine);
-  });
-}
-
 function upsertThinking(update, conversation = activeConversation() ?? state.composer) {
   const thought = updateContentText(update);
   if (thought.length === 0) {
@@ -2562,13 +2538,6 @@ function upsertToolActivity(update, conversation = activeConversation() ?? state
   const detail = updateContentText(update).trim();
   if (detail.length > 0) {
     activity.detail = detail;
-  }
-  if (
-    activity.status.toLowerCase() === "failed" &&
-    conversation.activePrompt &&
-    isMcpFailure(activity.detail)
-  ) {
-    markPromptRetryable(conversation.activePrompt, conversation);
   }
   scheduleMessagesRender(conversation, group);
 }
@@ -3032,16 +3001,6 @@ function renderMessages(conversation = activeConversation()) {
     body.className = "message-body";
     renderMessageBody(body, message);
     article.append(header, body);
-    if (message.role === "user" && message.retryPrompt) {
-      const retry = document.createElement("button");
-      retry.type = "button";
-      retry.className = "message-retry";
-      retry.textContent = "Reconnect & retry";
-      retry.title = "Reload MCP connections and retry the whole prompt";
-      retry.disabled = !canReloadMcp(conversation);
-      retry.addEventListener("click", () => retryFailedPrompt(message, conversation));
-      article.append(retry);
-    }
     elements.messages.append(article);
     restoreMessagePanelScroll(article, message, panelScrollPositions);
   }
@@ -3052,12 +3011,6 @@ function renderMessages(conversation = activeConversation()) {
     elements.messages.scrollLeft = previousScrollLeft;
   }
   updateScrollToBottomButton();
-}
-
-function renderRetryActions(conversation) {
-  if (conversation.messages.some((message) => message.retryPrompt)) {
-    renderMessages(conversation);
-  }
 }
 
 function setBusy(value, conversation = activeConversation()) {
@@ -3088,7 +3041,6 @@ function setBusy(value, conversation = activeConversation()) {
     renderConnectionStatus();
     renderConversationControls();
   }
-  renderRetryActions(conversation);
 }
 
 function stopRecoveredPromptPolling(conversation = activeConversation()) {
@@ -3249,7 +3201,6 @@ function setConfigurationBusy(value, conversation = activeConversation()) {
     updateAttachmentControls();
     renderConversationControls();
   }
-  renderRetryActions(conversation);
 }
 
 function addMessage(
@@ -3280,22 +3231,6 @@ function addMessage(
   if (key) {
     conversation.messageKeys.set(key, index);
   }
-  scheduleMessagesRender(conversation, message);
-}
-
-function markPromptRetryable(queuedPrompt, conversation) {
-  const messageIndex = conversation.messageKeys.get(queuedPrompt.messageKey);
-  if (messageIndex === undefined) {
-    return;
-  }
-  const message = conversation.messages[messageIndex];
-  if (!message || message.role !== "user") {
-    return;
-  }
-  message.retryPrompt = {
-    text: queuedPrompt.text,
-    attachments: queuedPrompt.attachments.map((attachment) => ({ ...attachment }))
-  };
   scheduleMessagesRender(conversation, message);
 }
 
@@ -4323,7 +4258,6 @@ async function drainPromptQueue(conversation = activeConversation()) {
       conversation.currentToolGroupKey = `tool-group:${queuedPrompt.messageKey}`;
       conversation.lastStreamRole = "user";
       conversation.currentAssistantMessageKey = null;
-      conversation.activePrompt = queuedPrompt;
       setStatus(
         queuedPrompt.reconnect
           ? "Reloading MCP connections..."
@@ -4334,7 +4268,6 @@ async function drainPromptQueue(conversation = activeConversation()) {
       );
       const controller = new AbortController();
       conversation.promptRequestController = controller;
-      let promptCompleted = false;
       try {
         const result = await api(`/api/sessions/${encodeURIComponent(queuedPrompt.sessionId)}/messages`, {
           method: "POST",
@@ -4351,7 +4284,6 @@ async function drainPromptQueue(conversation = activeConversation()) {
             }))
           })
         });
-        promptCompleted = true;
         if (conversation.promptRunId !== runId) {
           return;
         }
@@ -4369,15 +4301,9 @@ async function drainPromptQueue(conversation = activeConversation()) {
           return;
         }
         finalStatus = "Something went wrong";
-        if (!promptCompleted && isMcpFailure(error)) {
-          markPromptRetryable(queuedPrompt, conversation);
-        }
         showError(error, conversation);
         conversation.cancelRequested = false;
       } finally {
-        if (conversation.activePrompt === queuedPrompt) {
-          conversation.activePrompt = null;
-        }
         if (conversation.promptRequestController === controller) {
           conversation.promptRequestController = null;
         }
@@ -4490,28 +4416,6 @@ function enqueuePrompt(conversation, text, attachments, reconnect = false) {
     return;
   }
   void drainPromptQueue(conversation);
-}
-
-function retryFailedPrompt(message, conversation) {
-  const retryPrompt = message.retryPrompt;
-  if (!retryPrompt || !canReloadMcp(conversation)) {
-    return;
-  }
-  if (!window.confirm(
-    "MCP connections will reload before rerunning the entire prompt. " +
-    "Actions that already completed may be repeated. Continue?"
-  )) {
-    return;
-  }
-
-  message.retryPrompt = null;
-  scheduleMessagesRender(conversation, message);
-  enqueuePrompt(
-    conversation,
-    retryPrompt.text,
-    retryPrompt.attachments.map((attachment) => ({ ...attachment })),
-    true
-  );
 }
 
 function reconnectTools() {
