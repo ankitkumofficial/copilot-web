@@ -1732,6 +1732,15 @@ async function main(): Promise<void> {
       }
       const nativeMcpReload = typeof body.text === "string" &&
         body.text.trim() === "/mcp reload";
+      if (
+        body.reconnect === true &&
+        (!nativeMcpReload || (Array.isArray(body.attachments) && body.attachments.length > 0))
+      ) {
+        throw new HttpError(
+          400,
+          "reconnect can only be used with /mcp reload and no attachments"
+        );
+      }
       const reloadMcp = body.reconnect === true || nativeMcpReload;
       if ([...busySessions.values()].some((prompt) => prompt.reloadingMcp)) {
         throw new HttpError(409, "MCP connections are currently reloading");
@@ -1780,15 +1789,10 @@ async function main(): Promise<void> {
             acp.reloadMcpServers(session, busyPrompt.cancelController.signal)
           ));
           ensureSessionAvailable(sessionId);
-          busyPrompt.reloadingMcp = nativeMcpReload;
         }
-        const reloadOnly = body.reconnect === true &&
-          prompt.length === 1 &&
-          prompt[0]?.type === "text" &&
-          prompt[0].text.trim() === "/mcp reload";
         if (busyPrompt.cancelController.signal.aborted) {
           stopReason = "cancelled";
-        } else if (!reloadOnly && stopReason !== "cancelled") {
+        } else if (body.reconnect !== true) {
           stopReason = await acp.prompt(session, prompt, busyPrompt.cancelController.signal);
         }
         jsonResponse(response, 200, { stopReason });

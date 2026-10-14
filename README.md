@@ -33,8 +33,10 @@ keeps the model, tools, authentication, and workspace local.
   sequentially.
 - Show cumulative conversation AI-credit usage when the Copilot CLI exposes it
   through ACP.
-- Keep usage metrics beside the model settings when space permits; selectors
-  shrink first, and narrow layouts wrap without overlapping action buttons.
+- Size the Model, Context, and Reasoning selectors to fit their longest option,
+  so selected names are never truncated. Usage metrics stay beside them when
+  space permits and wrap below them otherwise, without overlapping action
+  buttons.
 - Show Copilot reasoning text when the ACP stream exposes thought chunks.
 - Display tool activity while Copilot works.
 - Toggle **Keep awake** using the coffee-cup button immediately before
@@ -57,16 +59,10 @@ keeps the model, tools, authentication, and workspace local.
   tool is unavailable without attempting a call, or after refreshing the page.
   This uses the native `/mcp reload` ACP command without restarting the CLI,
   rerunning earlier actions, or clearing your draft.
-  Reload and retry controls remain disabled while any conversation has an
+  The reload control remains disabled while any conversation has an
   active or queued prompt, including background conversations.
   Server activity is tracked separately from local prompt queues, and delayed
   session or status responses cannot overwrite newer activity notifications.
-- Use **Reconnect & retry** after an MCP-related prompt or tool failure to
-  reload MCP connections before resubmitting the original text and attachments.
-  The action requires an explicit MCP error or connection-failure message;
-  tool titles and filenames alone do not qualify. Unidentified failures can
-  still be handled with **Reconnect tools**. Retrying reruns the entire prompt
-  and may repeat actions that already completed.
 - Approve or reject Copilot tool permission requests from the browser.
 - Cancel an in-progress prompt.
 - Switch the active model when Copilot exposes model choices.
@@ -214,7 +210,7 @@ brand mark uses `C`.
 - Tool recovery requires the CLI to advertise the native `/mcp` command through
   ACP. Recovery waits up to five seconds for delayed command metadata and
   reports an explicit timeout if it never arrives. Cancelling during that wait
-  prevents the reload and prompt retry. It reloads configured MCP servers but
+  prevents the reload. It reloads configured MCP servers but
   does not guarantee that every server reconnects successfully or permanently
   fix upstream lifecycle bugs.
   Verify recovery with a fresh tool call; a cached status is not sufficient.
