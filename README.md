@@ -47,7 +47,7 @@ keeps the model, tools, authentication, and workspace local.
   so selected names are never truncated. Usage metrics stay beside them when
   space permits and wrap below them otherwise, without overlapping action
   buttons.
-- Show Copilot reasoning text when the ACP stream exposes thought chunks.
+- Show Copilot reasoning text when the ACP stream or persisted history exposes it.
 - Display tool activity while Copilot works.
 - Toggle **Keep awake** using the coffee-cup button immediately before
   **Reconnect tools** in the message bar. It uses the browser's Screen Wake Lock
@@ -260,8 +260,9 @@ translates ACP JSON-RPC messages into a small HTTP/SSE API. The static browser
 client consumes that API; Copilot credentials, model calls, file access, shell
 commands, MCP servers, and tool execution remain in the local CLI process.
 Native user and assistant messages are sourced from the Copilot event stream
-and read-only persisted-event snapshots; ACP remains authoritative for tools,
-reasoning, and configuration activity.
+and read-only persisted-event snapshots; ACP remains authoritative for tools
+and configuration activity, with persisted assistant reasoning restored when
+available.
 
 ## Configuration
 
