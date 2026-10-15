@@ -908,6 +908,11 @@ async function main(): Promise<void> {
     ".copilot-web",
     "session-activity.json"
   );
+  const sessionPreferencesPath = path.join(
+    os.homedir(),
+    ".copilot-web",
+    "session-preferences.json"
+  );
   const sessionTitleOverrides = await loadSessionTitleOverrides(sessionTitlesPath);
   const sessionUsageCache = await loadSessionUsage(sessionUsagePath);
   const sessionActivityCache = await loadSessionActivity(sessionActivityPath);
@@ -917,7 +922,8 @@ async function main(): Promise<void> {
     cwd: projectsDirectory,
     clientVersion: applicationVersion,
     clientTitle: branding.brandName,
-    allowAll
+    allowAll,
+    preferencesPath: sessionPreferencesPath
   });
   await acp.start();
   const copilotHistory = new CopilotHistoryReader({
@@ -1849,7 +1855,12 @@ async function main(): Promise<void> {
         const previousContext = acp.getSessionContext(sessionId);
         const busyPrompt = busySessions.get(sessionId);
         const busy = busyPrompt !== undefined;
-        const requestedContext = parseContext(body.context ?? previousContext);
+        // An explicit context switches profiles; otherwise reuse the conversation's last context.
+        const requestedContext = parseContext(
+          body.context ??
+          acp.getPreferredSessionContext(sessionId) ??
+          body.fallbackContext
+        );
         const context = busy
           ? previousContext ?? requestedContext
           : requestedContext;

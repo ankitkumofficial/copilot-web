@@ -1,5 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import path from "node:path";
 
 import { SerialTaskQueue } from "./persistence.js";
 
@@ -913,6 +916,10 @@ export class AcpConnectionManager {
   private readonly connections = new Map<string, AcpConnection>();
   private readonly sessionConnections = new Map<string, AcpConnection>();
   private readonly sessionConfigPreferences = new Map<string, Map<string, string | boolean>>();
+  private readonly sessionContextPreferences = new Map<string, ContextTier>();
+  private readonly preferencesPath: string | undefined;
+  private readonly preferenceWrites = new SerialTaskQueue();
+  private preferencesLoad: Promise<void> | undefined;
   private readonly profileDefaults = new Map<string, SessionSetup>();
   private readonly unpromptedSessions = new Set<string>();
   private readonly replacedSessions = new Set<string>();
@@ -929,16 +936,25 @@ export class AcpConnectionManager {
     clientVersion: string;
     clientTitle?: string;
     allowAll?: boolean;
+    preferencesPath?: string;
   }) {
     this.command = options.command;
     this.cwd = options.cwd;
     this.clientVersion = options.clientVersion;
     this.clientTitle = options.clientTitle ?? "Copilot Web";
     this.allowAll = options.allowAll === true;
+    this.preferencesPath = options.preferencesPath;
   }
 
   public async start(context: ContextTier = "default"): Promise<void> {
+    await this.loadPersistedPreferences();
     await this.getConnection(context);
+  }
+
+  /** The context last used by a conversation, including one recorded before a restart. */
+  public getPreferredSessionContext(sessionId: string): ContextTier | undefined {
+    return this.sessionConnections.get(sessionId)?.context ??
+      this.sessionContextPreferences.get(sessionId);
   }
 
   public getCapabilities(context: ContextTier = "default"): AgentCapabilities {
@@ -1007,9 +1023,13 @@ export class AcpConnectionManager {
         configOverrides,
         fallbackConfigIds
       );
-      this.rememberSessionConfig(configuredSetup.sessionId, configuredSetup.configOptions);
-      this.sessionConnections.set(configuredSetup.sessionId, connection);
       this.unpromptedSessions.add(configuredSetup.sessionId);
+      this.rememberSessionConfig(
+        configuredSetup.sessionId,
+        configuredSetup.configOptions,
+        connection.context
+      );
+      this.sessionConnections.set(configuredSetup.sessionId, connection);
       return configuredSetup;
     } catch (error) {
       if (!this.stopping && connection.getCapabilities().sessionCapabilities.close) {
@@ -1034,6 +1054,7 @@ export class AcpConnectionManager {
     context: ContextTier,
     model?: string
   ): Promise<SessionSetup> {
+    await this.loadPersistedPreferences();
     const preferredModel = model ??
       this.sessionConfigPreferences.get(session.sessionId)?.get("model");
     const connection = await this.getConnection(
@@ -1070,7 +1091,11 @@ export class AcpConnectionManager {
         this.unpromptedSessions.add(restoredSetup.sessionId);
       }
       this.sessionConnections.set(restoredSetup.sessionId, connection);
-      this.rememberSessionConfig(restoredSetup.sessionId, restoredSetup.configOptions);
+      this.rememberSessionConfig(
+        restoredSetup.sessionId,
+        restoredSetup.configOptions,
+        connection.context
+      );
       return restoredSetup;
     } catch (error) {
       if (!this.stopping && (replaceSession || (previousConnection && previousConnection !== connection))) {
@@ -1135,6 +1160,7 @@ export class AcpConnectionManager {
       const preferences = this.sessionConfigPreferences.get(session.sessionId) ?? new Map();
       preferences.set(configId, value);
       this.sessionConfigPreferences.set(session.sessionId, preferences);
+      this.schedulePreferencesSave();
       return { sessionId: session.sessionId, configOptions };
     });
   }
@@ -1156,9 +1182,15 @@ export class AcpConnectionManager {
       if (signal?.aborted) {
         return "cancelled";
       }
-      this.unpromptedSessions.delete(session.sessionId);
+      if (this.unpromptedSessions.delete(session.sessionId)) {
+        this.schedulePreferencesSave();
+      }
       const result = await connection.prompt(session, prompt);
-      this.rememberSessionConfig(session.sessionId, connection.getConfigOptions(session.sessionId));
+      this.rememberSessionConfig(
+        session.sessionId,
+        connection.getConfigOptions(session.sessionId),
+        connection.context
+      );
       return result;
     });
   }
@@ -1179,8 +1211,12 @@ export class AcpConnectionManager {
 
   public forgetSession(sessionId: string): void {
     this.sessionConnections.delete(sessionId);
-    this.sessionConfigPreferences.delete(sessionId);
+    const hadPreferences = this.sessionConfigPreferences.delete(sessionId);
+    const hadContext = this.sessionContextPreferences.delete(sessionId);
     this.unpromptedSessions.delete(sessionId);
+    if (hadPreferences || hadContext) {
+      this.schedulePreferencesSave();
+    }
   }
 
   public async deleteSession(sessionId: string): Promise<void> {
@@ -1209,9 +1245,11 @@ export class AcpConnectionManager {
     this.stopping = true;
     await Promise.all([...this.connections.values()].map((connection) => connection.stop()));
     await Promise.all([...this.sessionOperations.values()].map(({ queue }) => queue.flush()));
+    await this.preferenceWrites.flush();
     this.connections.clear();
     this.sessionConnections.clear();
     this.sessionConfigPreferences.clear();
+    this.sessionContextPreferences.clear();
     this.profileDefaults.clear();
     this.unpromptedSessions.clear();
     this.replacedSessions.clear();
@@ -1269,7 +1307,10 @@ export class AcpConnectionManager {
       await previous.start();
     }
     if (!previous?.isSessionLoaded(session.sessionId)) {
-      const setup = await this.loadSessionInternal(session, previous?.context ?? "default");
+      const setup = await this.loadSessionInternal(
+        session,
+        previous?.context ?? this.sessionContextPreferences.get(session.sessionId) ?? "default"
+      );
       if (setup.sessionId !== session.sessionId) {
         throw new AcpError("This empty conversation was replaced; reload its new session before continuing");
       }
@@ -1408,7 +1449,13 @@ export class AcpConnectionManager {
     };
   }
 
-  private rememberSessionConfig(sessionId: string, configOptions: JsonObject[]): void {
+  private rememberSessionConfig(
+    sessionId: string,
+    configOptions: JsonObject[],
+    context: ContextTier
+  ): void {
+    let changed = this.sessionContextPreferences.get(sessionId) !== context;
+    this.sessionContextPreferences.set(sessionId, context);
     const preferences = this.sessionConfigPreferences.get(sessionId) ??
       new Map<string, string | boolean>();
     for (const configId of ["model", "reasoning_effort"]) {
@@ -1417,12 +1464,111 @@ export class AcpConnectionManager {
         option &&
         (typeof option.currentValue === "string" || typeof option.currentValue === "boolean")
       ) {
+        changed ||= preferences.get(configId) !== option.currentValue;
         preferences.set(configId, option.currentValue);
       }
     }
     if (preferences.size > 0) {
       this.sessionConfigPreferences.set(sessionId, preferences);
     }
+    if (changed) {
+      this.schedulePreferencesSave();
+    }
+  }
+
+  private loadPersistedPreferences(): Promise<void> {
+    this.preferencesLoad ??= this.readPersistedPreferences();
+    return this.preferencesLoad;
+  }
+
+  private async readPersistedPreferences(): Promise<void> {
+    if (!this.preferencesPath) {
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(this.preferencesPath, "utf8")) as unknown;
+    } catch (error) {
+      if (isRecord(error) && error.code === "ENOENT") {
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Unable to read conversation preferences at ${this.preferencesPath}: ${message}`
+      );
+    }
+    if (!isRecord(parsed)) {
+      throw new Error(`Conversation preferences at ${this.preferencesPath} are not a JSON object`);
+    }
+    for (const [sessionId, entry] of Object.entries(parsed)) {
+      if (!isRecord(entry)) {
+        continue;
+      }
+      // Preferences recorded by this process are newer than the persisted copy.
+      if (
+        (entry.context === "default" || entry.context === "long_context") &&
+        !this.sessionContextPreferences.has(sessionId)
+      ) {
+        this.sessionContextPreferences.set(sessionId, entry.context);
+      }
+      if (this.sessionConfigPreferences.has(sessionId)) {
+        continue;
+      }
+      const preferences = new Map<string, string | boolean>();
+      for (const configId of ["model", "reasoning_effort"]) {
+        const value = entry[configId];
+        if (typeof value === "string" || typeof value === "boolean") {
+          preferences.set(configId, value);
+        }
+      }
+      if (preferences.size > 0) {
+        this.sessionConfigPreferences.set(sessionId, preferences);
+      }
+    }
+  }
+
+  private schedulePreferencesSave(): void {
+    const filePath = this.preferencesPath;
+    if (!filePath || this.stopping) {
+      return;
+    }
+    void this.preferenceWrites.enqueue(async () => {
+      try {
+        await this.loadPersistedPreferences();
+      } catch {
+        // Keep an unreadable preferences file intact rather than replacing it.
+        return;
+      }
+      const sessionIds = new Set([
+        ...this.sessionContextPreferences.keys(),
+        ...this.sessionConfigPreferences.keys()
+      ]);
+      const snapshot: Record<string, Record<string, string | boolean>> = {};
+      for (const sessionId of [...sessionIds].sort()) {
+        // Empty sessions have no native history to reload after a restart.
+        if (this.unpromptedSessions.has(sessionId)) {
+          continue;
+        }
+        const entry: Record<string, string | boolean> = {};
+        const context = this.sessionContextPreferences.get(sessionId);
+        if (context) {
+          entry.context = context;
+        }
+        for (const [configId, value] of this.sessionConfigPreferences.get(sessionId) ?? []) {
+          entry[configId] = value;
+        }
+        snapshot[sessionId] = entry;
+      }
+      try {
+        await mkdir(path.dirname(filePath), { recursive: true });
+        const temporaryPath = `${filePath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+        await writeFile(temporaryPath, JSON.stringify(snapshot, null, 2) + "\n", "utf8");
+        await rename(temporaryPath, filePath);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[acp] Unable to persist conversation preferences: ${message}`);
+      }
+    });
   }
 
   private async restoreConfigOptions(

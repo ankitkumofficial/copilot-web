@@ -107,7 +107,11 @@ the value advertised for that model. Context is passed explicitly to the CLI
 as `--context default` or `--context long_context`. Each model/context profile
 uses a separate reusable ACP process, with the model also passed as `--model`.
 Changing model or context reloads the conversation through the selected profile,
-preserving its history and compatible reasoning preference. Profile changes and
+preserving its history and compatible reasoning preference. Each conversation's
+last-used context, model, and reasoning are stored in
+`~/.copilot-web/session-preferences.json`, so reopening it, including after a
+server restart, restores that profile instead of the current selector or
+Copilot defaults. Profile changes and
 prompts are serialized per conversation, while cancellation and permission
 responses remain available. Before the first prompt, changing profiles recreates
 the empty native session and updates its ID without losing the browser draft
@@ -172,6 +176,8 @@ Custom conversation titles are stored in
 `~/.copilot-web/session-titles.json`. Cumulative conversation AI-credit usage is
 stored in `~/.copilot-web/session-usage.json`, and last-activity timestamps used
 for sidebar ordering are stored in `~/.copilot-web/session-activity.json`.
+Per-conversation context, model, and reasoning preferences are stored in
+`~/.copilot-web/session-preferences.json`.
 These are web-interface metadata and do not modify the underlying Copilot
 session transcript. Selecting or loading a conversation does not update its
 last-activity timestamp. Writes to each metadata file are serialized and replace
