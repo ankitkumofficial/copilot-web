@@ -1440,6 +1440,7 @@ button:disabled {
   width: min(1200px, calc(100vw - 32px));
   max-width: calc(100vw - 32px);
   max-height: calc(100vh - 32px);
+  box-sizing: border-box;
   margin: auto;
   padding: 12px;
   border: 1px solid var(--border);
@@ -1456,13 +1457,17 @@ button:disabled {
 .image-preview-content {
   position: relative;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   place-items: center;
+  width: 100%;
+  min-width: 0;
   margin: 0;
 }
 
 .image-preview-image {
   display: block;
-  max-width: calc(100vw - 80px);
+  max-width: 100%;
+  min-width: 0;
   max-height: calc(100vh - 80px);
   border-radius: 8px;
   object-fit: contain;
