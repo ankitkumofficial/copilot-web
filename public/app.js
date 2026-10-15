@@ -2272,11 +2272,20 @@ function renderAttachmentList() {
     const chip = document.createElement("div");
     chip.className = "attachment-chip";
 
-    const preview = document.createElement("div");
+    const isImage = attachment.mimeType.startsWith("image/");
+    const preview = document.createElement(isImage ? "button" : "div");
     preview.className = "attachment-chip-preview";
-    if (attachment.mimeType.startsWith("image/")) {
+    if (isImage) {
+      preview.type = "button";
+      preview.classList.add("attachment-chip-image-preview");
+      preview.title = `Preview ${attachment.name}`;
+      preview.setAttribute("aria-label", `Preview ${attachment.name}`);
+      const source = attachmentDataUrl(attachment);
+      preview.addEventListener("click", () => {
+        openImagePreview(source, attachment.name);
+      });
       const image = document.createElement("img");
-      image.src = attachmentDataUrl(attachment);
+      image.src = source;
       image.alt = "";
       preview.append(image);
     } else {
