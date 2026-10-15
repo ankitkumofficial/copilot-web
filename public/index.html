@@ -125,7 +125,7 @@
           ></div>
           <textarea id="prompt-input" rows="1" placeholder="Message Copilot..." aria-label="Message Copilot"></textarea>
           <div id="attachment-list" class="attachment-list" aria-live="polite"></div>
-          <div id="drop-hint" class="drop-hint" hidden>Drop images or PDF files here</div>
+          <div id="drop-hint" class="drop-hint" hidden>Drop files here</div>
           <div class="composer-footer">
             <span id="composer-hint" class="visually-hidden" aria-live="polite"></span>
             <div class="composer-settings" aria-label="Model settings">
@@ -171,12 +171,12 @@
                   <path d="M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 17.9 17"></path>
                 </svg>
               </button>
-              <button id="attach-files" class="secondary-button icon-button" type="button" aria-label="Attach images or PDF files" title="Attach images or PDF files">
+              <button id="attach-files" class="secondary-button icon-button" type="button" aria-label="Attach files" title="Attach files">
                 <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
                   <path d="m20.5 11.5-8.1 8.1a5 5 0 0 1-7.1-7.1l8.5-8.5a3.5 3.5 0 0 1 5 5l-8.5 8.5a2 2 0 0 1-2.8-2.8l7.8-7.8"></path>
                 </svg>
               </button>
-              <input id="file-input" type="file" accept="image/*,.pdf,application/pdf" multiple hidden>
+              <input id="file-input" type="file" multiple hidden>
               <button id="voice-input" class="secondary-button icon-button" type="button" data-icon="microphone" aria-label="Start voice input" aria-pressed="false" aria-describedby="voice-input-status" title="Start voice input" disabled>
                 <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z"></path>

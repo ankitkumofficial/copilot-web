@@ -78,7 +78,7 @@ keeps the model, tools, authentication, and workspace local.
 - Switch the active model when Copilot exposes model choices.
 - Select the available reasoning effort levels.
 - Choose between the standard and long context tiers.
-- Attach images or PDF files to prompts by pasting, dragging and dropping, or
+- Attach files of any type to prompts by pasting, dragging and dropping, or
   using the attachment picker.
 - Render common Markdown formatting in assistant messages, including emphasis,
   headings, lists, links, inline code, code blocks, and quotes.
@@ -237,8 +237,14 @@ brand mark uses `C`.
   be shared. The server rejects reloads while any prompt is active and rejects
   new prompts during a reload, including manually submitted `/mcp reload`
   commands.
-- Prompt attachments are limited to images and PDFs, with an 8 MB per-file and
-  16 MB per-message total size limit.
+- Prompt attachments accept any file type, with a 10-file limit, an 8 MB
+  per-file limit, and a 16 MB per-message total size limit. Images require image
+  support from the active agent; other file types require embedded-context
+  support. Copilot CLI stores non-image attachments as temporary files with
+  generated names, so the model does not see the original filename and file
+  types without a known extension are saved as `.bin`. Copilot CLI history
+  does not keep the contents of non-image attachments, so they are not shown
+  again after a conversation is reloaded or the page is refreshed.
 - Long-running prompt turns remain active until Copilot completes, the user
   cancels them, or a new prompt requests an interruption; they are not cut off
   by the bridge's short request timeout.

@@ -176,23 +176,38 @@ test("normalizes native messages, reconstructs inline attachments, and deduplica
     data: {
       messageId: "user-1",
       content: "Review this image",
-      attachments: [{
-        type: "file",
-        displayName: "diagram.png",
-        mimeType: "image/png",
-        data: "aGVsbG8="
-      }]
+      attachments: [
+        {
+          type: "file",
+          displayName: "diagram.png",
+          mimeType: "image/png",
+          data: "aGVsbG8="
+        },
+        {
+          type: "file",
+          displayName: "notes.txt",
+          mimeType: "text/plain",
+          data: "dGV4dA=="
+        }
+      ]
     }
   });
   assert.deepEqual(user, {
     messageId: "user-1",
     role: "user",
     content: "Review this image",
-    attachments: [{
-      name: "diagram.png",
-      mimeType: "image/png",
-      data: "aGVsbG8="
-    }],
+    attachments: [
+      {
+        name: "diagram.png",
+        mimeType: "image/png",
+        data: "aGVsbG8="
+      },
+      {
+        name: "notes.txt",
+        mimeType: "text/plain",
+        data: "dGV4dA=="
+      }
+    ],
     completion: "completed",
     eventId: "user-event",
     revision: 1,
