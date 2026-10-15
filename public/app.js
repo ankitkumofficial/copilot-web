@@ -5710,7 +5710,8 @@ function applySessionReplacement(result, previousSessionId) {
   }
 }
 
-async function loadConversation(sessionId, requestedContext = state.selectedContext, force = false) {
+// Without a requested context, the server reuses the conversation's last context.
+async function loadConversation(sessionId, requestedContext = undefined, force = false) {
   if (state.deletingSessionId) {
     return false;
   }
@@ -5737,7 +5738,7 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
   if (
     !force &&
     conversation.loaded &&
-    conversation.sessionContext === requestedContext
+    (requestedContext === undefined || conversation.sessionContext === requestedContext)
   ) {
     activateConversation(sessionId);
     return true;
@@ -5765,12 +5766,16 @@ async function loadConversation(sessionId, requestedContext = state.selectedCont
     const request = beginServerPromptStateRequest();
     const result = await api(`/api/sessions/${encodeURIComponent(sessionId)}/load`, {
       method: "POST",
-      body: JSON.stringify({ context: requestedContext })
+      body: JSON.stringify(
+        requestedContext === undefined
+          ? { fallbackContext: state.selectedContext }
+          : { context: requestedContext }
+      )
     });
     applySessionReplacement(result, sessionId);
     const promptState = applyServerPromptState(conversation.sessionId, result, request);
     conversation.loaded = true;
-    applySessionSetup(result, requestedContext, conversation);
+    applySessionSetup(result, requestedContext ?? state.selectedContext, conversation);
     if (
       typeof result.session?.customTitle === "string" &&
       result.session.customTitle.length > 0
