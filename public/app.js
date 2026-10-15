@@ -2206,17 +2206,14 @@ function attachmentId() {
 
 function fileMimeType(file) {
   const declared = String(file.type ?? "").toLowerCase().split(";", 1)[0].trim();
-  if (declared.startsWith("image/") || declared === "application/pdf") {
+  if (declared && declared !== "application/octet-stream") {
     return declared;
   }
 
   const name = String(file.name ?? "").toLowerCase();
   const extension = name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
-  if (declared === "" || declared === "application/octet-stream") {
-    return imageMimeTypesByExtension[extension] ??
-      (extension === ".pdf" ? "application/pdf" : null);
-  }
-  return null;
+  return imageMimeTypesByExtension[extension] ??
+    (extension === ".pdf" ? "application/pdf" : "application/octet-stream");
 }
 
 function fileKey(file) {
@@ -2289,7 +2286,7 @@ function renderAttachmentList() {
       image.alt = "";
       preview.append(image);
     } else {
-      preview.textContent = "PDF";
+      preview.textContent = attachment.mimeType === "application/pdf" ? "PDF" : "FILE";
     }
 
     const copy = document.createElement("div");
@@ -2425,10 +2422,6 @@ async function addFiles(fileList) {
     for (const file of files) {
       const name = file.name || "attachment";
       const mimeType = fileMimeType(file);
-      if (!mimeType) {
-        errors.push(`${name} is not supported. Attach an image or PDF file.`);
-        continue;
-      }
       if (file.size > maximumAttachmentBytes) {
         errors.push(`${name} is too large. Files must be 8 MB or smaller.`);
         continue;
@@ -2536,10 +2529,10 @@ function attachmentCapabilityError(attachments) {
     return "This Copilot agent does not support image attachments.";
   }
   if (
-    attachments.some((attachment) => attachment.mimeType === "application/pdf") &&
+    attachments.some((attachment) => !attachment.mimeType.startsWith("image/")) &&
     promptCapabilities.embeddedContext !== true
   ) {
-    return "This Copilot agent does not support PDF attachments.";
+    return "This Copilot agent does not support file attachments.";
   }
   return null;
 }
@@ -3276,17 +3269,15 @@ function renderMessageAttachments(body, attachments) {
       image.alt = attachment.name;
       preview.append(image);
       item.append(preview);
-    } else if (attachment.mimeType === "application/pdf") {
+    } else {
       const link = document.createElement("a");
       link.className = "message-attachment-file";
       link.href = attachmentDataUrl(attachment);
       link.target = "_blank";
       link.rel = "noopener noreferrer";
       link.download = attachment.name;
-      link.textContent = `PDF: ${attachment.name}`;
+      link.textContent = `${attachment.mimeType === "application/pdf" ? "PDF" : "File"}: ${attachment.name}`;
       item.append(link);
-    } else {
-      continue;
     }
     list.append(item);
   }

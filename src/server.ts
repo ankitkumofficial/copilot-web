@@ -695,7 +695,7 @@ function parseContext(value: unknown): ContextTier {
   throw new HttpError(400, "Context must be default or long_context");
 }
 
-function inferredAttachmentMimeType(name: string): string | undefined {
+function inferredAttachmentMimeType(name: string): string {
   const extension = path.extname(name).toLowerCase();
   switch (extension) {
     case ".gif":
@@ -714,7 +714,7 @@ function inferredAttachmentMimeType(name: string): string | undefined {
     case ".pdf":
       return "application/pdf";
     default:
-      return undefined;
+      return "application/octet-stream";
   }
 }
 
@@ -725,7 +725,7 @@ function parseAttachmentMimeType(name: string, value: unknown): string {
   const mimeType = !declared || declared === "application/octet-stream"
     ? inferredAttachmentMimeType(name)
     : declared;
-  if (!mimeType || (!mimeType.startsWith("image/") && mimeType !== "application/pdf")) {
+  if (!/^[a-z0-9!#$%&'+.^_`|~-]+\/[a-z0-9!#$%&'+.^_`|~-]+$/.test(mimeType)) {
     throw new HttpError(400, `Unsupported attachment type for ${name}`);
   }
   return mimeType;
@@ -817,7 +817,7 @@ function parsePrompt(body: JsonObject, capabilities: AgentCapabilities): PromptC
     }
 
     if (!capabilities.promptCapabilities.embeddedContext) {
-      throw new HttpError(409, "This Copilot agent does not support PDF attachments");
+      throw new HttpError(409, "This Copilot agent does not support file attachments");
     }
     prompt.push({
       type: "resource",

@@ -1111,11 +1111,15 @@ test("preserves prompt text and attachments", async (t) => {
   const text = "prompt with attachments";
   const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=";
   const pdfData = Buffer.from("%PDF-1.4\n%%EOF").toString("base64");
+  const textData = Buffer.from("attachment text").toString("base64");
+  const binaryData = Buffer.from([0, 1, 2]).toString("base64");
   const response = await server.post("messages", {
     text,
     attachments: [
       { name: "image.png", mimeType: "image/png", data: imageData },
-      { name: "document.pdf", mimeType: "application/pdf", data: pdfData }
+      { name: "document.pdf", mimeType: "application/pdf", data: pdfData },
+      { name: "notes.txt", mimeType: "text/plain", data: textData },
+      { name: "archive.bin", data: binaryData }
     ]
   });
   assert.equal(response.status, 200);
@@ -1134,6 +1138,22 @@ test("preserves prompt text and attachments", async (t) => {
               uri: "urn:copilot-web:attachment:1:document.pdf",
               blob: pdfData,
               mimeType: "application/pdf"
+            }
+          },
+          {
+            type: "resource",
+            resource: {
+              uri: "urn:copilot-web:attachment:2:notes.txt",
+              blob: textData,
+              mimeType: "text/plain"
+            }
+          },
+          {
+            type: "resource",
+            resource: {
+              uri: "urn:copilot-web:attachment:3:archive.bin",
+              blob: binaryData,
+              mimeType: "application/octet-stream"
             }
           }
         ]
@@ -3704,6 +3724,81 @@ test("previews pending image attachments before sending", {
     !document.querySelector("#image-preview-image").hasAttribute("src")`);
   await evaluate(`document.querySelector("#attachment-list .attachment-remove").click()`);
   await waitFor(`document.querySelector("#attachment-list").children.length === 0`);
+});
+
+test("accepts arbitrary files from the picker and drag-and-drop", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="${server.sessionId}"]'))`);
+  await evaluate(`document.querySelector('button.session-item[data-session-id="${server.sessionId}"]').click()`);
+  await waitFor(`window.localStorage.getItem("copilot-web-active-session") === "${server.sessionId}" &&
+    document.querySelector("#attach-files").disabled === false`);
+  assert.equal(
+    await evaluate(`document.querySelector("#file-input").hasAttribute("accept")`),
+    false
+  );
+
+  await evaluate(`
+    const files = new DataTransfer();
+    files.items.add(new File(["picker content"], "notes.txt", { type: "text/plain" }));
+    const fileInput = document.querySelector("#file-input");
+    fileInput.files = files.files;
+    fileInput.dispatchEvent(new Event("change"));
+  `);
+  await waitFor(`document.querySelector("#attachment-list").textContent.includes("notes.txt")`);
+  assert.equal(
+    await evaluate(`document.querySelector("#attachment-list .attachment-chip-preview").textContent`),
+    "FILE"
+  );
+  await evaluate(`document.querySelector("#attachment-list .attachment-remove").click()`);
+  await waitFor(`document.querySelector("#attachment-list").children.length === 0`);
+
+  await evaluate(`
+    (() => {
+      const files = new DataTransfer();
+      files.items.add(new File(["drop content"], "document.odt", {
+        type: "application/vnd.oasis.opendocument.text"
+      }));
+      const composer = document.querySelector("#composer");
+      composer.dispatchEvent(new DragEvent("dragenter", {
+        bubbles: true, cancelable: true, dataTransfer: files
+      }));
+      composer.dispatchEvent(new DragEvent("dragover", {
+        bubbles: true, cancelable: true, dataTransfer: files
+      }));
+      composer.dispatchEvent(new DragEvent("drop", {
+        bubbles: true, cancelable: true, dataTransfer: files
+      }));
+    })();
+  `);
+  await waitFor(`document.querySelector("#attachment-list").textContent.includes("document.odt")`);
+  assert.equal(await evaluate(`document.querySelector("#drop-hint").hidden`), true);
+  await evaluate(`
+    const input = document.querySelector("#prompt-input");
+    input.value = "Review this file";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    document.querySelector("#send-prompt").click();
+  `);
+  await server.waitForPrompt("Review this file");
+  await waitFor(`document.querySelector("#messages").textContent.includes("Done.")`);
+  assert.equal(
+    await evaluate(`document.querySelector("#messages .message-attachment-file")?.textContent`),
+    "File: document.odt"
+  );
+
+  const prompt = (await server.requests()).find((request) => request.method === "session/prompt");
+  assert.ok(prompt && Array.isArray(prompt.prompt));
+  const fileBlock = prompt.prompt[1];
+  assert.ok(isRecord(fileBlock) && isRecord(fileBlock.resource));
+  assert.equal(fileBlock.type, "resource");
+  assert.equal(fileBlock.resource.mimeType, "application/vnd.oasis.opendocument.text");
+  assert.equal(
+    Buffer.from(String(fileBlock.resource.blob), "base64").toString(),
+    "drop content"
+  );
 });
 
 test("preserves the draft and attachments when an empty conversation changes model and context", {

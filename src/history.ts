@@ -5,6 +5,7 @@ import { isRecord, type JsonObject } from "./acp.js";
 
 const persistedEventPageSize = 200;
 const maximumPersistedHistoryPages = 10_000;
+const attachmentMimeTypePattern = /^[a-z0-9!#$%&'+.^_`|~-]+\/[a-z0-9!#$%&'+.^_`|~-]+$/;
 const nativeMessageEventTypes = new Set([
   "user.message",
   "assistant.message_start",
@@ -323,11 +324,15 @@ function attachmentName(attachment: JsonObject): string {
   return basename || "Attachment";
 }
 
-function attachmentMimeType(attachment: JsonObject): string | undefined {
+function attachmentMimeType(attachment: JsonObject): string {
   const mimeType = typeof attachment.mimeType === "string"
     ? attachment.mimeType.toLowerCase().split(";", 1)[0]?.trim()
     : undefined;
-  if (mimeType?.startsWith("image/") || mimeType === "application/pdf") {
+  if (
+    mimeType &&
+    mimeType !== "application/octet-stream" &&
+    attachmentMimeTypePattern.test(mimeType)
+  ) {
     return mimeType;
   }
   const name = attachmentName(attachment).toLowerCase();
@@ -352,7 +357,7 @@ function attachmentMimeType(attachment: JsonObject): string | undefined {
   if (name.endsWith(".svg")) {
     return "image/svg+xml";
   }
-  return undefined;
+  return "application/octet-stream";
 }
 
 function nativeAttachments(value: unknown): NativeAttachment[] {
