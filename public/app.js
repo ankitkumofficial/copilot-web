@@ -1,3 +1,5 @@
+import { inlineMarkdownToHtml, parseMarkdownList } from "./prompt-editor.js";
+
 const defaultBrandName = "Copilot Web";
 const defaultBrandInitial = "C";
 const contextStorageKey = "copilot-web-context";
@@ -330,7 +332,7 @@ function parseSelectionPrompt(text) {
 }
 
 function messageSelectionSearchText(message) {
-  if (message.role !== "assistant") {
+  if (message.role !== "assistant" && message.role !== "user") {
     return message.text;
   }
   const rendered = document.createElement("div");
@@ -1216,101 +1218,12 @@ function safeLink(value) {
 }
 
 function renderInlineMarkdown(value) {
-  let output = "";
-  let index = 0;
-  let plainTextStart = 0;
-
-  const flushPlainText = (end) => {
-    if (end > plainTextStart) {
-      output += escapeHtml(value.slice(plainTextStart, end)).replaceAll("\n", "<br>");
-    }
-  };
-
-  while (index < value.length) {
-    if (value[index] === "\\" && index + 1 < value.length) {
-      flushPlainText(index);
-      output += escapeHtml(value[index + 1]);
-      index += 2;
-      plainTextStart = index;
-      continue;
-    }
-
-    if (value[index] === "`") {
-      const closing = value.indexOf("`", index + 1);
-      if (closing > index + 1) {
-        flushPlainText(index);
-        output += `<code>${escapeHtml(value.slice(index + 1, closing))}</code>`;
-        index = closing + 1;
-        plainTextStart = index;
-        continue;
-      }
-    }
-
-    if (value[index] === "[" && value[index - 1] !== "!") {
-      const labelEnd = value.indexOf("]", index + 1);
-      if (labelEnd > index + 1 && value[labelEnd + 1] === "(") {
-        const targetEnd = value.indexOf(")", labelEnd + 2);
-        if (targetEnd > labelEnd + 2) {
-          const href = safeLink(value.slice(labelEnd + 2, targetEnd));
-          if (href) {
-            flushPlainText(index);
-            output += `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${renderInlineMarkdown(value.slice(index + 1, labelEnd))}</a>`;
-            index = targetEnd + 1;
-            plainTextStart = index;
-            continue;
-          }
-        }
-      }
-    }
-
-    const strongMarker = value.startsWith("**", index)
-      ? "**"
-      : value.startsWith("__", index)
-        ? "__"
-        : null;
-    if (strongMarker) {
-      const closing = value.indexOf(strongMarker, index + strongMarker.length);
-      if (closing > index + strongMarker.length) {
-        flushPlainText(index);
-        output += `<strong>${renderInlineMarkdown(value.slice(index + strongMarker.length, closing))}</strong>`;
-        index = closing + strongMarker.length;
-        plainTextStart = index;
-        continue;
-      }
-    }
-
-    if (value.startsWith("~~", index)) {
-      const closing = value.indexOf("~~", index + 2);
-      if (closing > index + 2) {
-        flushPlainText(index);
-        output += `<del>${renderInlineMarkdown(value.slice(index + 2, closing))}</del>`;
-        index = closing + 2;
-        plainTextStart = index;
-        continue;
-      }
-    }
-
-    const emphasisMarker = value[index] === "*" || value[index] === "_" ? value[index] : null;
-    if (emphasisMarker && !value.startsWith(emphasisMarker.repeat(2), index)) {
-      const closing = value.indexOf(emphasisMarker, index + 1);
-      const preceding = value[index - 1];
-      if (
-        closing > index + 1 &&
-        !(emphasisMarker === "_" && /[A-Za-z0-9]/.test(preceding ?? ""))
-      ) {
-        flushPlainText(index);
-        output += `<em>${renderInlineMarkdown(value.slice(index + 1, closing))}</em>`;
-        index = closing + 1;
-        plainTextStart = index;
-        continue;
-      }
-    }
-
-    index += 1;
-  }
-
-  flushPlainText(value.length);
-  return output;
+  return inlineMarkdownToHtml(value, {
+    resolveLink: safeLink,
+    linkAttributes: ' target="_blank" rel="noopener noreferrer"',
+    preserveDelimiters: false,
+    strikeTag: "del"
+  });
 }
 
 function splitTableRow(value) {
@@ -1500,35 +1413,11 @@ function renderMarkdown(value) {
       continue;
     }
 
-    const unorderedItem = line.match(/^ {0,3}[-+*]\s+(.+)$/);
-    if (unorderedItem) {
+    if (/^ *([-+*]|\d{1,9}[.)]) +/.test(line)) {
       flushParagraph();
-      const items = [];
-      while (index < lines.length) {
-        const item = lines[index].match(/^ {0,3}[-+*]\s+(.+)$/);
-        if (!item) {
-          break;
-        }
-        items.push(`<li>${renderInlineMarkdown(item[1])}</li>`);
-        index += 1;
-      }
-      blocks.push(`<ul>${items.join("")}</ul>`);
-      continue;
-    }
-
-    const orderedItem = line.match(/^ {0,3}\d+[.)]\s+(.+)$/);
-    if (orderedItem) {
-      flushParagraph();
-      const items = [];
-      while (index < lines.length) {
-        const item = lines[index].match(/^ {0,3}\d+[.)]\s+(.+)$/);
-        if (!item) {
-          break;
-        }
-        items.push(`<li>${renderInlineMarkdown(item[1])}</li>`);
-        index += 1;
-      }
-      blocks.push(`<ol>${items.join("")}</ol>`);
+      const list = parseMarkdownList(lines, index, renderInlineMarkdown);
+      blocks.push(list.html);
+      index = list.next;
       continue;
     }
 
@@ -2483,8 +2372,12 @@ async function addFiles(fileList) {
   }
 }
 
-function insertTextAtCursor(text) {
+function insertTextAtCursor(text, html = "") {
   const input = elements.input;
+  if (typeof input.insertClipboard === "function") {
+    input.insertClipboard({ text, html });
+    return;
+  }
   const start = input.selectionStart ?? input.value.length;
   const end = input.selectionEnd ?? start;
   input.setRangeText(text, start, end, "end");
@@ -2498,8 +2391,9 @@ function handlePaste(event) {
   }
   event.preventDefault();
   const text = event.clipboardData?.getData("text/plain") ?? "";
-  if (text) {
-    insertTextAtCursor(text);
+  const html = event.clipboardData?.getData("text/html") ?? "";
+  if (text || html) {
+    insertTextAtCursor(text, html);
   }
   void addFiles(files);
 }
@@ -2683,7 +2577,9 @@ function messageClipboardContent(message, button) {
   if (message.role !== "assistant") {
     return {
       text: fallbackText,
-      html: `<div>${escapeHtml(fallbackText).replaceAll("\n", "<br>")}</div>`
+      html: message.role === "user"
+        ? renderMarkdown(fallbackText)
+        : `<div>${escapeHtml(fallbackText).replaceAll("\n", "<br>")}</div>`
     };
   }
 
@@ -3127,7 +3023,11 @@ function renderMessageBody(body, message) {
     if (message.text) {
       const text = document.createElement("div");
       text.className = "message-text";
-      text.textContent = message.text;
+      if (message.role === "user") {
+        text.innerHTML = renderMarkdown(message.text);
+      } else {
+        text.textContent = message.text;
+      }
       body.append(text);
     }
     renderMessageAttachments(body, message.attachments);
@@ -6651,7 +6551,7 @@ elements.permissionCancel.addEventListener("click", (event) => {
   void cancelPermission();
 });
 elements.input.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
     event.preventDefault();
     elements.composer.requestSubmit();
   }

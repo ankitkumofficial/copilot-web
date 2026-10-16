@@ -27,6 +27,13 @@ keeps the model, tools, authentication, and workspace local.
 - Reload a conversation after a CLI crash without duplicating its history or
   showing historical messages as new output.
 - Send prompts and receive streamed Copilot responses.
+- Compose rich-text prompts: preserve bold, italics, lists, and code when
+  pasting from web pages or Markdown, and format Markdown as you type.
+  **Enter** sends; **Shift+Enter** adds a line or list item, **Tab** /
+  **Shift+Tab** nest or unnest list items, and **Ctrl/Cmd+Z** undoes edits.
+  Prompts are sent as Markdown and retain their formatting in conversation
+  history, including after a page reload. Literal Markdown characters in rich
+  text are escaped on send so they do not become unintended formatting.
 - Select text in a user or Copilot message and choose **Ask Copilot** to attach
   it as a numbered selection card; add multiple selections to one follow-up.
   Composer cards and sent-message selection chips return to their source and
@@ -80,8 +87,8 @@ keeps the model, tools, authentication, and workspace local.
 - Choose between the standard and long context tiers.
 - Attach files of any type to prompts by pasting, dragging and dropping, or
   using the attachment picker.
-- Render common Markdown formatting in assistant messages, including emphasis,
-  headings, lists, links, inline code, code blocks, and quotes.
+- Render common Markdown formatting in user and assistant messages, including
+  emphasis, headings, lists, links, inline code, code blocks, and quotes.
 - Use a light or dark theme, defaulting to the browser/system theme.
 - Scroll conversation history independently from the chat area.
 - Jump to the latest message using the floating down-arrow button that appears
