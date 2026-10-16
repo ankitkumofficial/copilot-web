@@ -860,7 +860,8 @@ button:disabled {
   text-align: right;
 }
 
-.message.assistant .message-body {
+.message.assistant .message-body,
+.message.user .message-text {
   white-space: normal;
 }
 
@@ -889,7 +890,8 @@ button:disabled {
   margin-bottom: 1em;
 }
 
-.message-body > :last-child {
+.message-body > :last-child,
+.message-text > :last-child {
   margin-bottom: 0;
 }
 
@@ -1178,11 +1180,13 @@ button:disabled {
   box-shadow: 0 0 0 3px rgba(139, 124, 255, 0.16), var(--shadow);
 }
 
-.composer textarea {
+.composer prompt-editor {
+  position: relative;
   display: block;
   width: 100%;
   min-height: 36px;
   max-height: 130px;
+  box-sizing: border-box;
   padding: 6px 2px;
   border: 0;
   border-radius: 9px;
@@ -1192,7 +1196,83 @@ button:disabled {
   line-height: 1.45;
   overflow-x: hidden;
   overflow-y: hidden;
-  resize: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  cursor: text;
+}
+
+.composer prompt-editor.is-empty::before {
+  position: absolute;
+  top: 6px;
+  left: 2px;
+  color: var(--muted);
+  content: attr(placeholder);
+  pointer-events: none;
+}
+
+.composer prompt-editor[disabled] {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.composer prompt-editor :is(p, h1, h2, h3, h4, h5, h6, ul, ol, li, blockquote, pre) {
+  margin: 0;
+}
+
+.composer prompt-editor h1 {
+  font-size: 1.3em;
+}
+
+.composer prompt-editor h2 {
+  font-size: 1.18em;
+}
+
+.composer prompt-editor h3 {
+  font-size: 1.06em;
+}
+
+.composer prompt-editor :is(h1, h2, h3, h4, h5, h6) {
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.composer prompt-editor :is(ul, ol) {
+  padding-left: 1.6em;
+}
+
+.composer prompt-editor ul ul {
+  list-style-type: circle;
+}
+
+.composer prompt-editor blockquote {
+  padding-left: 0.8em;
+  border-left: 3px solid var(--accent);
+  color: var(--muted);
+}
+
+.composer prompt-editor :is(pre, code) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.88em;
+}
+
+.composer prompt-editor pre {
+  margin: 4px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--background);
+  white-space: pre-wrap;
+}
+
+.composer prompt-editor code {
+  padding: 0.08em 0.3em;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-hover);
+}
+
+.composer prompt-editor a {
+  color: var(--accent);
 }
 
 .selection-list {
