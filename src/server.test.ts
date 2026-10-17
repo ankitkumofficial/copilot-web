@@ -131,6 +131,9 @@ function emitNativeEvent(sessionId, event, persist = false, duplicate = false) {
 function emitNativePrompt(request, sessionId, reply) {
   const prompt = request.params.prompt;
   const promptText = prompt.find((block) => block.type === "text")?.text ?? "";
+  const reasoningText = promptText === "stream-progress"
+    ? "Live reasoning: checking the request."
+    : undefined;
   const userMessageId = require("node:crypto").randomUUID();
   const assistantMessageId = require("node:crypto").randomUUID();
   const attachments = prompt.flatMap((block) => {
@@ -168,7 +171,8 @@ function emitNativePrompt(request, sessionId, reply) {
       deltaContent: reply
     }, 200),
     final: createNativeEvent("assistant.message", assistantMessageId, {
-      content: reply
+      content: reply,
+      ...(reasoningText === undefined ? {} : { reasoningText })
     }, 300)
   };
 }
@@ -344,6 +348,33 @@ input.on("line", (line) => {
       const nativeEvents = nativeMessages && !reload
         ? emitNativePrompt(request, request.params.sessionId, reply)
         : null;
+      if (request.params.prompt[0]?.text === "stream-progress") {
+        update(request.params.sessionId, {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: "Live reasoning: checking " }
+        });
+        update(request.params.sessionId, {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: "the request." }
+        });
+        update(request.params.sessionId, {
+          sessionUpdate: "tool_call",
+          toolCallId: "live-history-inspection",
+          title: "Inspect live history",
+          kind: "read",
+          status: "in_progress"
+        });
+        setTimeout(() => update(request.params.sessionId, {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "live-history-inspection",
+          title: "Inspect live history",
+          status: "completed",
+          content: [{
+            type: "content",
+            content: { type: "text", text: "Inspection complete" }
+          }]
+        }), 500);
+      }
       const delay = reload
         ? Number(process.env.TEST_MCP_RELOAD_DELAY_MS ?? 200)
         : Number(process.env.TEST_PROMPT_DELAY_MS ?? 20);
@@ -2466,9 +2497,13 @@ test("does not shift or duplicate messages when native and ACP histories differ"
     name: string;
     events: JsonObject[];
     expected: Array<{ role: string; text: string; timed: boolean }>;
+    expectedReasoning?: string;
+    expectedActivities?: string[];
   }> = [
     {
       name: "tool calls separate replies within a turn",
+      expectedReasoning: "Now run the command.",
+      expectedActivities: ["History lookup", "view", "bash"],
       events: [
         nativeTranscriptEvent("user.message", "user-1", "Inspect and run", 0),
         nativeTranscriptEvent("assistant.message", "assistant-1", "I will look at the file.", 1, {
@@ -2547,11 +2582,134 @@ test("does not shift or duplicate messages when native and ACP histories differ"
       ).click()`);
       await waitFor(`document.querySelector("#messages").textContent.includes("Second answer")`);
       assert.deepEqual(await evaluate(chatTranscript), scenario.expected);
+      if (scenario.expectedReasoning) {
+        assert.equal(
+          await evaluate(`Array.from(document.querySelectorAll(".thinking-content-text"))
+            .map((element) => element.textContent).join("\\n")`),
+          scenario.expectedReasoning
+        );
+      }
+      if (scenario.expectedActivities) {
+        assert.deepEqual(
+          await evaluate(`Array.from(document.querySelectorAll(".tool-activity-title"))
+            .map((element) => element.textContent)`),
+          scenario.expectedActivities
+        );
+      }
       assert.equal(
         await evaluate(`document.querySelector("#messages").textContent.includes("Hidden native")`),
         false
       );
     });
+  }
+});
+
+test("keeps historical and live responses, reasoning, and tool activity visible", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 30_000
+}, async (t) => {
+  const history = [
+    nativeTranscriptEvent("user.message", "stored-user", "Older question", 0),
+    nativeTranscriptEvent("assistant.message", "stored-assistant", "Older response", 1, {
+      reasoningText: "Historical reasoning.",
+      toolRequests: [{ toolCallId: "stored-tool", name: "Read stored files" }]
+    })
+  ];
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: { events: history },
+    promptDelayMs: 1_200
+  });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`
+    document.querySelector("#messages").textContent.includes("Older response") &&
+    Array.from(document.querySelectorAll(".thinking-content-text"))
+      .some((element) => element.textContent.includes("Historical reasoning."))
+  `);
+  assert.deepEqual(await evaluate(`
+    Array.from(document.querySelectorAll(".message.assistant .message-body"))
+      .map((body) => body.textContent)
+  `), ["Older response"]);
+  assert.deepEqual(await evaluate(`
+    Array.from(document.querySelectorAll(".tool-activity-title"))
+      .map((element) => element.textContent)
+  `), ["History lookup", "Read stored files"]);
+
+  await evaluate(`
+    (() => {
+      const input = document.querySelector("#prompt-input");
+      input.value = "stream-progress";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector("#composer").requestSubmit();
+    })();
+  `);
+  await server.waitForPrompt("stream-progress");
+  await waitFor(`
+    Array.from(document.querySelectorAll(".thinking-content-text"))
+      .some((element) => element.textContent.includes(
+        "Live reasoning: checking the request."
+      )) &&
+    Array.from(document.querySelectorAll(".tool-activity-item"))
+      .some((item) =>
+        item.querySelector(".tool-activity-title")?.textContent === "Inspect live history" &&
+        item.querySelector(".tool-activity-status")?.textContent === "Running"
+      )
+  `);
+  assert.equal(await evaluate(`
+    Array.from(document.querySelectorAll(".message.assistant .message-body"))
+      .some((body) => body.textContent === "Done.")
+  `), false);
+
+  await waitFor(`
+    Array.from(document.querySelectorAll(".tool-activity-item"))
+      .some((item) =>
+        item.querySelector(".tool-activity-title")?.textContent === "Inspect live history" &&
+        item.querySelector(".tool-activity-status")?.textContent === "Completed" &&
+        item.querySelector(".tool-activity-detail")?.textContent === "Inspection complete"
+      ) &&
+    !Array.from(document.querySelectorAll(".message.assistant .message-body"))
+      .some((body) => body.textContent === "Done.")
+  `);
+  await waitFor(`
+    Array.from(document.querySelectorAll(".message.assistant .message-body"))
+      .some((body) => body.textContent === "Done.")
+  `);
+
+  assert.deepEqual(await evaluate(`
+    Array.from(document.querySelectorAll(".message.assistant .message-body"))
+      .map((body) => body.textContent)
+  `), ["Older response", "Done."]);
+  assert.ok(await evaluate(`
+    Array.from(document.querySelectorAll(".thinking-content-text"))
+      .some((element) => element.textContent.includes("Historical reasoning."))
+  `));
+  assert.ok(await evaluate(`
+    Array.from(document.querySelectorAll(".thinking-content-text"))
+      .some((element) => element.textContent.includes(
+        "Live reasoning: checking the request."
+      ))
+  `));
+  assert.equal(await evaluate(`
+    Array.from(document.querySelectorAll(".thinking-content-text"))
+      .filter((element) => element.textContent.includes(
+        "Live reasoning: checking the request."
+      )).length
+  `), 1);
+  const activityTitles = await evaluate(`
+    Array.from(document.querySelectorAll(".tool-activity-title"))
+      .map((element) => element.textContent)
+  `);
+  assert.ok(Array.isArray(activityTitles));
+  for (const title of ["History lookup", "Read stored files", "Inspect live history"]) {
+    assert.ok(activityTitles.includes(title), `Missing activity: ${title}`);
   }
 });
 
