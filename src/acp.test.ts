@@ -692,6 +692,72 @@ test("uses the selected model at startup and falls back only for incompatible re
   }
 });
 
+test("restores context, model, and reasoning preferences after a manager restart", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-preferences-restart-test-"));
+  const command = path.join(directory, "copilot-fake");
+  const preferencesPath = path.join(directory, "metadata", "session-preferences.json");
+  await writeFile(command, tieredCopilot);
+  await chmod(command, 0o700);
+  const readPreferences = async () => JSON.parse(await readFile(preferencesPath, "utf8")) as unknown;
+  const first = new AcpConnectionManager({
+    command, cwd: directory, clientVersion: "test", preferencesPath
+  });
+  let sessionId: string;
+  let emptySessionId: string;
+  try {
+    await first.start();
+    const setup = await first.newSession(directory, "long_context", {
+      model: "claude-opus-5.5", reasoning_effort: "max"
+    });
+    sessionId = setup.sessionId;
+    const session = { sessionId, cwd: directory };
+    await first.setConfigOption(session, "reasoning_effort", "low");
+    await first.prompt(session, [{ type: "text", text: "first message" }]);
+    emptySessionId = (await first.newSession(directory, "default")).sessionId;
+  } finally {
+    await first.stop();
+  }
+  assert.deepEqual(await readPreferences(), {
+    [sessionId]: { context: "long_context", model: "claude-opus-5.5", reasoning_effort: "low" }
+  });
+  assert.ok(emptySessionId !== sessionId);
+
+  // Like the real CLI, a resumed session falls back to the global reasoning default.
+  const sessionFile = path.join(directory, `${sessionId}.json`);
+  const persisted = JSON.parse(await readFile(sessionFile, "utf8")) as Record<string, unknown>;
+  await writeFile(sessionFile, JSON.stringify({ ...persisted, reasoningEffort: "max" }));
+
+  const second = new AcpConnectionManager({
+    command, cwd: directory, clientVersion: "test", preferencesPath
+  });
+  let size: unknown;
+  second.events.on("sessionUpdate", (event: { params: Record<string, unknown> }) => {
+    if (isRecord(event.params.update) && event.params.update.sessionUpdate === "usage_update") {
+      size = event.params.update.size;
+    }
+  });
+  try {
+    await second.start();
+    const context = second.getPreferredSessionContext(sessionId);
+    assert.equal(context, "long_context");
+    const session = { sessionId, cwd: directory };
+    const loaded = await second.loadSession(session, context ?? "default");
+    assert.equal(loaded.configOptions.find((option) => option.id === "model")?.currentValue, "claude-opus-5.5");
+    assert.equal(loaded.configOptions.find((option) => option.id === "reasoning_effort")?.currentValue, "low");
+    await second.prompt(session, [{ type: "text", text: "after restart" }]);
+    assert.equal(size, 968_000);
+
+    second.forgetSession(sessionId);
+  } finally {
+    await second.stop();
+  }
+  try {
+    assert.deepEqual(await readPreferences(), {});
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("keeps the original session usable when switching profiles cannot load its history", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-profile-failure-test-"));
   const command = path.join(directory, "copilot-fake");

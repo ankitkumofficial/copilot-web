@@ -772,6 +772,10 @@ async function startTestServer(t: TestContext, options: {
     createSession,
     session: (id: string) => readFile(path.join(projects, `profile-session-${id}.json`), "utf8")
       .then((content) => JSON.parse(content) as unknown),
+    copilotSettings: (settings: JsonObject) => writeFile(
+      path.join(copilotHome, "settings.json"),
+      JSON.stringify(settings)
+    ),
     metadata: (name: string) => readFile(path.join(home, ".copilot-web", name), "utf8")
       .then((content) => JSON.parse(content) as unknown),
     nativeHistory: () => readFile(path.join(projects, "native-history.json"), "utf8")
@@ -855,6 +859,75 @@ test("updates empty-session IDs through the API and preserves metadata and selec
     .find((update) => update.sessionUpdate === "usage_update");
   assert.equal(usage?.size, 968_000);
   assert.equal((await server.requests()).some((request) => request.method === "session/load"), false);
+});
+
+test("reloads a conversation with its own persisted context unless a context is requested", async (t) => {
+  const server = await startTestServer(t, { profileSessions: true, context: "long_context" });
+  assert.equal((await server.post("config", { configId: "reasoning_effort", value: "medium" })).status, 200);
+  assert.equal((await server.post("messages", { text: "first message" })).status, 200);
+  const waitForPreferences = async (expected: unknown): Promise<void> => {
+    const deadline = Date.now() + 5_000;
+    let actual: unknown;
+    while (Date.now() < deadline) {
+      actual = await server.metadata("session-preferences.json").catch(() => undefined);
+      if (JSON.stringify(actual) === JSON.stringify(expected)) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(actual, expected);
+  };
+  await waitForPreferences({
+    [server.sessionId]: { context: "long_context", model: "gpt-6-luna", reasoning_effort: "medium" }
+  });
+
+  const reloaded = await server.post("load", { fallbackContext: "default" });
+  assert.equal(reloaded.status, 200);
+  const reloadedBody: unknown = await reloaded.json();
+  assert.ok(isRecord(reloadedBody) && Array.isArray(reloadedBody.configOptions));
+  assert.equal(reloadedBody.context, "long_context");
+  assert.equal(reloadedBody.configOptions.filter(isRecord)
+    .find((option) => option.id === "reasoning_effort")?.currentValue, "medium");
+
+  const switched = await server.post("load", { context: "default", fallbackContext: "long_context" });
+  assert.equal(switched.status, 200);
+  const switchedBody: unknown = await switched.json();
+  assert.ok(isRecord(switchedBody));
+  assert.equal(switchedBody.context, "default");
+  await waitForPreferences({
+    [server.sessionId]: { context: "default", model: "gpt-6-luna", reasoning_effort: "medium" }
+  });
+});
+
+test("starts new conversations from Copilot CLI defaults, not a previous conversation's preferences", async (t) => {
+  const server = await startTestServer(t, { profileSessions: true, context: "long_context" });
+  assert.equal((await server.post("config", { configId: "reasoning_effort", value: "low" })).status, 200);
+  assert.equal((await server.post("messages", { text: "first message" })).status, 200);
+  await server.copilotSettings({
+    model: "claude-sonnet-5.5", contextTier: "default", effortLevel: "medium"
+  });
+
+  const configResponse = await fetch(`${server.baseUrl}/api/config`, { headers: server.headers });
+  assert.equal(configResponse.status, 200);
+  const config: unknown = await configResponse.json();
+  assert.ok(isRecord(config) && Array.isArray(config.configOptions));
+  assert.equal(config.context, "default");
+  assert.deepEqual(config.newSessionDefaults, {
+    context: "default", model: "claude-sonnet-5.5", reasoningEffort: "medium"
+  });
+  assert.equal(config.configOptions.filter(isRecord)
+    .find((option) => option.id === "model")?.currentValue, "claude-sonnet-5.5");
+
+  const createResponse = await fetch(`${server.baseUrl}/api/sessions`, {
+    method: "POST", headers: server.headers, body: JSON.stringify({})
+  });
+  assert.equal(createResponse.status, 201);
+  const created: unknown = await createResponse.json();
+  assert.ok(isRecord(created) && Array.isArray(created.configOptions));
+  assert.equal(created.context, "default");
+  const options = created.configOptions.filter(isRecord);
+  assert.equal(options.find((option) => option.id === "model")?.currentValue, "claude-sonnet-5.5");
+  assert.equal(options.find((option) => option.id === "reasoning_effort")?.currentValue, "medium");
 });
 
 test("serializes concurrent API model switches and rejects prompts until configuration finishes", async (t) => {
