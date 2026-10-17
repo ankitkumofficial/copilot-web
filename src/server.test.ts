@@ -637,6 +637,32 @@ async function waitForHomePage(
   throw new Error(`Copilot Web did not start:\n${getOutput()}`);
 }
 
+const resourceCleanups = new WeakMap<TestContext, Array<() => Promise<void>>>();
+
+function registerResourceCleanup(t: TestContext, cleanup: () => Promise<void>) {
+  let cleanups = resourceCleanups.get(t);
+  if (!cleanups) {
+    const stack: Array<() => Promise<void>> = [];
+    cleanups = stack;
+    resourceCleanups.set(t, cleanups);
+    t.after(async () => {
+      const errors: unknown[] = [];
+      // Release dependent resources (the browser) before their server.
+      for (const dispose of [...stack].reverse()) {
+        try {
+          await dispose();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (errors.length > 0) {
+        throw new AggregateError(errors, "Test resource cleanup failed");
+      }
+    });
+  }
+  cleanups.push(cleanup);
+}
+
 async function startTestServer(t: TestContext, options: {
   advertiseMcp?: boolean;
   failReload?: boolean;
@@ -728,7 +754,7 @@ async function startTestServer(t: TestContext, options: {
     output += chunk;
   });
 
-  t.after(async () => {
+  registerResourceCleanup(t, async () => {
     if (child.exitCode === null && child.signalCode === null) {
       const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
       child.kill("SIGTERM");
@@ -1749,7 +1775,7 @@ async function startTestBrowser(t: TestContext, baseUrl: string, preloadScript?:
     reject: (error: Error) => void;
     timer: NodeJS.Timeout;
   }>();
-  t.after(async () => {
+  registerResourceCleanup(t, async () => {
     socket?.close();
     for (const request of pending.values()) {
       clearTimeout(request.timer);
@@ -4272,4 +4298,678 @@ test("keeps tools recovery available for successful refusals and after page refr
     (await server.requests()).filter((request) => request.text === "/mcp reload").length,
     reloadCountBeforeFailures
   );
+});
+
+function composerHelpers(command: Awaited<ReturnType<typeof startTestBrowser>>["command"], sessionId: string) {
+  const type = async (text: string) => {
+    for (const character of text) {
+      await command("Input.insertText", { text: character }, sessionId);
+    }
+  };
+  const press = async (key: string, modifiers = 0, code = key) => {
+    const keyCodes: Record<string, number> = { Enter: 13, Tab: 9, Backspace: 8, z: 90 };
+    const base = { key, code, modifiers, windowsVirtualKeyCode: keyCodes[key] ?? 0 };
+    await command("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, sessionId);
+    await command("Input.dispatchKeyEvent", { type: "keyUp", ...base }, sessionId);
+  };
+  return { type, press, shift: 8, meta: process.platform === "darwin" ? 4 : 2 };
+}
+
+test("formats Markdown while typing in the composer and sends it as Markdown", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const { type, press, shift, meta } = composerHelpers(command, sessionId);
+  const input = `document.querySelector("#prompt-input")`;
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="${server.sessionId}"]'))`);
+  await waitFor(`!${input}.disabled`);
+  await evaluate(`${input}.focus()`);
+
+  await type("**Follow these rules:**");
+  assert.equal(await evaluate(`${input}.querySelector("strong")?.textContent`), "Follow these rules:");
+  assert.equal(await evaluate(`${input}.textContent.includes("**")`), false);
+  await press("z", meta, "KeyZ");
+  assert.equal(await evaluate(`${input}.querySelector("strong")`), null);
+  assert.equal(await evaluate(`${input}.textContent`), "**Follow these rules:**");
+  assert.equal(await evaluate(`${input}.value`), String.raw`\*\*Follow these rules:\*\*`);
+  await press("z", meta | shift, "KeyZ");
+  assert.equal(await evaluate(`${input}.querySelector("strong")?.textContent`), "Follow these rules:");
+
+  await press("Enter", shift);
+  await press("Enter", shift);
+  await type("1. *One* sentence with `code`");
+  await press("Enter", shift);
+  await type("Daily life");
+  await press("Tab");
+  await type(" ~~old~~ done");
+  await press("Enter", shift);
+  await press("Enter", shift);
+  await press("Enter", shift);
+  await type("# Heading");
+  await press("Enter", shift);
+  await type("- point");
+
+  const expected = [
+    "**Follow these rules:**",
+    "",
+    "1. *One* sentence with `code`",
+    "   1. Daily life ~~old~~ done",
+    "# Heading",
+    "- point"
+  ].join("\n");
+  assert.equal(await evaluate(`${input}.value`), expected);
+  assert.deepEqual(await evaluate(`
+    [...${input}.querySelectorAll("strong, em, code, s, ol, ol ol, h1, ul")]
+      .map((element) => element.tagName)
+  `), ["STRONG", "OL", "EM", "CODE", "OL", "S", "H1", "UL"]);
+  assert.equal(await evaluate(`${input}.textContent.includes("\\u200b")`), false);
+
+  await evaluate(`${input}.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "Enter", isComposing: true, bubbles: true, cancelable: true
+  }))`);
+  assert.equal((await server.requests()).some((request) => request.text === expected), false);
+  assert.equal(await evaluate(`${input}.value`), expected);
+
+  await press("Enter");
+  await server.waitForPrompt(expected);
+  await waitFor(`${input}.value === "" && ${input}.classList.contains("is-empty")`);
+
+  await type("```js");
+  await press("Enter", shift);
+  assert.equal(await evaluate(`${input}.querySelector("pre")?.dataset.language`), "js");
+  await type("const value = 1;");
+  await press("Enter", shift);
+  await type("value++;");
+  await press("Enter", shift);
+  await press("Enter", shift);
+  await type("> quote");
+  await press("Enter", shift);
+  await press("Enter", shift);
+  await type("- first");
+  await press("Enter", shift);
+  await type("second");
+  await press("Tab");
+  await press("Tab", shift);
+  assert.equal(await evaluate(`${input}.querySelector("ul ul")`), null);
+  assert.equal(await evaluate(`${input}.value`), "```js\nconst value = 1;\nvalue++;\n```\n> quote\n- first\n- second");
+});
+
+test("pastes rich HTML and Markdown text into the composer as formatted content", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const input = `document.querySelector("#prompt-input")`;
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="${server.sessionId}"]'))`);
+  await waitFor(`!${input}.disabled`);
+  const paste = (data: Record<string, string>, setup = `${input}.value = ""; ${input}.focus();`) => evaluate(`
+    (() => {
+      ${setup}
+      const transfer = new DataTransfer();
+      for (const [type, value] of Object.entries(${JSON.stringify(data)})) {
+        transfer.setData(type, value);
+      }
+      ${input}.dispatchEvent(new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true }));
+      return ${input}.value;
+    })()
+  `);
+
+  assert.equal(await paste({
+    "text/plain": "Act as my tutor.\n**Follow these rules:**\n\n1. **One sentence at a time:** Give me one.\n2. **Daily-life situations:** Use practical sentences."
+  }), "Act as my tutor.\n**Follow these rules:**\n\n1. **One sentence at a time:** Give me one.\n2. **Daily-life situations:** Use practical sentences.");
+  assert.deepEqual(await evaluate(`[...${input}.querySelectorAll("ol > li > strong")].map((node) => node.textContent)`), [
+    "One sentence at a time:",
+    "Daily-life situations:"
+  ]);
+  assert.equal(await evaluate(`${input}.textContent.includes("**")`), false);
+  assert.equal(await evaluate(`document.querySelector("#composer").contains(${input})`), true);
+
+  assert.equal(await paste({
+    "text/html": "<meta charset='utf-8'><h2>Shopping</h2><p>Buy <script>alert(1)</script>these:</p><ul><li>Milk</li><li>Eggs <b>fresh</b><ul><li>brown</li></ul></li></ul><p><a href='javascript:alert(1)'>bad</a> <a href='https://example.com'>good</a></p>",
+    "text/plain": "ignored"
+  }), "## Shopping\n\nBuy these:\n\n- Milk\n- Eggs **fresh**\n  - brown\n\nbad [good](https://example.com)");
+  assert.equal(await evaluate(`${input}.querySelector("script, [href^='javascript']")`), null);
+
+  assert.equal(await paste({
+    "text/html": "<b style='font-weight:normal' id='docs-internal-guid-1'><p><span style='font-weight:700'>Bold</span><span> text</span></p><ul><li><p><span style='font-style:italic'>item</span></p></li></ul></b>",
+    "text/plain": "ignored"
+  }), "**Bold** text\n\n- *item*");
+
+  assert.equal(await paste({ "text/plain": "• apples\n• pears" }), "- apples\n- pears");
+  assert.equal(await paste({ "text/plain": "MID" }, `${input}.value = "abcd"; ${input}.focus(); ${input}.setSelectionRange(2, 2);`), "abMIDcd");
+  assert.equal(await paste({ "text/plain": "X\n- y\nZ" }, `${input}.value = "abcd"; ${input}.focus(); ${input}.setSelectionRange(2, 2);`), "abX\n- y\nZcd");
+  assert.equal(await paste({ "text/html": "<div>HTML-only text</div>" }), "HTML-only text");
+  assert.equal(await paste({
+    "text/html": "<div style='font-family:monospace;white-space:pre'><span>const x = 1;</span><br><span>  x++;</span></div>",
+    "text/plain": "const x = 1;\n  x++;",
+    "vscode-editor-data": "{}"
+  }), "```\nconst x = 1;\n  x++;\n```");
+  assert.equal(await evaluate(`${input}.querySelector("pre")?.textContent`), "const x = 1;\n  x++;");
+  assert.equal(await paste({
+    "text/plain": "___both___ and __bold _italic___"
+  }), "___both___ and __bold _italic___");
+  assert.equal(await evaluate(`${input}.querySelectorAll("strong em").length`), 2);
+  assert.equal(await paste({ "text/plain": "**** and **unfinished" }), String.raw`\*\*\*\* and \*\*unfinished`);
+  assert.equal(await evaluate(`${input}.textContent`), "**** and **unfinished");
+
+  const richCases = [
+    {
+      html: "<p><strong><em>Bold italic</em></strong> and <em>italic <strong>bold</strong></em></p>",
+      markdown: "***Bold italic*** and *italic **bold***",
+      selectors: ["strong em", "em strong"]
+    },
+    {
+      html: "<ol start='3'><li>First<br>continued<ul><li>Nested</li></ul></li><li>Second</li></ol>",
+      markdown: "3. First\n   continued\n   - Nested\n4. Second",
+      selectors: ["ol[start='3'] > li", "ol > li > ul > li"]
+    },
+    {
+      html: "<p>Use <code>**literal** and `ticks`</code></p>",
+      markdown: "Use `` **literal** and `ticks` ``",
+      selectors: ["code"]
+    },
+    {
+      html: "<p>Keep <code>  spaces  </code> and <code>`</code></p>",
+      markdown: "Keep `   spaces   ` and `` ` ``",
+      selectors: ["code"]
+    },
+    {
+      html: "<p><strong>*not italic*</strong> and <em>**not bold**</em></p>",
+      markdown: String.raw`**\*not italic\*** and *\*\*not bold\*\**`,
+      selectors: ["strong", "em"]
+    }
+  ];
+  for (const { html, markdown, selectors } of richCases) {
+    assert.equal(await paste({ "text/html": html }), markdown, html);
+    const before = await evaluate(`${input}.textContent`);
+    await evaluate(`${input}.value = ${input}.value`);
+    assert.equal(await evaluate(`${input}.value`), markdown, `Restoring Markdown: ${html}`);
+    assert.equal(await evaluate(`${input}.textContent`), before, `Restoring visible text: ${html}`);
+    for (const selector of selectors) {
+      assert.equal(await evaluate(`Boolean(${input}.querySelector(${JSON.stringify(selector)}))`), true, selector);
+    }
+  }
+  await evaluate(`
+    ${input}.innerHTML = '<p><span style="font-weight:bold;font-style:italic">Both</span></p>';
+    ${input}.dispatchEvent(new InputEvent("input", { inputType: "formatBold", bubbles: true }));
+  `);
+  assert.equal(await evaluate(`${input}.value`), "***Both***");
+  assert.equal(await evaluate(`${input}.querySelector("strong em")?.textContent`), "Both");
+});
+
+test("indents list subtrees without flattening their descendants", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const { press, shift } = composerHelpers(command, sessionId);
+  const input = `document.querySelector("#prompt-input")`;
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="${server.sessionId}"]'))`);
+  await waitFor(`!${input}.disabled`);
+  const cases = [
+    {
+      original: "- A\n- B\n  - C\n    1. Grandchild\n- D",
+      indented: "- A\n  - B\n    - C\n      1. Grandchild\n- D"
+    },
+    {
+      original: "- A\n  - Existing\n- B\n  3. C\n     - Grandchild\n- D",
+      indented: "- A\n  - Existing\n  - B\n    3. C\n       - Grandchild\n- D"
+    },
+    {
+      original: "3. A\n4. B\n   7. C\n      - Grandchild\n5. D",
+      indented: "3. A\n   1. B\n      7. C\n         - Grandchild\n4. D"
+    }
+  ];
+  for (const { original, indented } of cases) {
+    await evaluate(`
+      ${input}.value = ${JSON.stringify(original)};
+      ${input}.focus();
+      ${input}.setSelectionRange(${input}.value.indexOf("B"), ${input}.value.indexOf("B"));
+    `);
+    const children = await evaluate(`${input}.querySelectorAll(":scope > ul > li, :scope > ol > li")[1].innerHTML`);
+    await press("Tab");
+    assert.equal(await evaluate(`${input}.value`), indented);
+    assert.equal(await evaluate(`[...${input}.querySelectorAll("li")].find((item) => item.firstChild.textContent === "B").innerHTML`), children);
+    await evaluate(`${input}.undo()`);
+    assert.equal(await evaluate(`${input}.value`), original);
+    await evaluate(`${input}.redo()`);
+    assert.equal(await evaluate(`${input}.value`), indented);
+    await press("Tab", shift);
+    assert.equal(await evaluate(`${input}.value`), original);
+  }
+});
+
+test("preserves literal Markdown and its selection offsets through draft and history round trips", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true, nativeMessages: true, nativeHistory: { events: [] }
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const input = `document.querySelector("#prompt-input")`;
+  const session = `document.querySelector('button.session-item[data-session-id="${server.sessionId}"]')`;
+  await waitFor(`Boolean(${session})`);
+  await evaluate(`${session}.click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false" && !${input}.disabled`);
+  const html = [
+    "<p><strong>Example:</strong> literally **not bold** and _underscores_ and ~~not struck~~.</p>",
+    "<p># Not a heading<br>- Not a list<br>1. Not numbered<br>&gt; Not a quote<br>---<br>[not a link](https://example.com)<br>literal \\ * `</p>",
+    "<p><code>**code** _raw_ \\</code></p>"
+  ].join("");
+  const markdown = [
+    String.raw`**Example:** literally \*\*not bold\*\* and \_underscores\_ and \~\~not struck\~\~.`,
+    "",
+    String.raw`\# Not a heading`,
+    String.raw`\- Not a list`,
+    String.raw`1\. Not numbered`,
+    String.raw`\> Not a quote`,
+    String.raw`\---`,
+    String.raw`\[not a link\](https://example.com)`,
+    "literal \\\\ \\* \\`",
+    "",
+    "`**code** _raw_ \\`"
+  ].join("\n");
+  await evaluate(`
+    ${input}.focus();
+    ${input}.insertClipboard({ html: ${JSON.stringify(html)} });
+    ${input}.dispatchEvent(new Event("input", { bubbles: true }));
+  `);
+  assert.equal(await evaluate(`${input}.value`), markdown);
+  const visible = await evaluate(`${input}.textContent`);
+  await evaluate(`${input}.value = ${input}.value`);
+  assert.equal(await evaluate(`${input}.textContent`), visible);
+  assert.equal(await evaluate(`${input}.querySelectorAll("strong").length`), 1);
+  assert.equal(await evaluate(`${input}.querySelector("h1, ul, ol, blockquote, hr, a, em, del, s")`), null);
+  assert.equal(await evaluate(`${input}.value`), markdown);
+  await evaluate(`document.querySelector("#new-chat").click()`);
+  await waitFor(`${input}.value === ""`);
+  await evaluate(`${session}.click()`);
+  await waitFor(`${input}.value === ${JSON.stringify(markdown)} && !${input}.disabled`);
+  assert.equal(await evaluate(`${input}.textContent`), visible);
+  await evaluate(`document.querySelector("#composer").requestSubmit()`);
+  await server.waitForPrompt(markdown);
+  const message = `document.querySelector(".message.user .message-text")`;
+  await waitFor(`document.querySelector("#messages").textContent.includes("Done.")`);
+  assert.equal(await evaluate(`${message}.textContent`), visible);
+  assert.equal(await evaluate(`${message}.querySelectorAll("strong").length`), 1);
+  assert.equal(await evaluate(`${message}.querySelector("h1, ul, ol, blockquote, hr, a, em, del, s")`), null);
+  const historyHtml = await evaluate(`${message}.innerHTML`);
+  await evaluate(`window.beforeLiteralReload = true`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeLiteralReload && Boolean(${message}) &&
+    document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  assert.equal(await evaluate(`${message}.innerHTML`), historyHtml);
+
+  const suffix = " a*b_c\\d";
+  await evaluate(`
+    ${input}.value = "";
+    ${input}.focus();
+    ${input}.insertClipboard({ html: ${JSON.stringify(`<p><strong>Title</strong>${suffix}</p>`)} });
+  `);
+  for (let offset = 0; offset <= suffix.length; offset += 1) {
+    const expectedOffset = "**Title**".length + suffix.slice(0, offset).replace(/[\\*_]/g, "\\$&").length;
+    await evaluate(`window.getSelection().collapse(${input}.querySelector("p").lastChild, ${offset})`);
+    assert.equal(await evaluate(`${input}.selectionStart`), expectedOffset, `DOM offset ${offset}`);
+    await evaluate(`${input}.setSelectionRange(${expectedOffset}, ${expectedOffset})`);
+    assert.equal(await evaluate(`${input}.selectionStart`), expectedOffset, `Markdown offset ${expectedOffset}`);
+  }
+  await evaluate(`
+    const node = ${input}.querySelector("p").lastChild;
+    window.getSelection().setBaseAndExtent(node, 2, node, 3);
+    ${input}.setRangeText("X", ${input}.selectionStart, ${input}.selectionEnd, "end");
+  `);
+  assert.equal(await evaluate(`${input}.textContent`), "Title aXb_c\\d");
+  assert.equal(await evaluate(`${input}.value`), String.raw`**Title** aXb\_c\\d`);
+});
+
+test("keeps dictation outside completed inline formatting at DOM and Markdown boundaries", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, mockSpeechRecognition);
+  const input = `document.querySelector("#prompt-input")`;
+  const button = `document.querySelector("#voice-input")`;
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="${server.sessionId}"]'))`);
+  await waitFor(`!${input}.disabled && ${button}.dataset.state === "idle"`);
+  const cases = [
+    { html: "<strong>Bold</strong>", markdown: "**Bold**" },
+    { html: "<em>Italic</em>", markdown: "*Italic*" },
+    { html: "<s>Old</s>", markdown: "~~Old~~" },
+    { html: "<code>code</code>", markdown: "`code`" },
+    { html: '<a href="https://example.com">Link</a>', markdown: "[Link](https://example.com)" },
+    { html: "<strong><em>Both</em></strong>", markdown: "***Both***" }
+  ];
+  for (const { html, markdown } of cases) {
+    await evaluate(`
+      ${input}.value = "";
+      ${input}.focus();
+      ${input}.insertClipboard({ html: ${JSON.stringify(`<p>${html}</p>`)} });
+    `);
+    assert.equal(await evaluate(`${input}.selectionStart`), markdown.length, `After pasting ${html}`);
+    assert.equal(await evaluate(`${input}.selectionEnd`), markdown.length);
+    await evaluate(`${input}.value = ${input}.value; ${input}.setSelectionRange(${markdown.length}, ${markdown.length})`);
+    assert.equal(await evaluate(`${input}.selectionStart`), markdown.length, `After restoring ${html}`);
+    await evaluate(`${button}.click()`);
+    await waitFor(`${button}.dataset.state === "recording"`);
+    await evaluate(`window.speechRecognitionTest.instances.at(-1).emit([{ transcript: "more", isFinal: false }])`);
+    assert.equal(await evaluate(`${input}.value`), `${markdown} more`);
+    await evaluate(`window.speechRecognitionTest.instances.at(-1).emit([{ transcript: "more words", isFinal: true }])`);
+    assert.equal(await evaluate(`${input}.value`), `${markdown} more words`);
+    assert.equal(await evaluate(`${input}.querySelector("p").lastChild.data`), " more words");
+    await evaluate(`${button}.click()`);
+    await waitFor(`${button}.dataset.state === "idle"`);
+  }
+  await evaluate(`
+    ${input}.value = "***Both***";
+    ${input}.focus();
+    window.getSelection().collapse(${input}.querySelector("em").firstChild, 4);
+  `);
+  assert.equal(await evaluate(`${input}.selectionStart`), 7);
+  await evaluate(`window.getSelection().collapse(${input}.querySelector("strong"), 1)`);
+  assert.equal(await evaluate(`${input}.selectionStart`), 8);
+  await evaluate(`window.getSelection().collapse(${input}.querySelector("p"), 1)`);
+  assert.equal(await evaluate(`${input}.selectionStart`), 10);
+  await evaluate(`${input}.setSelectionRange(0, 0)`);
+  assert.equal(await evaluate(`${input}.selectionStart`), 0);
+});
+
+test("preserves rich composer drafts through switching, dictation, replacement, and file paste", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, mockSpeechRecognition);
+  const input = `document.querySelector("#prompt-input")`;
+  const session = `document.querySelector('button.session-item[data-session-id="${server.sessionId}"]')`;
+  await waitFor(`Boolean(${session})`);
+  await evaluate(`${session}.click()`);
+  await waitFor(`!${input}.disabled && document.querySelector("#messages").textContent.includes("GoCD")`);
+  const draft = "**Intro**\n\n3. First\n   continued\n   - Nested\n4. Second";
+  await evaluate(`
+    ${input}.value = ${JSON.stringify(draft)};
+    ${input}.dispatchEvent(new Event("input", { bubbles: true }));
+    document.querySelector("#new-chat").click();
+  `);
+  await waitFor(`${input}.value === ""`);
+  await evaluate(`${session}.click()`);
+  await waitFor(`${input}.value === ${JSON.stringify(draft)} && !${input}.disabled`);
+  assert.equal(await evaluate(`${input}.querySelector("strong")?.textContent`), "Intro");
+  assert.equal(await evaluate(`${input}.querySelector("ol > li > ul > li")?.textContent`), "Nested");
+
+  await evaluate(`
+    ${input}.setSelectionRange(${input}.value.length, ${input}.value.length);
+    document.querySelector("#voice-input").click();
+  `);
+  await waitFor(`document.querySelector("#voice-input").dataset.state === "recording"`);
+  await evaluate(`window.speechRecognitionTest.instances[0].emit([
+    { transcript: "more detail", isFinal: true }
+  ])`);
+  assert.equal(await evaluate(`${input}.value`), `${draft} more detail`);
+  assert.equal(await evaluate(`${input}.querySelector("strong")?.textContent`), "Intro");
+  await evaluate(`document.querySelector("#voice-input").click()`);
+  await waitFor(`document.querySelector("#voice-input").dataset.state === "idle"`);
+
+  await evaluate(`
+    (() => {
+      const input = ${input};
+      input.focus();
+      input.setSelectionRange(0, input.value.length);
+      const transfer = new DataTransfer();
+      transfer.setData("text/html", "<p><b>Attached</b> note</p>");
+      transfer.setData("text/plain", "Attached note");
+      transfer.items.add(new File(["file content"], "pasted.txt", { type: "text/plain" }));
+      input.dispatchEvent(new ClipboardEvent("paste", {
+        clipboardData: transfer, bubbles: true, cancelable: true
+      }));
+    })()
+  `);
+  await waitFor(`document.querySelector("#attachment-list").textContent.includes("pasted.txt")`);
+  assert.equal(await evaluate(`${input}.value`), "**Attached** note");
+  await evaluate(`${input}.undo()`);
+  assert.equal(await evaluate(`${input}.value`), `${draft} more detail`);
+  await evaluate(`${input}.redo()`);
+  assert.equal(await evaluate(`${input}.value`), "**Attached** note");
+  await evaluate(`document.querySelector("#composer").requestSubmit()`);
+  await server.waitForPrompt("**Attached** note");
+  await waitFor(`document.querySelector("#messages").textContent.includes("Done.")`);
+});
+
+test("renders user Markdown in live and restored history, rich copies, and selection sources", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const nestedEmphasisMarkdown = "**bold *italic*** and *italic **bold*** and __bold _italic___ and _italic __bold___";
+  const historicalPrompt = [
+    "# Instructions",
+    "",
+    "**Rules:**",
+    "",
+    "3. **English:** Translate `word`.",
+    "   - **Informal:** *du / ihr*",
+    "   - **Formal:** *Sie*",
+    "4. Continue",
+    "   on a second line.",
+    "",
+    "> Keep it simple.",
+    "",
+    "```js",
+    "const value = '<script>literal</script>';",
+    "```",
+    "",
+    "***Bold italic*** and `` `ticks` ``.",
+    nestedEmphasisMarkdown,
+    "",
+    "[Reference](https://example.com)",
+    "<script>window.userMarkupExecuted = true</script>",
+    "[Unsafe](javascript:alert(1))"
+  ].join("\n");
+  const events = nativeHistoryEvents().map((event) => {
+    if (event.id === "persisted-assistant-event") {
+      assert.ok(isRecord(event.data));
+      return { ...event, data: { ...event.data, content: `Native historical reply\n\n${nestedEmphasisMarkdown}` } };
+    }
+    if (event.type !== "user.message") return event;
+    assert.ok(isRecord(event.data));
+    return { ...event, data: { ...event.data, content: historicalPrompt } };
+  });
+  const server = await startTestServer(t, {
+    existingSession: true, nativeMessages: true, nativeHistory: { events }
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    window.clipboardWrites = [];
+    Object.defineProperty(navigator, "clipboard", {
+      value: {
+        async write(items) {
+          const item = items[0];
+          window.clipboardWrites.push({
+            text: await (await item.getType("text/plain")).text(),
+            html: await (await item.getType("text/html")).text()
+          });
+        }
+      }
+    });
+  `);
+  await command("Emulation.setDeviceMetricsOverride", {
+    width: 1200, height: 900, deviceScaleFactor: 1, mobile: false
+  }, sessionId);
+  const users = `[...document.querySelectorAll(".message.user .message-text")]`;
+  const input = `document.querySelector("#prompt-input")`;
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="${server.sessionId}"]'))`);
+  await evaluate(`document.querySelector('button.session-item[data-session-id="${server.sessionId}"]').click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Native historical reply")`);
+  await evaluate(`${input}.value = ${JSON.stringify(nestedEmphasisMarkdown)}`);
+  const nestedText = ["italic", "bold", "italic", "bold"];
+  assert.deepEqual(await evaluate(`[...${input}.querySelectorAll("strong em, em strong")].map((node) => node.textContent)`), nestedText);
+  assert.deepEqual(await evaluate(`[...document.querySelectorAll(".message.assistant .message-body strong em, .message.assistant .message-body em strong")].map((node) => node.textContent)`), nestedText);
+  await evaluate(`${input}.value = ""`);
+  assert.deepEqual(await evaluate(`
+    (() => {
+      const text = ${users}[0];
+      return {
+        heading: text.querySelector("h1")?.textContent,
+        title: text.querySelector("p > strong")?.textContent,
+        start: text.querySelector("ol")?.getAttribute("start"),
+        nested: [...text.querySelectorAll("ol > li > ul > li")]
+          .map((item) => item.textContent),
+        continuation: text.querySelector("ol > li:last-child")?.innerHTML,
+        code: [...text.querySelectorAll("code")].map((code) => code.textContent),
+        combined: text.querySelector("strong em")?.textContent,
+        nestedEmphasis: [...text.querySelectorAll("strong em, em strong")].map((node) => node.textContent),
+        quote: text.querySelector("blockquote")?.textContent,
+        link: text.querySelector("a")?.getAttribute("href"),
+        unsafe: Boolean(text.querySelector("script, [href^='javascript:']")) ||
+          Boolean(window.userMarkupExecuted),
+        whitespace: getComputedStyle(text).whiteSpace,
+        lastMargin: getComputedStyle(text.lastElementChild).marginBottom
+      };
+    })()
+  `), {
+    heading: "Instructions", title: "Rules:", start: "3",
+    nested: ["Informal: du / ihr", "Formal: Sie"],
+    continuation: "Continue<br>on a second line.",
+    code: ["word", "const value = '<script>literal</script>';", "`ticks`"],
+    combined: "Bold italic", nestedEmphasis: ["Bold italic", "italic", "bold", "italic", "bold"],
+    quote: "Keep it simple.", link: "https://example.com/",
+    unsafe: false, whitespace: "normal", lastMargin: "0px"
+  });
+  assert.equal(await evaluate(`document.querySelector(".message.user .message-attachment-image")?.alt`), "diagram.png");
+  const historicalHtml = await evaluate(`${users}[0].innerHTML`);
+  await evaluate(`document.querySelector(".message.user .message-copy").click()`);
+  await waitFor(`window.clipboardWrites.length === 1`);
+  assert.equal(await evaluate(`window.clipboardWrites[0].text`), `${historicalPrompt}\n\nAttachments: diagram.png`);
+  assert.equal(await evaluate(`window.clipboardWrites[0].html.includes("<strong>Rules:</strong>")`), true);
+
+  await evaluate(`
+    (() => {
+      const input = ${input};
+      input.focus();
+      const transfer = new DataTransfer();
+      transfer.setData("text/html",
+        "<h2>Live prompt</h2><p><b>Keep</b> this formatting</p><ol><li>First<ul><li>Nested</li></ul></li><li>Second</li></ol>");
+      input.dispatchEvent(new ClipboardEvent("paste", {
+        clipboardData: transfer, bubbles: true, cancelable: true
+      }));
+      window.sentRichPrompt = input.value;
+      document.querySelector("#composer").requestSubmit();
+    })()
+  `);
+  const sentPrompt = await evaluate(`window.sentRichPrompt`);
+  assert.equal(typeof sentPrompt, "string");
+  await server.waitForPrompt(String(sentPrompt));
+  await waitFor(`${users}.length === 2 && document.querySelector("#messages").textContent.includes("Done.")`);
+  assert.equal(await evaluate(`${users}[1].querySelector("h2")?.textContent`), "Live prompt");
+  assert.equal(await evaluate(`${users}[1].querySelector("p > strong")?.textContent`), "Keep");
+  assert.equal(await evaluate(`${users}[1].querySelector("ol > li > ul > li")?.textContent`), "Nested");
+  const liveHtml = await evaluate(`${users}[1].innerHTML`);
+
+  await evaluate(`window.beforeRichHistoryReload = true`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeRichHistoryReload && ${users}.length === 2 &&
+    document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  assert.equal(await evaluate(`${users}[0].innerHTML`), historicalHtml);
+  assert.equal(await evaluate(`${users}[1].innerHTML`), liveHtml);
+  assert.equal(await evaluate(`document.querySelector(".message.user .message-attachment-image")?.alt`), "diagram.png");
+
+  await evaluate(`
+    (() => {
+      const paragraph = ${users}[1].querySelector("p");
+      paragraph.scrollIntoView({ block: "center" });
+      document.querySelector("#messages").dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      const range = document.createRange();
+      range.selectNodeContents(paragraph);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    })()
+  `);
+  await waitFor(`!document.querySelector("#ask-selection").hidden`);
+  await evaluate(`
+    document.querySelector("#ask-selection").click();
+    ${input}.value = "Explain this.";
+    ${input}.dispatchEvent(new Event("input", { bubbles: true }));
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await server.waitForPrompt("Explain this.\n\nSelected passages from the conversation:\nSelection 1:\n> Keep this formatting");
+  await waitFor(`document.querySelectorAll(".message.assistant").length === 3 &&
+    document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`
+    localStorage.removeItem("copilot-web-selection-messages");
+    window.beforeSelectionSourceReload = true;
+  `);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeSelectionSourceReload &&
+    document.querySelector(".message-selection-summary")?.textContent === "1 selection"`);
+  await evaluate(`document.querySelector(".message-selection-summary").click()`);
+  await waitFor(`(window.CSS.highlights?.get("copilot-web-source-selection")
+    ? [...window.CSS.highlights.get("copilot-web-source-selection")].map((range) => range.toString()).join("")
+    : window.getSelection().toString()) === "Keep this formatting"`);
+});
+
+test("keeps the rich composer readable and bounded in light and dark themes", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const input = `document.querySelector("#prompt-input")`;
+  const ready = `Boolean(customElements.get("prompt-editor")) &&
+    Boolean(document.querySelector('button.session-item[data-session-id="${server.sessionId}"]')) &&
+    !${input}.disabled`;
+  await waitFor(ready);
+  const text = "**Follow these rules**\n\n1. *One* sentence with `code`\n   - Nested point\n2. Next point\n\n> A useful quote\n\n```js\nconst value = 1;\n```";
+  for (const theme of ["light", "dark"]) {
+    await evaluate(`
+      localStorage.setItem("copilot-web-theme", ${JSON.stringify(theme)});
+      window.beforeComposerThemeReload = true;
+    `);
+    await command("Page.reload", {}, sessionId);
+    await waitFor(`!window.beforeComposerThemeReload && (${ready})`);
+    assert.equal(await evaluate(`document.documentElement.dataset.theme`), theme);
+    for (const width of [1280, 390]) {
+      await command("Emulation.setDeviceMetricsOverride", {
+        width, height: 900, deviceScaleFactor: 1, mobile: false
+      }, sessionId);
+      await evaluate(`
+        ${input}.value = ${JSON.stringify(text)};
+        ${input}.dispatchEvent(new Event("input", { bubbles: true }));
+        ${input}.scrollTop = 0;
+      `);
+      assert.deepEqual(await evaluate(`
+        (() => {
+          const input = ${input};
+          const bounds = input.getBoundingClientRect();
+          const composer = document.querySelector("#composer").getBoundingClientRect();
+          const styles = getComputedStyle(input);
+          return {
+            boundedHeight: bounds.height <= 130 && bounds.height >= 36,
+            contained: bounds.left >= composer.left && bounds.right <= composer.right,
+            fitsViewport: composer.left >= 0 && composer.right <= innerWidth,
+            scrollable: styles.overflowY === "auto" && input.scrollHeight > input.clientHeight,
+            bold: getComputedStyle(input.querySelector("strong")).fontWeight >= 600,
+            italic: getComputedStyle(input.querySelector("em")).fontStyle === "italic",
+            listMarkers: getComputedStyle(input.querySelector("ul")).listStyleType !== "none",
+            color: styles.color
+          };
+        })()
+      `), {
+        boundedHeight: true, contained: true, fitsViewport: true, scrollable: true,
+        bold: true, italic: true, listMarkers: true,
+        color: theme === "light" ? "rgb(29, 34, 48)" : "rgb(241, 243, 245)"
+      }, `${theme}, ${width}px`);
+      await evaluate(`
+        ${input}.value = "";
+        ${input}.dispatchEvent(new Event("input", { bubbles: true }));
+      `);
+      assert.equal(await evaluate(`${input}.classList.contains("is-empty") &&
+        getComputedStyle(${input}, "::before").content.includes("Message Copilot") &&
+        ${input}.getBoundingClientRect().height === 36`), true);
+    }
+  }
 });
