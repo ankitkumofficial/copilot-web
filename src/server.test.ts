@@ -3662,6 +3662,50 @@ test("restores sent selection chips and source links after a page refresh", {
   `);
 });
 
+test("previews pending image attachments before sending", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="${server.sessionId}"]'))`);
+  await evaluate(`document.querySelector('button.session-item[data-session-id="${server.sessionId}"]').click()`);
+  await waitFor(`window.localStorage.getItem("copilot-web-active-session") === "${server.sessionId}" &&
+    document.querySelector("#attach-files").disabled === false`);
+
+  const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=";
+  await evaluate(`
+    const files = new DataTransfer();
+    const image = Uint8Array.from(atob("${imageData}"), (character) => character.charCodeAt(0));
+    files.items.add(new File([image], "preview.png", { type: "image/png" }));
+    const fileInput = document.querySelector("#file-input");
+    fileInput.files = files.files;
+    fileInput.dispatchEvent(new Event("change"));
+  `);
+  await waitFor(`document.querySelector("#attachment-list").textContent.includes("preview.png")`);
+  assert.equal(await evaluate(`
+    (() => {
+      const button = document.querySelector("#attachment-list .attachment-chip-image-preview");
+      return button?.type === "button" &&
+        button.getAttribute("aria-label") === "Preview preview.png";
+    })()
+  `), true);
+
+  await evaluate(`document.querySelector("#attachment-list .attachment-chip-image-preview").click()`);
+  await waitFor(`document.querySelector("#image-preview-dialog").open`);
+  assert.equal(await evaluate(`document.querySelector("#image-preview-image").alt`), "preview.png");
+  assert.equal(
+    await evaluate(`document.querySelector("#image-preview-image").getAttribute("src")`),
+    `data:image/png;base64,${imageData}`
+  );
+
+  await evaluate(`document.querySelector("#image-preview-dialog").close()`);
+  await waitFor(`!document.querySelector("#image-preview-dialog").open &&
+    !document.querySelector("#image-preview-image").hasAttribute("src")`);
+  await evaluate(`document.querySelector("#attachment-list .attachment-remove").click()`);
+  await waitFor(`document.querySelector("#attachment-list").children.length === 0`);
+});
+
 test("preserves the draft and attachments when an empty conversation changes model and context", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
