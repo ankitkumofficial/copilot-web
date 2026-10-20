@@ -1,0 +1,155 @@
+#!/bin/bash
+# Managed by the copilot-web macOS cpw installer.
+set -euo pipefail
+
+LABEL="com.github.copilot-web"
+DOMAIN="gui/$(id -u)"
+SERVICE="$DOMAIN/$LABEL"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+PLIST_BUDDY="/usr/libexec/PlistBuddy"
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "cpw is available only on macOS." >&2
+  exit 1
+fi
+
+case "${1:-}" in
+  start|restart|stop|status) ;;
+  *)
+    echo "Usage: cpw {start|restart|stop|status}" >&2
+    exit 2
+    ;;
+esac
+
+if [[ ! -f "$PLIST" ]]; then
+  echo "copilot-web is not installed. Run cpw-installer/macOS/install.sh from its checkout." >&2
+  exit 1
+fi
+
+if [[ ! -x "$PLIST_BUDDY" ]]; then
+  echo "Cannot read the LaunchAgent configuration: $PLIST_BUDDY is unavailable." >&2
+  exit 1
+fi
+
+APP_ROOT="$("$PLIST_BUDDY" -c 'Print :WorkingDirectory' "$PLIST" 2>/dev/null)" || {
+  echo "Cannot read the copilot-web working directory from $PLIST." >&2
+  exit 1
+}
+NPM_BIN="$("$PLIST_BUDDY" -c 'Print :EnvironmentVariables:NPM_BIN' "$PLIST" 2>/dev/null)" || {
+  echo "Cannot read npm's path from $PLIST. Rerun the installer." >&2
+  exit 1
+}
+
+is_loaded() {
+  launchctl print "$SERVICE" >/dev/null 2>&1
+}
+
+running_address() {
+  local service_info pid address
+
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "Cannot determine copilot-web status: lsof is unavailable." >&2
+    return 2
+  fi
+
+  service_info="$(launchctl print "$SERVICE" 2>/dev/null)" || return 1
+  if ! printf '%s\n' "$service_info" |
+    awk '$1 == "state" && $2 == "=" && $3 == "running" { running = 1 } END { exit !running }'; then
+    return 1
+  fi
+
+  pid="$(printf '%s\n' "$service_info" | awk '$1 == "pid" && $2 == "=" { print $3; exit }')"
+  [[ -n "$pid" ]] || return 1
+
+  address="$(lsof -nP -a -p "$pid" -iTCP -sTCP:LISTEN 2>/dev/null |
+    awk 'NR > 1 { print $9; exit }')"
+  [[ -n "$address" ]] || return 1
+
+  printf '%s\n' "$address"
+}
+
+wait_for_address() {
+  local address result
+
+  for _ in {1..30}; do
+    if address="$(running_address)"; then
+      printf '%s\n' "$address"
+      return 0
+    else
+      result=$?
+      if (( result == 2 )); then
+        return "$result"
+      fi
+    fi
+    sleep 1
+  done
+
+  echo "copilot-web did not start listening within 30 seconds." >&2
+  echo "Check $HOME/Library/Logs/copilot-web/stderr.log for startup errors." >&2
+  return 1
+}
+
+build_app() {
+  if [[ ! -x "$NPM_BIN" ]]; then
+    echo "npm was not found at $NPM_BIN. Rerun the installer after installing Node.js." >&2
+    return 1
+  fi
+  if [[ ! -d "$APP_ROOT" ]]; then
+    echo "copilot-web checkout not found at $APP_ROOT. Rerun the installer from its current location." >&2
+    return 1
+  fi
+  (cd "$APP_ROOT" && "$NPM_BIN" run build)
+}
+
+case "${1:-}" in
+  start)
+    if address="$(running_address)"; then
+      echo "copilot-web is already running on $address"
+      exit 0
+    else
+      result=$?
+      if (( result == 2 )); then
+        exit "$result"
+      fi
+    fi
+    build_app
+    if ! is_loaded; then
+      launchctl bootstrap "$DOMAIN" "$PLIST"
+    fi
+    launchctl kickstart "$SERVICE"
+    address="$(wait_for_address)"
+    echo "copilot-web started on $address"
+    ;;
+
+  restart)
+    if is_loaded; then
+      launchctl bootout "$SERVICE"
+    fi
+    build_app
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+    launchctl kickstart "$SERVICE"
+    address="$(wait_for_address)"
+    echo "copilot-web restarted on $address"
+    ;;
+
+  stop)
+    if is_loaded; then
+      launchctl bootout "$SERVICE"
+      echo "copilot-web stopped"
+    else
+      echo "copilot-web is not running"
+    fi
+    ;;
+
+  status)
+    if address="$(running_address)"; then
+      echo "copilot-web is running on $address"
+    else
+      result=$?
+      if (( result == 2 )); then
+        exit "$result"
+      fi
+      echo "copilot-web is not running"
+    fi
+    ;;
+esac
