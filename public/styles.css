@@ -548,6 +548,17 @@ button:disabled {
   min-height: 0;
   padding: 28px clamp(20px, 5vw, 72px);
   overflow: auto;
+  overflow-anchor: none;
+}
+
+.history-control {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  margin: 0 auto 23px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-align: center;
 }
 
 .scroll-to-bottom {

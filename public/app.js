@@ -14,6 +14,8 @@ const maximumAttachmentCount = 10;
 const maximumAttachmentBytes = 8 * 1024 * 1024;
 const maximumAttachmentTotalBytes = 16 * 1024 * 1024;
 const messagesBottomThreshold = 80;
+const maximumInitialHistoryPages = 32;
+const messagePanelPositions = new WeakMap();
 const imageMimeTypesByExtension = {
   ".avif": "image/avif",
   ".gif": "image/gif",
@@ -112,6 +114,14 @@ function createConversationState(sessionId = null) {
     promptRunId: 0,
     promptRequestController: null,
     loading: false,
+    history: null,
+    historyLoading: false,
+    historyLoadPromise: null,
+    historyError: "",
+    historyWarning: "",
+    historyGeneration: 0,
+    newerHistoryHidden: false,
+    lastScrollTop: 0,
     configurationBusy: false,
     attachmentBusy: false,
     pendingPermission: null,
@@ -146,6 +156,8 @@ function isStoredSelectionReference(value) {
     value.endPath.every((index) => Number.isInteger(index) && index >= 0) &&
     Number.isInteger(value.endOffset) &&
     value.endOffset >= 0 &&
+    (value.sourceMessageId === undefined || typeof value.sourceMessageId === "string") &&
+    (value.sourceKey === undefined || value.sourceKey === null || typeof value.sourceKey === "string") &&
     (
       value.sourceOrdinal === undefined ||
       (Number.isInteger(value.sourceOrdinal) && value.sourceOrdinal >= 0)
@@ -184,6 +196,8 @@ function readSelectionMessageMetadata() {
         promptText: entry.promptText,
         displayText: entry.displayText,
         selections: entry.selections.map(copySelectionReference),
+        ...(typeof entry.messageId === "string" ? { messageId: entry.messageId } : {}),
+        ...(typeof entry.clientPromptId === "string" ? { clientPromptId: entry.clientPromptId } : {}),
         createdAt: Number.isFinite(entry.createdAt) ? entry.createdAt : 0
       }));
       if (metadata[sessionId].length === 0) {
@@ -367,21 +381,35 @@ function restoreSelectionMessageMetadata(message, conversation) {
     return;
   }
   const promptText = message.rawSelectionPromptText ?? message.text;
-  const entries = (selectionMessageMetadata[conversation.sessionId] ?? [])
-    .filter((entry) => entry.promptText === promptText);
+  const storedEntries = selectionMessageMetadata[conversation.sessionId] ?? [];
+  const recoveredPrompt = parseSelectionPrompt(promptText);
+  const identified = storedEntries.find((entry) => (
+    (message.nativeMessageId && entry.messageId === message.nativeMessageId) ||
+    (message.clientPromptId && entry.clientPromptId === message.clientPromptId)
+  ));
+  const entries = identified ? [identified]
+    : storedEntries.filter((entry) => (
+      entry.promptText === promptText ||
+      entry.displayText === promptText ||
+      (recoveredPrompt && entry.displayText === recoveredPrompt.displayText)
+    ));
   const sessionCounts = selectionMessageRestorationCounts.get(conversation.sessionId) ?? new Map();
-  const matchingIndex = sessionCounts.get(promptText) ?? 0;
+  const matchingIndex = identified
+    ? 0
+    : Math.min(sessionCounts.get(promptText) ?? 0, entries.length - 1);
   const entry = entries[matchingIndex];
   if (entry) {
-    sessionCounts.set(promptText, matchingIndex + 1);
-    selectionMessageRestorationCounts.set(conversation.sessionId, sessionCounts);
+    if (!identified) {
+      sessionCounts.set(promptText, matchingIndex + 1);
+      selectionMessageRestorationCounts.set(conversation.sessionId, sessionCounts);
+    }
     message.text = entry.displayText;
     message.selections = entry.selections.map(copySelectionReference);
     message.selectionMetadataRestored = true;
     return;
   }
 
-  const recovered = parseSelectionPrompt(promptText);
+  const recovered = recoveredPrompt;
   if (!recovered) {
     return;
   }
@@ -392,24 +420,20 @@ function restoreSelectionMessageMetadata(message, conversation) {
       messageIndex,
       selection.text
     );
-    if (sourceIndex < 0) {
-      return null;
-    }
     return {
       id: `selection-${selection.number}`,
       number: selection.number,
       text: selection.text,
       sessionId: conversation.sessionId,
-      messageIndex: sourceIndex,
+      messageIndex: Math.max(0, sourceIndex),
+      ...(sourceIndex >= 0 && conversation.messages[sourceIndex].nativeMessageId
+        ? { sourceMessageId: conversation.messages[sourceIndex].nativeMessageId } : {}),
       startPath: [],
       startOffset: 0,
       endPath: [],
       endOffset: 0
     };
   });
-  if (selections.some((selection) => selection === null)) {
-    return;
-  }
   message.text = recovered.displayText;
   message.selections = selections;
   message.selectionMetadataRestored = true;
@@ -487,6 +511,46 @@ function conversationState(sessionId, create = true) {
 
 function activeConversation() {
   return conversationState(state.activeSessionId, false);
+}
+
+function messageIdentity(message) {
+  if (message.nativeMessageId) {
+    return `native:${message.role}:${message.nativeMessageId}`;
+  }
+  if (message.role === "tool") {
+    return message.toolActivities?.length > 0
+      ? `tool:${message.toolActivities[0].id}`
+      : message.toolGroupKey;
+  }
+  return message.displayKey ?? message.localMessageKey ?? null;
+}
+
+function reindexMessages(conversation) {
+  conversation.messageKeys.clear();
+  const indexes = new Map();
+  conversation.messages.forEach((message, index) => {
+    for (const key of [
+      messageIdentity(message),
+      message.displayKey,
+      message.localMessageKey
+    ]) {
+      if (key) {
+        conversation.messageKeys.set(key, index);
+        indexes.set(key, index);
+      }
+    }
+  });
+  if (isActiveConversation(conversation)) {
+    for (const article of elements.messages.querySelectorAll(".message")) {
+      const index = indexes.get(article.dataset.messageKey);
+      if (index !== undefined) {
+        article.dataset.messageIndex = String(index);
+      }
+    }
+  }
+  conversation.nativeEventIds = new Set(conversation.messages
+    .map((message) => message.nativeEventId)
+    .filter(Boolean));
 }
 
 function currentComposerConversation() {
@@ -1451,7 +1515,9 @@ async function api(path, options = {}) {
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(typeof body.error === "string" ? body.error : `Request failed (${response.status})`);
+    const error = new Error(typeof body.error === "string" ? body.error : `Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
   }
   return body;
 }
@@ -2766,6 +2832,7 @@ function toolStatusClass(status) {
 function createToolGroup(toolGroupKey) {
   return {
     role: "tool",
+    displayKey: toolGroupKey,
     text: "",
     toolGroupKey,
     toolActivities: [],
@@ -3167,6 +3234,8 @@ function renderMessageAttachments(body, attachments) {
       image.className = "message-attachment-image";
       image.src = source;
       image.alt = attachment.name;
+      image.loading = "lazy";
+      image.decoding = "async";
       preview.append(image);
       item.append(preview);
     } else {
@@ -3228,12 +3297,13 @@ function captureMessagePanelScroll(conversation) {
       }
     });
     positions.set(message, panelPositions);
+    messagePanelPositions.set(message, panelPositions);
   });
   return positions;
 }
 
 function restoreMessagePanelScroll(article, message, positions) {
-  const savedPositions = positions.get(message);
+  const savedPositions = positions.get(message) ?? messagePanelPositions.get(message);
   if (!savedPositions) {
     return;
   }
@@ -3287,7 +3357,7 @@ function clearMessageSelectionHighlight() {
     window.CSS?.highlights?.delete(messageSelectionHighlightName);
   }
   const selection = window.getSelection();
-  if (!highlight.custom && selection && selectionMatchesRange(selection, highlight.range)) {
+  if (selection && selectionMatchesRange(selection, highlight.range)) {
     selection.removeAllRanges();
   }
 }
@@ -3356,6 +3426,8 @@ function messageSelectionReference(selection) {
       text,
       sessionId: conversation.sessionId,
       messageIndex,
+      sourceMessageId: conversation.messages[messageIndex].nativeMessageId,
+      sourceKey: messageIdentity(conversation.messages[messageIndex]),
       sourceOrdinal: selectableMessageArticles().indexOf(message),
       startPath,
       startOffset: range.startOffset,
@@ -3512,6 +3584,16 @@ function selectionRangeForReference(body, reference) {
 }
 
 function preferredSelectionMessageIndex(reference, articles) {
+  const conversation = currentComposerConversation();
+  if (reference.sourceMessageId || reference.sourceKey) {
+    const index = conversation.messages.findIndex((message) => (
+      (reference.sourceMessageId && message.nativeMessageId === reference.sourceMessageId) ||
+      (reference.sourceKey && messageIdentity(message) === reference.sourceKey)
+    ));
+    if (index >= 0) {
+      return index;
+    }
+  }
   if (Number.isInteger(reference.sourceOrdinal)) {
     const article = articles[reference.sourceOrdinal];
     const index = Number(article?.dataset.messageIndex);
@@ -3612,23 +3694,93 @@ function restoreMessageSelectionHighlight() {
   highlight.custom = custom;
 }
 
-function jumpToSelection(reference) {
+async function jumpToSelection(reference) {
   const conversation = currentComposerConversation();
   if (reference.sessionId && reference.sessionId !== conversation.sessionId) {
     if (!state.sessions.some((session) => session.sessionId === reference.sessionId)) {
       showSelectionNotice("The selected text's conversation is no longer available.");
       return;
     }
-    void loadConversation(reference.sessionId).then((loaded) => {
-      if (loaded) {
-        jumpToSelection(reference);
-      } else {
-        showSelectionNotice("The selected text's conversation could not be opened.");
-      }
-    });
+    const loaded = await loadConversation(reference.sessionId);
+    if (loaded) {
+      await jumpToSelection(reference);
+    } else {
+      showSelectionNotice("The selected text's conversation could not be opened.");
+    }
     return;
   }
 
+  let index = conversation.messages.findIndex((message) => (
+    (reference.sourceMessageId && message.nativeMessageId === reference.sourceMessageId) ||
+    (reference.sourceKey && messageIdentity(message) === reference.sourceKey)
+  ));
+  if (index < 0 && reference.sourceMessageId && conversation.history) {
+    if (conversation.busy || conversation.recoveredPrompt) {
+      showSelectionNotice("Wait for the current activity to finish before opening an unloaded passage.");
+      return;
+    }
+    while (conversation.historyLoading) {
+      const pendingHistoryLoad = conversation.historyLoadPromise;
+      if (!pendingHistoryLoad) {
+        showSelectionNotice("Wait for the current history load to finish before opening an unloaded passage.");
+        return;
+      }
+      await pendingHistoryLoad;
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      if (conversation.busy || conversation.recoveredPrompt) {
+        showSelectionNotice("Wait for the current activity to finish before opening an unloaded passage.");
+        return;
+      }
+    }
+    const generation = ++conversation.historyGeneration;
+    conversation.historyLoading = true;
+    try {
+      const page = await api(`/api/sessions/${encodeURIComponent(conversation.sessionId)}/history?${
+        new URLSearchParams({ around: reference.sourceMessageId })
+      }`);
+      if (generation !== conversation.historyGeneration || !isActiveConversation(conversation)) {
+        return;
+      }
+      if (conversation.busy || conversation.recoveredPrompt ||
+          serverPromptStates.get(conversation.sessionId)?.busy) {
+        showSelectionNotice("Open this passage after the current reply finishes.");
+        return;
+      }
+      applyHistoryPage(page, conversation, true);
+      index = conversation.messages.findIndex((message) => message.nativeMessageId === reference.sourceMessageId);
+    } catch (error) {
+      showSelectionNotice(error.message);
+      return;
+    } finally {
+      if (generation === conversation.historyGeneration) {
+        conversation.historyLoading = false;
+        renderMessages(conversation);
+      }
+    }
+  }
+  if (index < 0) {
+    const compact = compactSelectionText(reference.text);
+    index = conversation.messages.findIndex((message) => (
+      (message.role === "user" || message.role === "assistant") &&
+      compactSelectionText(messageSelectionSearchText(message)).includes(compact)
+    ));
+    if (!reference.sourceMessageId && conversation.history && !conversation.historyLoading && !conversation.busy &&
+        !conversation.recoveredPrompt) {
+      for (let pages = 0; index < 0 && pages < 10_000 && conversation.history.hasMore; pages += 1) {
+        await loadOlderHistory(conversation);
+        if (!isActiveConversation(conversation) || conversation.historyError) {
+          return;
+        }
+        index = conversation.messages.findIndex((message) => (
+          (message.role === "user" || message.role === "assistant") &&
+          compactSelectionText(messageSelectionSearchText(message)).includes(compact)
+        ));
+      }
+    }
+  }
+  if (index >= 0) {
+    mountMessageAtIndex(conversation, index);
+  }
   const located = locateSelectionReference(reference);
   if (!located) {
     showSelectionNotice("The selected text is no longer available in this conversation.");
@@ -3746,16 +3898,160 @@ function messagesAreAtBottom() {
     elements.messages.clientHeight < messagesBottomThreshold;
 }
 
+function mountMessageAtIndex(conversation, index) {
+  const article = elements.messages.querySelector(`[data-message-index="${index}"]`);
+  article?.scrollIntoView({ block: "center" });
+  conversation.lastScrollTop = elements.messages.scrollTop;
+}
+
+function createHistoryControl(conversation, newer = false) {
+  if (newer ? !conversation.newerHistoryHidden
+    : !conversation.historyLoading && !conversation.historyError) {
+    return null;
+  }
+  const row = document.createElement("div");
+  row.className = "history-control";
+  if (!newer) {
+    if (conversation.historyLoading) {
+      row.id = "history-loading";
+      row.setAttribute("role", "status");
+      row.textContent = "Loading earlier messages...";
+      return row;
+    }
+    row.id = "history-error";
+    const error = document.createElement("span");
+    error.setAttribute("role", "status");
+    error.textContent = conversation.historyError;
+    row.append(error);
+    if (conversation.history?.hasMore) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "secondary-button";
+      retry.id = "retry-history";
+      retry.setAttribute("aria-label", "Retry loading earlier messages");
+      retry.textContent = "Retry";
+      retry.addEventListener("click", () => {
+        void loadOlderHistory(conversation);
+      });
+      row.append(retry);
+    }
+    return row;
+  }
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "secondary-button";
+  button.id = "load-latest-messages";
+  button.disabled = conversation.historyLoading || conversation.loading;
+  button.textContent = "Return to latest messages";
+  button.addEventListener("click", () => {
+    void loadConversation(conversation.sessionId, undefined, true);
+  });
+  row.append(button);
+  return row;
+}
+
+function renderHistoryControl(conversation, newer = false) {
+  const row = createHistoryControl(conversation, newer);
+  if (row) {
+    elements.messages.append(row);
+  }
+}
+
+function captureMessageScrollAnchor() {
+  const viewportTop = elements.messages.getBoundingClientRect().top;
+  const article = [...elements.messages.querySelectorAll(".message")]
+    .find((message) => message.getBoundingClientRect().bottom > viewportTop + 1);
+  return {
+    scrollTop: elements.messages.scrollTop,
+    scrollLeft: elements.messages.scrollLeft,
+    article,
+    offset: article?.getBoundingClientRect().top - viewportTop
+  };
+}
+
+function restoreMessageScrollAnchor(conversation, anchor) {
+  elements.messages.scrollLeft = anchor.scrollLeft;
+  if (anchor.article && elements.messages.contains(anchor.article) &&
+      Number.isFinite(anchor.offset)) {
+    const viewportTop = elements.messages.getBoundingClientRect().top;
+    elements.messages.scrollTop +=
+      anchor.article.getBoundingClientRect().top - viewportTop - anchor.offset;
+  } else {
+    elements.messages.scrollTop = anchor.scrollTop;
+  }
+  conversation.lastScrollTop = elements.messages.scrollTop;
+}
+
+function syncMessageEmptyState(conversation) {
+  if (conversation.messages.length > 0 || conversation.history?.hasMore) {
+    elements.emptyState.hidden = true;
+    if (elements.emptyState.parentElement === elements.messages) {
+      elements.emptyState.remove();
+    }
+    return;
+  }
+  elements.emptyState.hidden = false;
+  if (elements.emptyState.parentElement !== elements.messages) {
+    elements.messages.append(elements.emptyState);
+  }
+}
+
+function syncOlderHistoryControl(conversation) {
+  elements.messages.querySelector("#history-loading, #history-error")?.remove();
+  const row = createHistoryControl(conversation);
+  if (row) {
+    const firstMessage = elements.messages.querySelector(".message");
+    const emptyState = elements.emptyState.parentElement === elements.messages
+      ? elements.emptyState
+      : null;
+    const latestControl = elements.messages.querySelector("#load-latest-messages")
+      ?.closest(".history-control");
+    const before = firstMessage ?? emptyState ?? latestControl;
+    if (before) {
+      elements.messages.insertBefore(row, before);
+    } else {
+      elements.messages.append(row);
+    }
+  }
+  const latestButton = elements.messages.querySelector("#load-latest-messages");
+  if (latestButton) {
+    latestButton.disabled = conversation.historyLoading || conversation.loading;
+  }
+  elements.messages.setAttribute("aria-busy", String(conversation.historyLoading === true));
+  syncMessageEmptyState(conversation);
+}
+
+function renderHistoryStatusInPlace(conversation) {
+  if (!isActiveConversation(conversation)) {
+    return;
+  }
+  if (
+    renderedMessagesConversation !== conversation ||
+    conversation.renderedMessageCount !== conversation.messages.length ||
+    elements.messages.querySelectorAll(".message").length !== conversation.messages.length
+  ) {
+    renderMessages(conversation);
+    return;
+  }
+  const anchor = captureMessageScrollAnchor();
+  syncOlderHistoryControl(conversation);
+  restoreMessageScrollAnchor(conversation, anchor);
+  updateScrollToBottomButton();
+}
+
 function updateScrollToBottomButton() {
   const conversation = activeConversation();
   const visible = conversation?.loading === false &&
     conversation.messages.length > 0 &&
-    !messagesAreAtBottom();
+    (!messagesAreAtBottom() || conversation.newerHistoryHidden);
   elements.scrollToBottom.hidden = !visible;
   elements.scrollToBottom.disabled = !visible;
 }
 
 function updateMessagesInPlace(conversation, messages) {
+  if (conversation.renderedMessageCount !== conversation.messages.length) {
+    return false;
+  }
   const articlesByIndex = new Map();
   elements.messages.querySelectorAll(".message").forEach((article) => {
     const index = Number(article.dataset.messageIndex);
@@ -3767,13 +4063,16 @@ function updateMessagesInPlace(conversation, messages) {
     const index = conversation.messages.indexOf(message);
     const article = articlesByIndex.get(index);
     const body = article?.querySelector(".message-body");
-    return body && article ? { article, body, message } : null;
+    if (!body || !article) {
+      return null;
+    }
+    return { article, body, message };
   });
   if (updates.some((update) => !update)) {
     return false;
   }
 
-  const wasAtBottom = messagesAreAtBottom();
+  const wasAtBottom = messagesAreAtBottom() && !conversation.preserveHistoryAnchor;
   const previousScrollTop = elements.messages.scrollTop;
   const previousScrollLeft = elements.messages.scrollLeft;
   const preservedSelection = preserveMessageTextSelection(conversation);
@@ -3790,6 +4089,7 @@ function updateMessagesInPlace(conversation, messages) {
   restoreMessageSelectionHighlight();
   restoreMessageTextSelection(preservedSelection);
   updateScrollToBottomButton();
+  conversation.lastScrollTop = elements.messages.scrollTop;
   return true;
 }
 
@@ -3868,6 +4168,139 @@ function renderMessageSelectionSummary(message, messageIndex) {
   return row;
 }
 
+function createMessageArticle(message, index) {
+  const article = document.createElement("article");
+  article.className = `message ${message.role}`;
+  article.dataset.messageIndex = String(index);
+  article.dataset.messageKey = messageIdentity(message) ?? "";
+  const header = document.createElement("div");
+  header.className = "message-header";
+  const label = document.createElement("div");
+  label.className = "message-label";
+  label.textContent = message.role === "user"
+    ? "You"
+    : message.role === "tool"
+      ? "Thinking"
+      : message.role === "system"
+        ? state.brandName
+        : "Copilot";
+  header.append(label);
+  if (message.role === "user" || message.role === "assistant") {
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "message-copy";
+    copy.innerHTML = copyIconMarkup;
+    copy.title = "Copy message";
+    copy.setAttribute(
+      "aria-label",
+      message.role === "user" ? "Copy your message" : "Copy Copilot response"
+    );
+    copy.addEventListener("click", () => {
+      void copyMessage(message, copy);
+    });
+    header.append(copy);
+  }
+  const body = document.createElement("div");
+  body.className = "message-body";
+  renderMessageBody(body, message);
+  article.append(header);
+  const selectionSummary = renderMessageSelectionSummary(message, index);
+  if (selectionSummary) {
+    article.append(selectionSummary);
+  }
+  article.append(body);
+  renderMessageTimestamp(article, message);
+  return article;
+}
+
+function updateMessageArticleIndex(article, index) {
+  article.dataset.messageIndex = String(index);
+  const menu = article.querySelector(".message-selection-menu");
+  if (menu) {
+    menu.id = `message-selection-menu-${index}`;
+    article.querySelector(".message-selection-summary")
+      ?.setAttribute("aria-controls", menu.id);
+  }
+}
+
+function renderHistoryPageInPlace(
+  conversation,
+  addedMessages,
+  modifiedMessages,
+  panelScrollPositions,
+  existingArticleIndexes
+) {
+  if (!isActiveConversation(conversation)) {
+    return;
+  }
+  const existingArticles = [...elements.messages.querySelectorAll(".message")];
+  const previousMessageCount = conversation.messages.length - addedMessages.length;
+  if (
+    renderedMessagesConversation !== conversation ||
+    conversation.renderedMessageCount !== previousMessageCount ||
+    existingArticles.length !== previousMessageCount
+  ) {
+    renderMessages(conversation);
+    return;
+  }
+
+  const anchor = captureMessageScrollAnchor();
+  const preservedSelection = preserveMessageTextSelection(conversation);
+  for (const article of existingArticles) {
+    const previousIndex = existingArticleIndexes.get(article);
+    if (!Number.isInteger(previousIndex)) {
+      renderMessages(conversation);
+      return;
+    }
+    const index = previousIndex + addedMessages.length;
+    const message = conversation.messages[index];
+    if (!message) {
+      renderMessages(conversation);
+      return;
+    }
+    updateMessageArticleIndex(article, index);
+    if (modifiedMessages.has(message)) {
+      const body = article.querySelector(".message-body");
+      if (body) {
+        renderMessageBody(body, message);
+        renderMessageTimestamp(article, message);
+        restoreMessagePanelScroll(article, message, panelScrollPositions);
+      }
+    }
+  }
+
+  const fragment = document.createDocumentFragment();
+  const newArticles = [];
+  addedMessages.forEach((message, index) => {
+    const article = createMessageArticle(message, index);
+    fragment.append(article);
+    newArticles.push({ article, message });
+  });
+  if (conversation.messages.length > 0) {
+    elements.emptyState.hidden = true;
+    if (elements.emptyState.parentElement === elements.messages) {
+      elements.emptyState.remove();
+    }
+  }
+  const latestControl = elements.messages.querySelector("#load-latest-messages")
+    ?.closest(".history-control");
+  elements.messages.insertBefore(fragment, existingArticles[0] ?? latestControl ?? null);
+  for (const { article, message } of newArticles) {
+    restoreMessagePanelScroll(article, message, panelScrollPositions);
+  }
+  syncMessageEmptyState(conversation);
+  elements.messages.setAttribute("aria-busy", String(conversation.historyLoading === true));
+  const latestButton = elements.messages.querySelector("#load-latest-messages");
+  if (latestButton) {
+    latestButton.disabled = conversation.historyLoading || conversation.loading;
+  }
+  conversation.renderedMessageCount = conversation.messages.length;
+  restoreMessageScrollAnchor(conversation, anchor);
+  restoreMessageSelectionHighlight();
+  restoreMessageTextSelection(preservedSelection);
+  updateScrollToBottomButton();
+}
+
 function renderMessages(conversation = activeConversation()) {
   if (conversation !== activeConversation()) {
     return;
@@ -3876,12 +4309,23 @@ function renderMessages(conversation = activeConversation()) {
   if (renderedMessagesConversation !== conversation) {
     clearMessageSelectionHighlight();
   }
-  const wasAtBottom = messagesAreAtBottom();
+  const wasAtBottom = conversation?.scrollToLatest ||
+    (messagesAreAtBottom() && !conversation?.preserveHistoryAnchor);
   const previousScrollTop = elements.messages.scrollTop;
   const previousScrollLeft = elements.messages.scrollLeft;
+  const viewportTop = elements.messages.getBoundingClientRect().top;
+  const anchorArticle = renderedMessagesConversation === conversation
+    ? [...elements.messages.querySelectorAll(".message")]
+      .find((article) => article.getBoundingClientRect().bottom > viewportTop + 1)
+    : null;
+  const anchorKey = anchorArticle?.dataset.messageKey;
+  const anchorOffset = anchorArticle?.getBoundingClientRect().top - viewportTop;
   const panelScrollPositions = captureMessagePanelScroll(conversation);
   elements.messages.replaceChildren();
   renderedMessagesConversation = conversation;
+  if (conversation) {
+    conversation.renderedMessageCount = conversation.messages.length;
+  }
   if (conversation?.loading === true) {
     clearMessageSelectionHighlight();
     hideAskSelection();
@@ -3894,10 +4338,23 @@ function renderMessages(conversation = activeConversation()) {
   }
 
   elements.loadingState.hidden = true;
-  elements.messages.setAttribute("aria-busy", "false");
+  elements.messages.setAttribute("aria-busy", String(conversation?.historyLoading === true));
+  if (conversation?.historyWarning) {
+    const warning = document.createElement("div");
+    warning.className = "history-control";
+    warning.setAttribute("role", "status");
+    warning.textContent = conversation.historyWarning;
+    elements.messages.append(warning);
+  }
   if (!conversation || conversation.messages.length === 0) {
     clearMessageSelectionHighlight();
     hideAskSelection();
+    if (conversation?.history?.hasMore) {
+      renderHistoryControl(conversation);
+      elements.emptyState.hidden = true;
+      updateScrollToBottomButton();
+      return;
+    }
     elements.messages.append(elements.emptyState);
     elements.emptyState.hidden = false;
     updateScrollToBottomButton();
@@ -3905,59 +4362,30 @@ function renderMessages(conversation = activeConversation()) {
   }
 
   elements.emptyState.hidden = true;
-  for (const [index, message] of conversation.messages.entries()) {
-    const article = document.createElement("article");
-    article.className = `message ${message.role}`;
-    article.dataset.messageIndex = String(index);
-    const header = document.createElement("div");
-    header.className = "message-header";
-    const label = document.createElement("div");
-    label.className = "message-label";
-    label.textContent = message.role === "user"
-      ? "You"
-      : message.role === "tool"
-        ? "Thinking"
-        : message.role === "system"
-        ? state.brandName
-          : "Copilot";
-    header.append(label);
-    if (message.role === "user" || message.role === "assistant") {
-      const copy = document.createElement("button");
-      copy.type = "button";
-      copy.className = "message-copy";
-      copy.innerHTML = copyIconMarkup;
-      copy.title = "Copy message";
-      copy.setAttribute(
-          "aria-label",
-          message.role === "user" ? "Copy your message" : "Copy Copilot response"
-      );
-      copy.addEventListener("click", () => {
-          void copyMessage(message, copy);
-      });
-      header.append(copy);
-    }
-    const body = document.createElement("div");
-    body.className = "message-body";
-    renderMessageBody(body, message);
-    article.append(header);
-    const selectionSummary = renderMessageSelectionSummary(message, index);
-    if (selectionSummary) {
-      article.append(selectionSummary);
-    }
-    article.append(body);
+  renderHistoryControl(conversation);
+  for (let index = 0; index < conversation.messages.length; index += 1) {
+    const message = conversation.messages[index];
+    const article = createMessageArticle(message, index);
     elements.messages.append(article);
-    renderMessageTimestamp(article, message);
     restoreMessagePanelScroll(article, message, panelScrollPositions);
   }
+  renderHistoryControl(conversation, true);
   if (wasAtBottom) {
     elements.messages.scrollTop = elements.messages.scrollHeight;
   } else {
     elements.messages.scrollTop = previousScrollTop;
     elements.messages.scrollLeft = previousScrollLeft;
+    const anchor = anchorKey ? [...elements.messages.querySelectorAll(".message")]
+      .find((article) => article.dataset.messageKey === anchorKey) : null;
+    if (anchor && Number.isFinite(anchorOffset)) {
+      elements.messages.scrollTop += anchor.getBoundingClientRect().top - viewportTop - anchorOffset;
+    }
   }
   restoreMessageSelectionHighlight();
   restoreMessageTextSelection(preservedSelection);
   updateScrollToBottomButton();
+  conversation.lastScrollTop = elements.messages.scrollTop;
+  conversation.scrollToLatest = false;
 }
 
 function setBusy(value, conversation = activeConversation()) {
@@ -3970,6 +4398,7 @@ function setBusy(value, conversation = activeConversation()) {
     conversation.activePromptKey = null;
     conversation.cancelRequested = false;
     stopRecoveredPromptPolling(conversation);
+    scheduleMessagesRender(conversation);
   } else {
     scheduleRecoveredPromptPolling(conversation);
   }
@@ -4187,7 +4616,10 @@ function addMessage(
     }
   }
 
-  const message = { role, text, attachments: [...attachments] };
+  const message = {
+    role, text, attachments: [...attachments],
+    displayKey: key ?? nextSyntheticMessageKey(role, conversation)
+  };
   const restoreSelectionMetadata = selections.length === 0 &&
     role === "user" &&
     conversation.loading;
@@ -4408,6 +4840,7 @@ function ingestNativeMessage(record, conversation) {
       ? message
       : { ...message, nativeRevision: 0 };
     if (!message.nativeMessageId || nativeMessageIsNewer(record, current)) {
+      delete message.nativeHistoryFragment;
       const preserveOptimisticUser = record.role === "user" &&
         message.optimisticPrompt === true;
       if (!preserveOptimisticUser) {
@@ -4446,6 +4879,12 @@ function ingestNativeMessage(record, conversation) {
     message.legacyFallback = false;
     if (typeof record.clientPromptId === "string") {
       message.clientPromptId = record.clientPromptId;
+      const metadata = (selectionMessageMetadata[conversation.sessionId] ?? [])
+        .find((entry) => entry.clientPromptId === record.clientPromptId);
+      if (record.role === "user" && metadata && metadata.messageId !== record.messageId) {
+        metadata.messageId = record.messageId;
+        writeSelectionMessageMetadata(metadata);
+      }
     }
     if (Number.isInteger(index) && index >= 0) {
       conversation.messageKeys.set(key, index);
@@ -4507,10 +4946,26 @@ function handleNativeMessage(params) {
     return;
   }
   const conversation = conversationState(params.sessionId);
+  if (conversation.newerHistoryHidden) {
+    return;
+  }
   conversation.nativeMessagesActive = true;
   conversation.nativeModeKnown = true;
+  if (!conversation.history) {
+    conversation.history = { hasMore: !conversation.loaded, cursor: null, oversized: false };
+  }
   if (conversation.loading) {
-    conversation.pendingNativeMessages.push(params);
+    const previous = conversation.pendingNativeMessages.findIndex((message) => (
+      message.role === params.role && message.messageId === params.messageId
+    ));
+    if (previous >= 0) {
+      if (params.completion === "completed" ||
+          conversation.pendingNativeMessages[previous].completion !== "completed") {
+        conversation.pendingNativeMessages[previous] = params;
+      }
+    } else {
+      conversation.pendingNativeMessages.push(params);
+    }
     return;
   }
   ingestNativeMessage(params, conversation);
@@ -4694,13 +5149,13 @@ function alignReplayTurns(replayTurns, nativeTurns) {
 function replayNativeHistory(replayUpdates, nativeMessages, conversation) {
   if (!conversation.nativeMessagesActive) {
     for (const replayUpdate of replayUpdates) {
-      handleSessionUpdate(replayUpdate, conversation.sessionId);
+      handleSessionUpdate(replayUpdate, conversation.sessionId, conversation);
     }
     return;
   }
   if (!replayUpdates.some((params) => replayChatRole(params?.update))) {
     for (const replayUpdate of replayUpdates) {
-      handleSessionUpdate(replayUpdate, conversation.sessionId);
+      handleSessionUpdate(replayUpdate, conversation.sessionId, conversation);
     }
     for (const nativeMessage of nativeMessages) {
       ingestNativeMessage(nativeMessage, conversation);
@@ -4737,7 +5192,7 @@ function replayNativeHistory(replayUpdates, nativeMessages, conversation) {
       }
       const matched = role === "user" ? userMatched : assistantMatches.has(groupIndex);
       if (!role || matched) {
-        handleSessionUpdate(params, conversation.sessionId);
+        handleSessionUpdate(params, conversation.sessionId, conversation);
         const nativeToolMessage = !role && params.update.sessionUpdate === "tool_call"
           ? reasoningByToolCall.get(params.update.toolCallId)
           : undefined;
@@ -4768,12 +5223,86 @@ function replayNativeHistory(replayUpdates, nativeMessages, conversation) {
             ? {}
             : { messageId: fallbackMessageId })
         }
-      }, conversation.sessionId);
+      }, conversation.sessionId, conversation);
     }
   }
 }
 
-function handleSessionUpdate(params, expectedSessionId = null) {
+function replayPagedNativeHistory(replayUpdates, nativeMessages, conversation) {
+  const messagesByKey = new Map(nativeMessages.map((message) => [
+    `${message.role}:${message.messageId}`,
+    message
+  ]));
+  const cachedReasoning = new Map();
+  for (const params of replayUpdates) {
+    const update = params?.update;
+    if (
+      update?.sessionUpdate !== "agent_thought_chunk" ||
+      (typeof update.messageId !== "string" && typeof update.messageId !== "number")
+    ) {
+      continue;
+    }
+    const messageId = String(update.messageId);
+    const text = contentText(update.content);
+    if (text) {
+      cachedReasoning.set(messageId, `${cachedReasoning.get(messageId) ?? ""}${text}`);
+    }
+  }
+  for (const [messageId, text] of cachedReasoning) {
+    const message = messagesByKey.get(`assistant:${messageId}`);
+    if (message && !message.reasoningText) {
+      message.reasoningText = text;
+    }
+  }
+  const ingested = new Set();
+  for (const params of replayUpdates) {
+    const update = params?.update;
+    if (!update) {
+      continue;
+    }
+    const role = replayChatRole(update);
+    const messageId = typeof update.messageId === "string" ||
+      typeof update.messageId === "number"
+      ? String(update.messageId)
+      : undefined;
+    if (role && messageId) {
+      const key = `${role}:${messageId}`;
+      const message = messagesByKey.get(key);
+      if (message) {
+        if (!ingested.has(key)) {
+          ingestNativeMessage(message, conversation);
+          ingested.add(key);
+        }
+      } else if (params.nativeCommand === true || params.nativeFallback === true) {
+        handleSessionUpdate(params, conversation.sessionId, conversation);
+      }
+      continue;
+    }
+    if (update.sessionUpdate === "agent_thought_chunk") {
+      continue;
+    }
+    if (params.nativeCommand === true || params.nativeFallback === true || !role) {
+      handleSessionUpdate(params, conversation.sessionId, conversation);
+    }
+  }
+  for (const [key, message] of messagesByKey) {
+    if (!ingested.has(key)) {
+      ingestNativeMessage(message, conversation);
+    }
+  }
+  for (const record of nativeMessages) {
+    if (record?.role !== "assistant" || record.completion !== "streaming") {
+      continue;
+    }
+    const index = conversation.messageKeys.get(nativeMessageKey(record));
+    const message = Number.isInteger(index) ? conversation.messages[index] : null;
+    if (message?.completed === false) {
+      message.nativeHistoryFragment = true;
+    }
+  }
+}
+
+function handleSessionUpdate(params, expectedSessionId = null, targetConversation = null) {
   if (
     !params ||
     params._replay === true ||
@@ -4787,8 +5316,14 @@ function handleSessionUpdate(params, expectedSessionId = null) {
   if (!sessionId || (expectedSessionId && sessionId !== expectedSessionId)) {
     return;
   }
-  const conversation = conversationState(sessionId);
+  const conversation = targetConversation ?? conversationState(sessionId);
   const update = params.update;
+  if (conversation.newerHistoryHidden && [
+    "user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call",
+    "tool_call_update", "plan"
+  ].includes(update.sessionUpdate)) {
+    return;
+  }
   const acpOnly = params.nativeFallback === true || params.nativeCommand === true;
   const chatRole = update.sessionUpdate === "user_message_chunk"
     ? "user"
@@ -5504,6 +6039,8 @@ async function createServerConversation() {
     conversation.messages = [];
     conversation.messageKeys.clear();
     conversation.nativeMessagesActive = result.nativeMessageHistoryAvailable === true;
+    conversation.history = conversation.nativeMessagesActive
+      ? { hasMore: false, cursor: null, oversized: false } : null;
     conversation.nativeModeKnown = true;
     conversation.nativeEventIds.clear();
     conversation.pendingNativeMessages = [];
@@ -5610,6 +6147,227 @@ function applySessionReplacement(result, previousSessionId) {
   }
 }
 
+function mergeOlderAssistantHistoryFragment(current, older) {
+  if (
+    current?.role !== "assistant" ||
+    older?.role !== "assistant" ||
+    current.completed !== false ||
+    older.completed !== false ||
+    current.nativeHistoryFragment !== true ||
+    older.nativeHistoryFragment !== true
+  ) {
+    return false;
+  }
+
+  const currentText = typeof current.text === "string" ? current.text : "";
+  const olderText = typeof older.text === "string" ? older.text : "";
+  if (!olderText) {
+    return false;
+  }
+
+  current.text = `${olderText}${currentText}`;
+  return true;
+}
+
+function applyHistoryPage(page, conversation, replace = false) {
+  if (!page.history || !Array.isArray(page.nativeMessages) || !Array.isArray(page.replayUpdates)) {
+    throw new Error("The server returned an invalid conversation history page");
+  }
+  const canUpdateInPlace = !replace && isActiveConversation(conversation);
+  const panelScrollPositions = canUpdateInPlace
+    ? captureMessagePanelScroll(conversation)
+    : new Map();
+  const existingArticleIndexes = new Map();
+  if (canUpdateInPlace) {
+    elements.messages.querySelectorAll(".message").forEach((article) => {
+      existingArticleIndexes.set(article, Number(article.dataset.messageIndex));
+    });
+  }
+  const temporary = createConversationState(conversation.sessionId);
+  temporary.loading = true;
+  temporary.nativeMessagesActive = true;
+  temporary.nativeModeKnown = true;
+  replayPagedNativeHistory(page.replayUpdates, page.nativeMessages, temporary);
+  let addedMessages = [];
+  const modifiedMessages = new Set();
+  if (replace) {
+    conversation.messages = temporary.messages;
+    conversation.newerHistoryHidden = true;
+  } else {
+    const existing = new Map(
+      conversation.messages
+        .map((message) => [messageIdentity(message), message])
+        .filter(([identity]) => identity)
+    );
+    addedMessages = temporary.messages.filter((message) => {
+      const identity = messageIdentity(message);
+      if (message.role !== "tool" && identity && existing.has(identity)) {
+        const current = existing.get(identity);
+        if (current && mergeOlderAssistantHistoryFragment(current, message)) {
+          modifiedMessages.add(current);
+        }
+        return false;
+      }
+      if (message.role === "tool") {
+        let continuation = null;
+        for (const current of conversation.messages) {
+          if (current.role !== "tool") {
+            continue;
+          }
+          message.toolActivities = message.toolActivities.filter((activity) => {
+            const newer = current.toolActivities.find((item) => item.id === activity.id);
+            if (!newer) {
+              return true;
+            }
+            continuation = current;
+            if (newer.title === "Copilot tool") {
+              newer.title = activity.title;
+              modifiedMessages.add(current);
+            }
+            if (activity.detail && !newer.detail) {
+              newer.detail = activity.detail;
+              modifiedMessages.add(current);
+            }
+            return false;
+          });
+        }
+        if (continuation && message.thinkingText) {
+          if (!continuation.thinkingText.includes(message.thinkingText)) {
+            continuation.thinkingText = `${message.thinkingText}\n\n${continuation.thinkingText}`.trim();
+            modifiedMessages.add(continuation);
+          }
+          message.thinkingText = "";
+        }
+        if (message.toolActivities.length === 0 && !message.thinkingText) {
+          return false;
+        }
+      }
+      return true;
+    });
+    conversation.messages.unshift(...addedMessages);
+  }
+  conversation.history = page.history;
+  conversation.historyError = "";
+  reindexMessages(conversation);
+  if (isActiveConversation(conversation)) {
+    if (replace) {
+      conversation.preserveHistoryAnchor = true;
+      renderMessages(conversation);
+      delete conversation.preserveHistoryAnchor;
+    } else {
+      renderHistoryPageInPlace(
+        conversation,
+        addedMessages,
+        modifiedMessages,
+        panelScrollPositions,
+        existingArticleIndexes
+      );
+    }
+  }
+}
+
+async function loadOlderHistory(conversation = activeConversation()) {
+  if (!conversation?.history?.hasMore || conversation.loading) {
+    return;
+  }
+  if (conversation.historyLoading) {
+    await conversation.historyLoadPromise;
+    return;
+  }
+  const generation = conversation.historyGeneration;
+  const before = conversation.messages.find((message) => message.nativeMessageId)?.nativeMessageId;
+  const cursor = conversation.history.cursor;
+  if (typeof cursor !== "string" || cursor.length === 0) {
+    conversation.historyError = "Reload the latest messages to continue browsing history.";
+    renderHistoryStatusInPlace(conversation);
+    return;
+  }
+  const query = { cursor };
+  const messageCount = conversation.messages.length;
+  let continuePastEmptyPage = false;
+  conversation.historyLoading = true;
+  conversation.historyError = "";
+  renderHistoryStatusInPlace(conversation);
+  const pendingHistoryLoad = (async () => {
+    try {
+      const messageCount = conversation.messages.length;
+      let nextQuery = query;
+      for (let pageCount = 0; pageCount < 4; pageCount += 1) {
+        let page;
+        try {
+          page = await api(`/api/sessions/${encodeURIComponent(conversation.sessionId)}/history?${
+            new URLSearchParams(nextQuery)
+          }`);
+        } catch (error) {
+          if (error.status !== 410 || !before || nextQuery.before) {
+            throw error;
+          }
+          page = await api(`/api/sessions/${encodeURIComponent(conversation.sessionId)}/history?${
+            new URLSearchParams({ before })
+          }`);
+        }
+        if (generation !== conversation.historyGeneration) {
+          return;
+        }
+        applyHistoryPage(page, conversation);
+        if (
+          conversation.messages.length > messageCount ||
+          !conversation.history?.hasMore ||
+          !conversation.history.cursor
+        ) {
+          break;
+        }
+        nextQuery = { cursor: conversation.history.cursor };
+      }
+    } catch (error) {
+      if (generation === conversation.historyGeneration) {
+        conversation.historyError = error.message;
+      }
+    } finally {
+      if (generation === conversation.historyGeneration) {
+        conversation.historyLoading = false;
+        renderHistoryStatusInPlace(conversation);
+        continuePastEmptyPage = conversation.messages.length === messageCount &&
+          conversation.history?.hasMore === true &&
+          !conversation.historyError &&
+          isActiveConversation(conversation) &&
+          elements.messages.scrollTop < 160;
+      }
+    }
+  })();
+  conversation.historyLoadPromise = pendingHistoryLoad;
+  try {
+    await pendingHistoryLoad;
+  } finally {
+    if (conversation.historyLoadPromise === pendingHistoryLoad) {
+      conversation.historyLoadPromise = null;
+    }
+  }
+  if (continuePastEmptyPage && generation === conversation.historyGeneration) {
+    window.setTimeout(() => {
+      void loadOlderHistory(conversation);
+    }, 0);
+  }
+}
+
+function hasVisibleConversationMessages(conversation) {
+  const viewport = elements.messages.getBoundingClientRect();
+  const visibleMessage = (role) => [...elements.messages.querySelectorAll(`.message.${role}`)]
+    .some((article) => {
+      const bounds = article.getBoundingClientRect();
+      if (bounds.bottom <= viewport.top || bounds.top >= viewport.bottom) {
+        return false;
+      }
+      const message = conversation.messages[Number(article.dataset.messageIndex)];
+      return Boolean(message) &&
+        ((typeof message.text === "string" && message.text.trim().length > 0) ||
+          (Array.isArray(message.attachments) && message.attachments.length > 0));
+    });
+  const hasUserMessage = visibleMessage("user");
+  const hasAssistantMessage = visibleMessage("assistant");
+  return hasUserMessage || hasAssistantMessage;
+}
+
 // Without a requested context, the server reuses the conversation's last context.
 async function loadConversation(sessionId, requestedContext = undefined, force = false) {
   if (state.deletingSessionId) {
@@ -5645,8 +6403,36 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
   }
 
   activateConversation(sessionId);
+  const previousLoadState = {
+    sessionId: conversation.sessionId,
+    loaded: conversation.loaded,
+    messages: conversation.messages,
+    messageKeys: new Map(conversation.messageKeys),
+    nativeMessagesActive: conversation.nativeMessagesActive,
+    nativeModeKnown: conversation.nativeModeKnown,
+    nativeEventIds: new Set(conversation.nativeEventIds),
+    pendingNativeMessages: [...conversation.pendingNativeMessages],
+    history: conversation.history,
+    historyError: conversation.historyError,
+    newerHistoryHidden: conversation.newerHistoryHidden,
+    historyWarning: conversation.historyWarning,
+    scrollToLatest: conversation.scrollToLatest,
+    usage: conversation.usage,
+    contextUsage: conversation.contextUsage,
+    usageRevision: conversation.usageRevision,
+    sessionContext: conversation.sessionContext,
+    configOptions: conversation.configOptions
+  };
   selectionMessageRestorationCounts.delete(sessionId);
   conversation.loaded = false;
+  conversation.scrollToLatest = true;
+  conversation.historyGeneration += 1;
+  conversation.history = null;
+  conversation.historyLoading = false;
+  conversation.historyLoadPromise = null;
+  conversation.historyError = "";
+  conversation.newerHistoryHidden = false;
+  conversation.historyWarning = "";
   conversation.activeSessionIsNew = false;
   conversation.messages = [];
   conversation.messageKeys.clear();
@@ -5668,8 +6454,8 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
       method: "POST",
       body: JSON.stringify(
         requestedContext === undefined
-          ? { fallbackContext: state.selectedContext }
-          : { context: requestedContext }
+          ? { fallbackContext: state.selectedContext, historyPaging: true }
+          : { context: requestedContext, historyPaging: true }
       )
     });
     applySessionReplacement(result, sessionId);
@@ -5688,6 +6474,9 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
     const replayUpdates = Array.isArray(result.replayUpdates)
       ? result.replayUpdates
       : [];
+    const liveReplayUpdates = Array.isArray(result.liveReplayUpdates)
+      ? result.liveReplayUpdates
+      : [];
     conversation.nativeMessagesActive = result.nativeMessagesActive === true;
     conversation.nativeModeKnown = true;
     if (conversation.nativeMessagesActive || replayUpdates.length > 0) {
@@ -5698,8 +6487,38 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
     const nativeMessages = Array.isArray(result.nativeMessages)
       ? result.nativeMessages
       : [];
-    replayNativeHistory(replayUpdates, nativeMessages, conversation);
-    const pendingNativeMessages = conversation.pendingNativeMessages;
+    if (result.history?.replayMode === "acp") {
+      replayNativeHistory([...replayUpdates, ...liveReplayUpdates], nativeMessages, conversation);
+      const renderedChat = conversation.messages.some((message) => (
+        (message.role === "user" || message.role === "assistant") &&
+        ((typeof message.text === "string" && message.text.trim().length > 0) ||
+          (Array.isArray(message.attachments) && message.attachments.length > 0))
+      ));
+      if (!renderedChat && nativeMessages.some(hasNativeContent)) {
+        conversation.messages = [];
+        conversation.messageKeys.clear();
+        conversation.nativeEventIds.clear();
+        resetStreamTracking(conversation);
+        pendingMessageUpdates.delete(conversation);
+        replayPagedNativeHistory(replayUpdates, nativeMessages, conversation);
+        for (const params of liveReplayUpdates) {
+          handleSessionUpdate(params, conversation.sessionId, conversation);
+        }
+      }
+    } else if (result.history) {
+      replayPagedNativeHistory(replayUpdates, nativeMessages, conversation);
+      for (const params of liveReplayUpdates) {
+        handleSessionUpdate(params, conversation.sessionId, conversation);
+      }
+    } else {
+      replayNativeHistory([...replayUpdates, ...liveReplayUpdates], nativeMessages, conversation);
+    }
+    conversation.history = result.history ?? null;
+    conversation.historyWarning = result.historyWarning ?? "";
+    const pendingNativeMessages = [
+      ...(Array.isArray(result.liveNativeMessages) ? result.liveNativeMessages : []),
+      ...conversation.pendingNativeMessages
+    ];
     conversation.pendingNativeMessages = [];
     if (conversation.nativeMessagesActive) {
       for (const nativeMessage of pendingNativeMessages) {
@@ -5731,10 +6550,66 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
     }
     return true;
   } catch (error) {
+    if (
+      previousLoadState.loaded &&
+      conversation.sessionId === previousLoadState.sessionId
+    ) {
+      conversation.loaded = previousLoadState.loaded;
+      conversation.messages = previousLoadState.messages;
+      conversation.messageKeys = previousLoadState.messageKeys;
+      conversation.nativeMessagesActive = previousLoadState.nativeMessagesActive;
+      conversation.nativeModeKnown = previousLoadState.nativeModeKnown;
+      conversation.nativeEventIds = previousLoadState.nativeEventIds;
+      conversation.pendingNativeMessages = previousLoadState.pendingNativeMessages;
+      conversation.history = previousLoadState.history;
+      conversation.historyError = previousLoadState.historyError;
+      conversation.newerHistoryHidden = previousLoadState.newerHistoryHidden;
+      conversation.historyWarning = previousLoadState.historyWarning;
+      conversation.scrollToLatest = previousLoadState.scrollToLatest;
+      conversation.usage = previousLoadState.usage;
+      conversation.contextUsage = previousLoadState.contextUsage;
+      conversation.usageRevision = previousLoadState.usageRevision;
+      conversation.sessionContext = previousLoadState.sessionContext;
+      conversation.configOptions = previousLoadState.configOptions;
+      conversation.historyLoading = false;
+      conversation.historyLoadPromise = null;
+      renderUsage(conversation);
+      renderConversationControls();
+    }
     showError(error, conversation);
     return false;
   } finally {
     setLoading(false, conversation);
+    if (
+      conversation.loaded &&
+      conversation.history?.hasMore &&
+      isActiveConversation(conversation)
+    ) {
+      const generation = conversation.historyGeneration;
+      let page = 0;
+      for (; page < maximumInitialHistoryPages; page += 1) {
+        if (
+          generation !== conversation.historyGeneration ||
+          !isActiveConversation(conversation) ||
+          !conversation.history?.hasMore ||
+          conversation.historyError ||
+          (hasVisibleConversationMessages(conversation) &&
+            elements.messages.scrollHeight > elements.messages.clientHeight + 1)
+        ) {
+          break;
+        }
+        await loadOlderHistory(conversation);
+      }
+      if (
+        page === maximumInitialHistoryPages &&
+        conversation.messages.length === 0 &&
+        conversation.history?.hasMore &&
+        !conversation.historyError
+      ) {
+        conversation.historyError = "No chat messages found in the recent history pages. Retry to continue searching.";
+        renderMessages(conversation);
+      }
+    }
   }
 }
 
@@ -5996,7 +6871,14 @@ async function submitPrompt() {
   if (!conversation?.sessionId) {
     return;
   }
-  if (conversation.messages.length === 0 && conversation.sessionContext !== state.selectedContext) {
+  if (conversation.newerHistoryHidden) {
+    const loaded = await loadConversation(conversation.sessionId, undefined, true);
+    if (!loaded || currentComposerConversation() !== conversation) {
+      return;
+    }
+  }
+  if (conversation.activeSessionIsNew && conversation.messages.length === 0 &&
+      conversation.sessionContext !== state.selectedContext) {
     conversation = await createServerConversation() ?? activeConversation();
   }
   if (!conversation?.sessionId) {
@@ -6053,6 +6935,14 @@ function enqueuePrompt(
     optimisticMessage.clientPromptId = messageKey;
     optimisticMessage.localMessageKey = messageKey;
     optimisticMessage.optimisticPrompt = true;
+    if (selections.length > 0) {
+      const metadata = [...(selectionMessageMetadata[conversation.sessionId] ?? [])]
+        .reverse().find((entry) => entry.promptText === text && !entry.clientPromptId);
+      if (metadata) {
+        metadata.clientPromptId = messageKey;
+        writeSelectionMessageMetadata(metadata);
+      }
+    }
   }
   conversation.promptQueue.push(queuedPrompt);
   renderSessionList();
@@ -6072,10 +6962,16 @@ function enqueuePrompt(
   void drainPromptQueue(conversation);
 }
 
-function reconnectTools() {
+async function reconnectTools() {
   const conversation = activeConversation();
   if (!canReloadMcp(conversation)) {
     return;
+  }
+  if (conversation.newerHistoryHidden) {
+    const loaded = await loadConversation(conversation.sessionId, undefined, true);
+    if (!loaded || activeConversation() !== conversation || !canReloadMcp(conversation)) {
+      return;
+    }
   }
   enqueuePrompt(conversation, "/mcp reload", [], true);
 }
@@ -6320,6 +7216,18 @@ elements.newChat.addEventListener("click", () => {
   startNewConversation();
 });
 elements.messages.addEventListener("scroll", updateScrollToBottomButton, { passive: true });
+elements.messages.addEventListener("scroll", () => {
+  const conversation = activeConversation();
+  if (!conversation || conversation.loading) {
+    return;
+  }
+  const top = elements.messages.scrollTop;
+  const movedUp = top < conversation.lastScrollTop - 1;
+  conversation.lastScrollTop = top;
+  if (movedUp && top < 160 && !conversation.historyError) {
+    void loadOlderHistory(conversation);
+  }
+}, { passive: true });
 elements.messages.addEventListener("keydown", handleMessageSelectionKeydown);
 elements.messages.addEventListener("scroll", updateAskSelection, { passive: true });
 elements.messages.addEventListener("load", updateScrollToBottomButton, true);
@@ -6363,13 +7271,25 @@ document.addEventListener("pointercancel", () => {
 document.addEventListener("keyup", handleMessageSelectionKeyup);
 window.addEventListener("resize", updateAskSelection);
 elements.scrollToBottom.addEventListener("click", () => {
+  const conversation = activeConversation();
+  if (conversation?.newerHistoryHidden) {
+    void loadConversation(conversation.sessionId, undefined, true);
+    return;
+  }
   elements.messages.scrollTo({
     top: elements.messages.scrollHeight,
     behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
   });
   updateScrollToBottomButton();
 });
-const messagesResizeObserver = new ResizeObserver(updateScrollToBottomButton);
+const messagesResizeObserver = new ResizeObserver(() => {
+  updateScrollToBottomButton();
+  const conversation = activeConversation();
+  if (conversation && conversation.renderWidth !== elements.messages.clientWidth) {
+    conversation.renderWidth = elements.messages.clientWidth;
+    scheduleMessagesRender(conversation);
+  }
+});
 messagesResizeObserver.observe(elements.messages);
 elements.renameInput.addEventListener("keydown", (event) => {
   if (event.key !== "Enter") {

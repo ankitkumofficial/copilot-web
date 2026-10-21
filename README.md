@@ -13,8 +13,10 @@ keeps the model, tools, authentication, and workspace local.
 - Show each conversation's title, last activity, and working or queued status.
 - Rename conversations from the browser; custom titles are stored locally and
   survive browser and server restarts.
-- Select an existing conversation and resume it with its full history replayed
-  into the browser.
+- Select an existing conversation and load its latest messages, fetching older
+  history automatically when scrolling upward.
+- Bound history pages by both message count and bytes while retaining loaded
+  transcript pages and drafts as you switch conversations.
 - Show each completed user message and Copilot reply's recorded date and time
   in the browser's local timezone, using **Today, 1:18 PM** for messages from
   today and the date for older messages; the tooltip gives the full date and
@@ -160,6 +162,57 @@ recorded event timestamp never receives an inferred or current time. Copilot
 does not record command output such as `/mcp reload` (used by **Reconnect
 tools**), so it is shown without a timestamp.
 
+### Display history and AI context
+
+History pagination changes only the web transcript, not the native conversation
+or the AI request. The bridge still restores the original session through ACP
+and sends only the new prompt and attachments to that same session ID. It never
+constructs the model's context from the visible messages, truncates the native
+journal, or creates a replacement session to evict a display cache. Model,
+context-tier, reasoning, cancellation, and permission behavior are unchanged.
+Copilot's own context-window limits and compaction still apply independently.
+
+With the backward persisted-history API (verified with CLI 1.0.100), pages
+target a 128 KiB persisted-event payload and contain at most 20 displayable
+user or assistant messages. Empty assistant events that only request tools and
+their tool activity do not consume the message count, so a tool-heavy turn can
+span more event records. If the newest bounded page contains only tool activity,
+the browser continues through bounded pages until recent chat is available or
+it reaches a 32-page scan safety limit. Older turns load as the reader scrolls
+upward. The byte budget can stop a page after only one or two
+long messages; it is not a fixed 20-message allocation. One indivisible oversized
+event is returned alone and intact rather than silently truncating its text or
+attachments. Supplemental ACP text/activity and live updates have separate
+bounded buffers. These are payload/cache budgets, not hard limits on browser or
+CLI RSS.
+
+The browser retains every page it has loaded and renders those messages in one
+chronological transcript; it does not evict newer rows or replace them with
+estimated-height spacers. Scrolling upward automatically fetches the next
+bounded page, preserving the visible message's position. The down-arrow returns
+to the latest loaded messages. Jumping to an unloaded selected passage opens
+the containing page and offers **Return to latest messages**; sending from
+there restores the latest page without changing the session or prompt.
+
+The server retains bounded recent ACP replay and native-message caches rather
+than whole replay streams for native-backed conversations. Historical ACP
+replay is not broadcast through SSE. Display cursors are bounded and
+short-lived; concurrent requests share a native continuation, failed reads can
+be retried, and expired cursors can be rebased using the oldest visible native
+message ID. Selection links use
+stable native message IDs to fetch an unloaded source passage. History-only
+requests never activate a session or submit a prompt.
+
+The initial ACP restore still replays history internally because this CLI does
+not advertise no-replay resume. Native AI-session state and its lifetime are
+deliberately not evicted by the web cache policy. If the persisted-history API
+is unavailable or fails, the bridge falls back to a complete ACP replay of the
+same native session. If that session is already active, it closes and reloads
+the same session before replaying; it does not create a new session or change
+the model context. If a complete replay cannot be performed safely, the load
+fails explicitly and keeps the previously displayed transcript instead of
+showing a truncated cache as complete history.
+
 ## Running
 
 ```shell
@@ -259,7 +312,11 @@ brand mark uses `C`.
   SDK and Copilot CLI supporting `sessions.readPersistedEvents`. If it is
   unavailable or unreadable, ACP replay remains available, but older messages
   may not have recorded timestamps.
-- When loading history, native messages are placed beside ACP tool and
+- Paged history reconstructs messages, recorded reasoning, and tool activity
+  from the native persisted journal. Small complete histories and compatibility
+  fallback also preserve ACP-only output, such as native command replies,
+  when it is retained in the recent replay cache.
+- When matching complete native and ACP history, native messages are placed beside ACP tool and
   reasoning activity by conversation turn, using the tool-call IDs both sources
   share. If a turn's native and ACP messages cannot be matched exactly, that
   part of the transcript is shown from ACP rather than risking shifted or
@@ -279,7 +336,7 @@ translates ACP JSON-RPC messages into a small HTTP/SSE API. The static browser
 client consumes that API; Copilot credentials, model calls, file access, shell
 commands, MCP servers, and tool execution remain in the local CLI process.
 Native user and assistant messages are sourced from the Copilot event stream
-and read-only persisted-event snapshots; ACP remains authoritative for tools
+and read-only persisted-event snapshots; ACP remains authoritative for live tools
 and configuration activity, with persisted assistant reasoning restored when
 available.
 

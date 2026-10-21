@@ -34,9 +34,17 @@ import {
   applyNativeMessageEvent,
   CopilotHistoryReader,
   createNativeMessageCollection,
+  HistoryCursorExpiredError,
+  HistoryPager,
+  historyPageMaximumBytes,
+  historyPageMaximumMessages,
+  historyReplayUpdates,
   isNativeMessageEvent,
   isRootAgentMessageEvent,
+  mergePagedHistoryReplayUpdates,
   mergeNativeMessages,
+  nativeMessagesFromEvents,
+  type HistoryPage,
   type NativeMessage,
   type NativeMessageCollection
 } from "./history.js";
@@ -121,6 +129,12 @@ interface NativeHistoryReadHandle {
   promise: Promise<JsonObject[]>;
   bufferedEvents: JsonObject[];
   release(): void;
+}
+
+interface PagedHistoryReplayBuffer {
+  updates: JsonObject[];
+  bytes: number;
+  truncated: boolean;
 }
 
 interface SessionUsage {
@@ -369,6 +383,18 @@ function jsonResponse(response: ServerResponse, status: number, body: unknown): 
 
 function sseEvent(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function replayUpdateSignature(params: JsonObject): string {
+  const update = isRecord(params.update) ? params.update : {};
+  return JSON.stringify([
+    update.sessionUpdate,
+    update.messageId,
+    update.toolCallId,
+    update.status,
+    update.content,
+    params.nativeCommand === true
+  ]);
 }
 
 async function readJsonBody(request: IncomingMessage): Promise<JsonObject> {
@@ -933,6 +959,7 @@ async function main(): Promise<void> {
     allowAll
   });
   await copilotHistory.initialize();
+  const historyPager = new HistoryPager((request) => copilotHistory.readPage(request));
 
   const browserCapabilities = () => {
     const capabilities = acp.getCapabilities();
@@ -951,10 +978,13 @@ async function main(): Promise<void> {
   const sessionUsageWrites = new SerialTaskQueue();
   const sessionActivityWrites = new SerialTaskQueue();
   const replayingSessions = new Map<string, JsonObject[]>();
+  const fallbackReplayTails = new Map<string, JsonObject[]>();
   const busySessions = new Map<string, BusyPrompt>();
   const nativeMessageStates = new Map<string, NativeMessageCollection>();
   const nativePipelineModes = new Map<string, boolean>();
   const nativeHistoryReads = new Map<string, NativeHistoryRead>();
+  const pagedHistoryBuffers = new Map<string, Set<Map<string, NativeMessage>>>();
+  const pagedHistoryReplayBuffers = new Map<string, Set<PagedHistoryReplayBuffer>>();
   const deletingSessions = new Set<string>();
   const deletedSessions = new Set<string>();
   const activeSessionOperations = new Map<string, number>();
@@ -962,6 +992,136 @@ async function main(): Promise<void> {
   const sessionOperationWaiters = new Map<string, Set<() => void>>();
   const sseClients = new Set<SseClient>();
   const browserToken = randomBytes(32).toString("hex");
+  const truncatedReplays = new Set<string>();
+  const legacyReplaySessions = new Set<string>();
+  const maximumReplayBytes = 512 * 1024;
+  const maximumReplaySessions = 8;
+  const replaySizes = new WeakMap<JsonObject[], { sizes: number[]; bytes: number }>();
+
+  const retainReplay = (sessionId: string, replay: JsonObject[], cache = true): void => {
+    // Legacy ACP-only history cannot be read back independently, so retain its compatibility path.
+    if (copilotHistory.available && !legacyReplaySessions.has(sessionId)) {
+      let measured = replaySizes.get(replay);
+      if (!measured) {
+        measured = { sizes: [], bytes: 0 };
+        replaySizes.set(replay, measured);
+      }
+      for (let index = measured.sizes.length; index < replay.length; index += 1) {
+        const entry = replay[index];
+        if (!entry) {
+          continue;
+        }
+        const size = Buffer.byteLength(JSON.stringify(entry));
+        measured.sizes.push(size);
+        measured.bytes += size;
+      }
+      let start = 0;
+      while (start < measured.sizes.length && (
+        measured.bytes > maximumReplayBytes || measured.sizes.length - start > 1000
+      )) {
+        measured.bytes -= measured.sizes[start] ?? 0;
+        start += 1;
+      }
+      if (start > 0) {
+        replay.splice(0, start);
+        measured.sizes.splice(0, start);
+        truncatedReplays.add(sessionId);
+      }
+      if (!cache) {
+        return;
+      }
+      sessionReplayCache.delete(sessionId);
+      while (sessionReplayCache.size >= maximumReplaySessions) {
+        const oldest = [...sessionReplayCache.keys()].find((id) => (
+          !busySessions.has(id) && !legacyReplaySessions.has(id)
+        ));
+        if (oldest === undefined) {
+          break;
+        }
+        sessionReplayCache.delete(oldest);
+        truncatedReplays.add(oldest);
+      }
+    }
+    if (cache) {
+      sessionReplayCache.set(sessionId, replay);
+    }
+  };
+
+  const trimNativeState = (sessionId: string): void => {
+    const state = nativeMessageStates.get(sessionId);
+    if (!state) {
+      return;
+    }
+    let bytes = 0;
+    for (let index = state.order.length - 1; index >= 0; index -= 1) {
+      const key = state.order[index];
+      const message = key ? state.messages.get(key) : undefined;
+      if (!message) {
+        continue;
+      }
+      bytes += Buffer.byteLength(JSON.stringify(message));
+      if (index < state.order.length - 1 && (
+        bytes > maximumReplayBytes || state.order.length - index > 64
+      )) {
+        for (const oldKey of state.order.splice(0, index + 1)) {
+          state.messages.delete(oldKey);
+        }
+        break;
+      }
+    }
+    while (state.eventIds.size > 1000) {
+      const first = state.eventIds.values().next().value;
+      if (first === undefined) {
+        break;
+      }
+      state.eventIds.delete(first);
+    }
+    nativeMessageStates.delete(sessionId);
+    nativeMessageStates.set(sessionId, state);
+    for (const id of nativeMessageStates.keys()) {
+      if (nativeMessageStates.size <= maximumReplaySessions) {
+        break;
+      }
+      if (id !== sessionId && !busySessions.has(id)) {
+        nativeMessageStates.delete(id);
+      }
+    }
+  };
+
+  const displayHistory = (
+    sessionId: string,
+    page: HistoryPage,
+    includeReplay = false,
+    liveReplay: readonly JsonObject[] = []
+  ) => {
+    const nativeMessages = nativeMessagesFromEvents(page.events);
+    const cachedReplay = sessionReplayCache.get(sessionId) ?? [];
+    const useCompleteReplay = includeReplay && cachedReplay.length > 0 &&
+      !page.hasMore && !truncatedReplays.has(sessionId) &&
+      Buffer.byteLength(JSON.stringify({ cachedReplay, nativeMessages })) <= historyPageMaximumBytes;
+    const replayUpdates = useCompleteReplay
+      ? [...cachedReplay]
+      : mergePagedHistoryReplayUpdates(
+        sessionId,
+        page.events,
+        nativeMessages,
+        cachedReplay,
+        []
+      );
+    return {
+      nativeMessages,
+      replayUpdates,
+      ...(liveReplay.length > 0 ? { liveReplayUpdates: [...liveReplay] } : {}),
+      history: {
+        hasMore: page.hasMore,
+        cursor: page.cursor ?? null,
+        oversized: page.oversized,
+        maxMessages: historyPageMaximumMessages,
+        maxBytes: historyPageMaximumBytes,
+        replayMode: useCompleteReplay ? "acp" : "native"
+      }
+    };
+  };
 
   const nativeMessageState = (sessionId: string): NativeMessageCollection => {
     let state = nativeMessageStates.get(sessionId);
@@ -1224,6 +1384,10 @@ async function main(): Promise<void> {
     sessionCache.set(setup.sessionId, replacement);
     sessionCache.delete(previousSessionId);
     sessionReplayCache.delete(previousSessionId);
+    fallbackReplayTails.delete(previousSessionId);
+    historyPager.forget(previousSessionId);
+    truncatedReplays.delete(previousSessionId);
+    legacyReplaySessions.delete(previousSessionId);
     nativeMessageStates.delete(previousSessionId);
     nativePipelineModes.delete(previousSessionId);
     nativePipelineModes.set(setup.sessionId, copilotHistory.available);
@@ -1296,7 +1460,23 @@ async function main(): Promise<void> {
           isRecord(params.update) && params.update.messageId === pendingMessageId
         ))
         : [];
-      sessionReplayCache.set(sessionId, [...replay, ...pendingUpdates]);
+      const completeReplay = [...replay, ...pendingUpdates];
+      const fallbackTail = fallbackReplayTails.get(sessionId);
+      if (fallbackTail) {
+        const signatures = new Set(completeReplay.map(replayUpdateSignature));
+        for (const update of fallbackTail) {
+          const signature = replayUpdateSignature(update);
+          if (!signatures.has(signature)) {
+            completeReplay.push(update);
+            signatures.add(signature);
+          }
+        }
+        fallbackReplayTails.delete(sessionId);
+      }
+      if (legacyReplaySessions.has(sessionId)) {
+        truncatedReplays.delete(sessionId);
+      }
+      retainReplay(sessionId, completeReplay);
     }
   });
   acp.events.on("sessionUpdate", (event: { context: ContextTier; params: JsonObject }) => {
@@ -1310,9 +1490,7 @@ async function main(): Promise<void> {
     if (sessionId) {
       const replay = replayingSessions.get(sessionId) ?? sessionReplayCache.get(sessionId) ?? [];
       replay.push(event.params);
-      if (!replayingSessions.has(sessionId)) {
-        sessionReplayCache.set(sessionId, replay);
-      }
+      retainReplay(sessionId, replay, !replayingSessions.has(sessionId));
     }
     if (
       sessionId &&
@@ -1323,6 +1501,9 @@ async function main(): Promise<void> {
       touchSessionActivity(sessionId);
     }
     const replaying = replayingSessions.has(sessionId ?? "");
+    if (replaying) {
+      return;
+    }
     const activePrompt = !replaying && sessionId
       ? busySessions.get(sessionId)
       : undefined;
@@ -1341,9 +1522,19 @@ async function main(): Promise<void> {
     const updateParams = activePromptId
       ? { ...event.params, clientPromptId: activePromptId }
       : event.params;
+    const updateBytes = Buffer.byteLength(JSON.stringify(updateParams));
+    for (const buffer of pagedHistoryReplayBuffers.get(sessionId ?? "") ?? []) {
+      if (buffer.bytes + updateBytes <= Math.floor(historyPageMaximumBytes / 2) &&
+          buffer.updates.length < 1000) {
+        buffer.updates.push(updateParams);
+        buffer.bytes += updateBytes;
+      } else {
+        buffer.truncated = true;
+      }
+    }
     publish(
       "session-update",
-      replaying ? { ...updateParams, _replay: true } : updateParams,
+      updateParams,
       sessionId
     );
   });
@@ -1353,6 +1544,9 @@ async function main(): Promise<void> {
     }
     const sessionId = typeof event.params.sessionId === "string" ? event.params.sessionId : undefined;
     if (sessionId && deletedSessions.has(sessionId)) {
+      return;
+    }
+    if (sessionId && replayingSessions.has(sessionId) && isNativeMessageEvent(event.params)) {
       return;
     }
     if (sessionId) {
@@ -1402,6 +1596,10 @@ async function main(): Promise<void> {
       );
       if (!nativeMessage) {
         return;
+      }
+      trimNativeState(sessionId);
+      for (const buffer of pagedHistoryBuffers.get(sessionId) ?? []) {
+        buffer.set(`${nativeMessage.role}:${nativeMessage.messageId}`, nativeMessage);
       }
       if (nativeMessage.role === "user" && busyPrompt) {
         busyPrompt.nativeUserMessageId = nativeMessage.messageId;
@@ -1762,6 +1960,10 @@ async function main(): Promise<void> {
         sessionCache.delete(sessionId);
         sessionReplayCache.delete(sessionId);
         nativeMessageStates.delete(sessionId);
+        historyPager.forget(sessionId);
+        truncatedReplays.delete(sessionId);
+        legacyReplaySessions.delete(sessionId);
+        fallbackReplayTails.delete(sessionId);
         nativePipelineModes.delete(sessionId);
         busySessions.delete(sessionId);
         replayingSessions.delete(sessionId);
@@ -1828,17 +2030,86 @@ async function main(): Promise<void> {
       throw new HttpError(404, "API route not found");
     }
 
+    if (request.method === "GET" && subroute === "history") {
+      if (!copilotHistory.available) {
+        throw new HttpError(409, "Paged history requires the Copilot persisted-history API");
+      }
+      const cursor = requestUrl.searchParams.get("cursor");
+      const before = requestUrl.searchParams.get("before");
+      const around = requestUrl.searchParams.get("around");
+      const position = cursor ?? before ?? around;
+      if (!position || position.length > 200 || [cursor, before, around].filter(Boolean).length !== 1) {
+        throw new HttpError(400, "One valid conversation history position is required");
+      }
+      try {
+        const page = cursor !== null
+          ? await historyPager.read(sessionId, cursor)
+          : await historyPager.seek(sessionId, position, around !== null);
+        ensureSessionAvailable(sessionId);
+        jsonResponse(response, 200, displayHistory(sessionId, page));
+      } catch (error) {
+        if (error instanceof HistoryCursorExpiredError) {
+          throw new HttpError(410, error.message);
+        }
+        throw error;
+      }
+      return true;
+    }
+
     if (request.method === "POST" && subroute === "load") {
       const body = await readJsonBody(request);
+      if (body.historyPaging !== undefined && typeof body.historyPaging !== "boolean") {
+        throw new HttpError(400, "historyPaging must be a boolean");
+      }
       const sessionWasUnprompted = acp.isSessionUnprompted(sessionId);
-      const nativeHistoryRead = startNativeHistoryRead(sessionId);
+      const liveHistoryMessages = new Map<string, NativeMessage>();
+      const historyPagingRequested = body.historyPaging === true;
+      const liveHistoryReplay: PagedHistoryReplayBuffer = {
+        updates: [],
+        bytes: 0,
+        truncated: false
+      };
+      if (historyPagingRequested) {
+        const buffers = pagedHistoryBuffers.get(sessionId) ?? new Set();
+        buffers.add(liveHistoryMessages);
+        pagedHistoryBuffers.set(sessionId, buffers);
+        const replayBuffers = pagedHistoryReplayBuffers.get(sessionId) ?? new Set();
+        replayBuffers.add(liveHistoryReplay);
+        pagedHistoryReplayBuffers.set(sessionId, replayBuffers);
+      }
+      let historyPage: HistoryPage | undefined;
+      let historyWarning: string | undefined;
+      if (historyPagingRequested && sessionWasUnprompted) {
+        historyPage = { events: [], hasMore: false, oversized: false };
+      } else if (historyPagingRequested && !copilotHistory.available) {
+        historyWarning = "This Copilot CLI cannot page stored history; using compatible ACP replay.";
+      }
+      if (
+        historyPagingRequested &&
+        !sessionWasUnprompted &&
+        copilotHistory.available
+      ) {
+        try {
+          // Pin the persisted generation before ACP activation can compact or rewrite it.
+          historyPage = await historyPager.read(sessionId);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(`[history] Paged history unavailable for ${sessionId}: ${message}`);
+          historyWarning = `Paged history unavailable; using ACP history: ${message}`;
+        }
+      }
+      const nativeHistoryRead = historyPage ? undefined : startNativeHistoryRead(sessionId);
       let persistedNativeEvents: JsonObject[] = [];
-      let nativeHistoryReadSucceeded = sessionWasUnprompted && copilotHistory.available;
+      let nativeHistoryReadSucceeded = historyPage !== undefined ||
+        (sessionWasUnprompted && copilotHistory.available);
+      if (historyPage) {
+        persistedNativeEvents = historyPage.events;
+      }
       try {
         if (nativeHistoryRead) {
           persistedNativeEvents = await nativeHistoryRead.promise;
           nativeHistoryReadSucceeded = true;
-        } else if (!sessionWasUnprompted && copilotHistory.available) {
+        } else if (!historyPage && !sessionWasUnprompted && copilotHistory.available) {
           console.warn(
             `[history] Unable to start persisted-message read for ${sessionId}`
           );
@@ -1848,6 +2119,21 @@ async function main(): Promise<void> {
         console.warn(
           `[history] Unable to read persisted messages for ${sessionId}: ${message}`
         );
+      }
+      if (historyPagingRequested && !historyPage && nativeHistoryReadSucceeded) {
+        historyPage = {
+          events: persistedNativeEvents,
+          hasMore: false,
+          oversized: persistedNativeEvents.some((event) => (
+            Buffer.byteLength(JSON.stringify(event)) > historyPageMaximumBytes
+          ))
+        };
+        historyWarning = "Paged history was unavailable; the complete native transcript was loaded.";
+      }
+      if (nativeHistoryReadSucceeded) {
+        legacyReplaySessions.delete(sessionId);
+      } else {
+        legacyReplaySessions.add(sessionId);
       }
 
       try {
@@ -1864,8 +2150,36 @@ async function main(): Promise<void> {
         const context = busy
           ? previousContext ?? requestedContext
           : requestedContext;
+        const acpFallbackReplay = historyPagingRequested &&
+          !historyPage &&
+          !nativeHistoryReadSucceeded;
+        const replayCompleteAcpHistory = acpFallbackReplay &&
+          previousContext !== undefined;
+        if (acpFallbackReplay && busy) {
+          throw new HttpError(
+            503,
+            "History could not be read safely while this conversation is active. Wait for the current reply to finish and retry."
+          );
+        }
+        if (
+          replayCompleteAcpHistory &&
+          !acp.getCapabilities(previousContext ?? context).sessionCapabilities.close
+        ) {
+          throw new HttpError(
+            503,
+            "History could not be read safely, and this Copilot CLI cannot replay the active session. The existing transcript was left unchanged."
+          );
+        }
         let setup: SessionSetup;
         let persistenceWarnings: string[] = [];
+        if (acpFallbackReplay) {
+          fallbackReplayTails.set(
+            sessionId,
+            [...(sessionReplayCache.get(sessionId) ?? [])]
+          );
+          sessionReplayCache.delete(sessionId);
+          truncatedReplays.delete(sessionId);
+        }
         if (busy) {
           setup = {
             sessionId,
@@ -1873,6 +2187,9 @@ async function main(): Promise<void> {
           };
         } else {
           setup = await withSessionOperation(sessionId, async () => {
+            if (replayCompleteAcpHistory) {
+              await acp.closeSession(sessionId);
+            }
             const loaded = await acp.loadSession(session, context);
             const replacement = await replaceEmptySession(session, loaded);
             session = replacement.session;
@@ -1894,11 +2211,12 @@ async function main(): Promise<void> {
           }, setup.sessionId);
         }
         const state = nativeMessageState(setup.sessionId);
-        const nativeMessagesActive = copilotHistory.available && (
-          nativeHistoryReadSucceeded ||
-          state.messages.size > 0
-        );
-        nativePipelineModes.set(setup.sessionId, nativeMessagesActive);
+        const nativeMessagesActive = !acpFallbackReplay &&
+          copilotHistory.available && (
+            nativeHistoryReadSucceeded ||
+            state.messages.size > 0
+          );
+        nativePipelineModes.set(setup.sessionId, copilotHistory.available);
         let nativeMessages: NativeMessage[] = [];
         if (nativeMessagesActive) {
           if (nativeHistoryReadSucceeded) {
@@ -1933,6 +2251,29 @@ async function main(): Promise<void> {
             }
           }
         }
+        trimNativeState(setup.sessionId);
+        retainReplay(setup.sessionId, sessionReplayCache.get(setup.sessionId) ?? []);
+        const pagedDisplay = historyPage
+          ? displayHistory(
+            setup.sessionId,
+            historyPage,
+            true,
+            liveHistoryReplay.updates
+          )
+          : undefined;
+        if (historyPage && busyPrompt) {
+          for (const message of nativeMessagesForState(state)) {
+            if (message.clientPromptId === busyPrompt.clientPromptId) {
+              liveHistoryMessages.set(`${message.role}:${message.messageId}`, message);
+            }
+          }
+        }
+        const loadWarnings = [
+          historyWarning,
+          liveHistoryReplay.truncated
+            ? "Some live activity arrived during history loading and could not fit in the page buffer."
+            : undefined
+        ].filter((warning): warning is string => warning !== undefined);
         jsonResponse(response, 200, {
           session: sessionView,
           context,
@@ -1942,14 +2283,40 @@ async function main(): Promise<void> {
           busy,
           ...(busyPrompt ? { promptId: busyPrompt.promptId } : {}),
           usage: sessionUsageCache.get(setup.sessionId) ?? null,
-          replayUpdates: [...(sessionReplayCache.get(setup.sessionId) ?? [])],
+          replayUpdates: pagedDisplay?.replayUpdates ??
+            [...(sessionReplayCache.get(setup.sessionId) ?? [])],
           nativeMessagesActive,
-          ...(nativeMessagesActive ? { nativeMessages } : {}),
+          ...(nativeMessagesActive ? {
+            nativeMessages: pagedDisplay?.nativeMessages ?? nativeMessages
+          } : {}),
+          ...(pagedDisplay ? {
+            history: pagedDisplay.history,
+            liveNativeMessages: [...liveHistoryMessages.values()],
+            ...(pagedDisplay.liveReplayUpdates
+              ? { liveReplayUpdates: pagedDisplay.liveReplayUpdates }
+              : {})
+          } : {}),
+          ...(loadWarnings.length > 0 ? { historyWarning: loadWarnings.join(" ") } : {}),
           ...(persistenceWarnings.length > 0 ? { persistenceWarnings } : {})
         });
+        if (acpFallbackReplay) {
+          legacyReplaySessions.delete(sessionId);
+          truncatedReplays.delete(sessionId);
+          retainReplay(sessionId, sessionReplayCache.get(sessionId) ?? []);
+        }
         return true;
       } finally {
         nativeHistoryRead?.release();
+        const buffers = pagedHistoryBuffers.get(sessionId);
+        buffers?.delete(liveHistoryMessages);
+        if (buffers?.size === 0) {
+          pagedHistoryBuffers.delete(sessionId);
+        }
+        const replayBuffers = pagedHistoryReplayBuffers.get(sessionId);
+        replayBuffers?.delete(liveHistoryReplay);
+        if (replayBuffers?.size === 0) {
+          pagedHistoryReplayBuffers.delete(sessionId);
+        }
       }
     }
 
@@ -2039,7 +2406,7 @@ async function main(): Promise<void> {
           userReplayEntries.push(entry);
           replay.push(entry);
         }
-        sessionReplayCache.set(sessionId, replay);
+        retainReplay(sessionId, replay);
         touchSessionActivity(sessionId);
         if (body.reconnect === true && !busyPrompt.cancelController.signal.aborted) {
           stopReason = await withSessionOperation(sessionId, () => (
@@ -2072,6 +2439,9 @@ async function main(): Promise<void> {
                 if (commandPrompt) {
                   update.nativeCommand = true;
                 }
+                if (busyPrompt.clientPromptId) {
+                  update.clientPromptId = busyPrompt.clientPromptId;
+                }
                 publish("session-update", {
                   ...update,
                   ...(busyPrompt.clientPromptId
@@ -2079,6 +2449,15 @@ async function main(): Promise<void> {
                     : {}),
                   ...(commandPrompt ? { nativeCommand: true } : { nativeFallback: true })
                 }, sessionId);
+              }
+            }
+            if (commandPrompt && busyPrompt.clientPromptId) {
+              for (const buffer of pagedHistoryReplayBuffers.get(sessionId) ?? []) {
+                for (const params of buffer.updates) {
+                  if (params.clientPromptId === busyPrompt.clientPromptId) {
+                    params.nativeCommand = true;
+                  }
+                }
               }
             }
           }

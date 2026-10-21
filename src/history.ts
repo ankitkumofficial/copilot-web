@@ -17,6 +17,7 @@ export interface PersistedEventsRequest {
   sessionId: string;
   cursor?: string;
   max: number;
+  direction?: "backward";
 }
 
 export interface PersistedEventsPage {
@@ -131,6 +132,387 @@ function parsePersistedEventsPage(value: unknown): PersistedEventsPage {
     events: value.events,
     hasMore: value.hasMore
   };
+}
+
+export const historyPageMaximumMessages = 20;
+export const historyPageMaximumBytes = 128 * 1024;
+const historyCursorLifetimeMs = 4 * 60_000;
+const maximumHistoryCursors = 8;
+const maximumHistoryCacheBytes = 8 * 1024 * 1024;
+
+export class HistoryCursorExpiredError extends Error {
+  public constructor() {
+    super("Conversation history has changed or its page expired. Reload the latest messages to continue.");
+  }
+}
+
+export interface HistoryPage {
+  events: JsonObject[];
+  cursor?: string;
+  hasMore: boolean;
+  oversized: boolean;
+}
+
+interface HistorySnapshot {
+  sessionId: string;
+  pending: JsonObject[];
+  sourceCursor?: string;
+  hasMore: boolean;
+}
+
+interface HistoryCursor {
+  sessionId: string;
+  touchedAt: number;
+  snapshot: HistorySnapshot;
+  result?: Promise<HistoryPage> | undefined;
+  bytes: number;
+}
+
+function isHistoryEvent(event: JsonObject): boolean {
+  return isRootAgentMessageEvent(event) && (
+    isNativeMessageEvent(event) ||
+    event.type === "tool.execution_start" ||
+    event.type === "tool.execution_complete"
+  );
+}
+
+function isDisplayableMessageEvent(event: JsonObject): boolean {
+  if (!isNativeMessageEvent(event) || !isRecord(event.data)) {
+    return false;
+  }
+  if (event.type === "user.message") {
+    return (typeof event.data.content === "string" && event.data.content.length > 0) ||
+      nativeAttachments(event.data.attachments).length > 0;
+  }
+  return event.type === "assistant.message" &&
+    ((typeof event.data.content === "string" && event.data.content.trim().length > 0) ||
+      nativeAttachments(event.data.attachments).length > 0);
+}
+
+// These snapshots are display-only. No cursor or page is used to resume or prompt an AI session.
+export class HistoryPager {
+  private readonly cursors = new Map<string, HistoryCursor>();
+
+  public constructor(
+    private readonly readPage: PersistedEventsPageReader,
+    private readonly now: () => number = Date.now
+  ) {}
+
+  public async read(sessionId: string, cursor?: string): Promise<HistoryPage> {
+    this.prune();
+    if (cursor !== undefined) {
+      const continuation = this.cursors.get(cursor);
+      if (!continuation || continuation.sessionId !== sessionId) {
+        throw new HistoryCursorExpiredError();
+      }
+      continuation.touchedAt = this.now();
+      // Native cursors are single-use: retries share a successful read, but a failed read is retryable.
+      if (!continuation.result) {
+        const snapshot = {
+          ...continuation.snapshot,
+          pending: [...continuation.snapshot.pending]
+        };
+        continuation.result = this.next(snapshot).then((page) => {
+          continuation.bytes += Buffer.byteLength(JSON.stringify(page));
+          this.prune();
+          return page;
+        }).catch((error: unknown) => {
+          continuation.result = undefined;
+          throw error;
+        });
+      }
+      return continuation.result;
+    }
+    return this.next({ sessionId, pending: [], hasMore: true });
+  }
+
+  public forget(sessionId: string): void {
+    for (const [cursor, continuation] of this.cursors) {
+      if (continuation.sessionId === sessionId) {
+        this.cursors.delete(cursor);
+      }
+    }
+  }
+
+  public async seek(sessionId: string, messageId: string, includeMessage = false): Promise<HistoryPage> {
+    let page = await this.read(sessionId);
+    for (let count = 0; count < maximumPersistedHistoryPages; count += 1) {
+      let index = -1;
+      for (let candidate = page.events.length - 1; candidate >= 0; candidate -= 1) {
+        const event = page.events[candidate];
+        if (event && isNativeMessageEvent(event) && isRecord(event.data) &&
+            event.data.messageId === messageId) {
+          index = candidate;
+          break;
+        }
+      }
+      if (index >= 0) {
+        const events = page.events.slice(0, index + (includeMessage ? 1 : 0));
+        if (events.length === 0 && page.cursor) {
+          return this.read(sessionId, page.cursor);
+        }
+        return { ...page, events };
+      }
+      if (!page.cursor) {
+        throw new HistoryCursorExpiredError();
+      }
+      page = await this.read(sessionId, page.cursor);
+    }
+    throw new Error("Conversation history is too large to locate this message");
+  }
+
+  private prune(): void {
+    let bytes = 0;
+    const oldest = [...this.cursors].sort((a, b) => a[1].touchedAt - b[1].touchedAt);
+    for (const [cursor, continuation] of oldest) {
+      if (this.now() - continuation.touchedAt >= historyCursorLifetimeMs) {
+        this.cursors.delete(cursor);
+      } else {
+        bytes += continuation.bytes;
+      }
+    }
+    for (const [cursor, continuation] of oldest) {
+      if (this.cursors.size <= maximumHistoryCursors && bytes <= maximumHistoryCacheBytes) {
+        break;
+      }
+      if (this.cursors.delete(cursor)) {
+        bytes -= continuation.bytes;
+      }
+    }
+  }
+
+  private async next(snapshot: HistorySnapshot): Promise<HistoryPage> {
+    const events: JsonObject[] = [];
+    let bytes = 2;
+    let displayableMessages = 0;
+    let reads = 0;
+    while (true) {
+      if (displayableMessages >= historyPageMaximumMessages) {
+        break;
+      }
+      if (snapshot.pending.length === 0) {
+        if (!snapshot.hasMore || reads >= 8) {
+          break;
+        }
+        const previousCursor = snapshot.sourceCursor;
+        const page = parsePersistedEventsPage(await this.readPage({
+          sessionId: snapshot.sessionId,
+          max: historyPageMaximumMessages,
+          direction: "backward",
+          ...(previousCursor === undefined ? {} : { cursor: previousCursor })
+        }));
+        if (page.cursorStatus === "expired") {
+          throw new HistoryCursorExpiredError();
+        }
+        if (page.hasMore && (!page.cursor || page.cursor === previousCursor)) {
+          throw new Error("Copilot returned an invalid backward-history cursor");
+        }
+        snapshot.pending = page.events.filter(isHistoryEvent);
+        snapshot.sourceCursor = page.cursor;
+        snapshot.hasMore = page.hasMore;
+        reads += 1;
+        if (snapshot.pending.length === 0) {
+          continue;
+        }
+      }
+      const event = snapshot.pending.at(-1);
+      if (!event) {
+        break;
+      }
+      const eventBytes = Buffer.byteLength(JSON.stringify(event)) + 1;
+      if (events.length > 0 && (
+        bytes + eventBytes > historyPageMaximumBytes - 16 * 1024 ||
+        displayableMessages >= historyPageMaximumMessages
+      )) {
+        break;
+      }
+      snapshot.pending.pop();
+      events.unshift(event);
+      bytes += eventBytes;
+      if (isDisplayableMessageEvent(event)) {
+        displayableMessages += 1;
+      }
+    }
+    const hasMore = snapshot.pending.length > 0 || snapshot.hasMore;
+    const result: HistoryPage = {
+      events,
+      hasMore,
+      oversized: bytes > historyPageMaximumBytes
+    };
+    if (hasMore) {
+      const cursor = randomUUID();
+      result.cursor = cursor;
+      this.cursors.set(cursor, {
+        sessionId: snapshot.sessionId,
+        snapshot,
+        touchedAt: this.now(),
+        bytes: Buffer.byteLength(JSON.stringify(snapshot.pending))
+      });
+      this.prune();
+    }
+    return result;
+  }
+}
+
+export function historyReplayUpdates(sessionId: string, events: readonly JsonObject[]): JsonObject[] {
+  const updates: JsonObject[] = [];
+  for (const event of events) {
+    if (!isHistoryEvent(event) || !isRecord(event.data)) {
+      continue;
+    }
+    const data = event.data;
+    if (isNativeMessageEvent(event)) {
+      if (event.type === "assistant.message_start" || event.type === "assistant.message_delta") {
+        continue;
+      }
+      updates.push({
+        sessionId,
+        update: {
+          sessionUpdate: event.type === "user.message" ? "user_message_chunk" : "agent_message_chunk",
+          messageId: data.messageId,
+          content: { type: "text", text: "" }
+        }
+      });
+      if (Array.isArray(data.toolRequests)) {
+        for (const tool of data.toolRequests) {
+          if (isRecord(tool) && typeof tool.toolCallId === "string") {
+            updates.push({
+              sessionId,
+              update: {
+                sessionUpdate: "tool_call",
+                toolCallId: tool.toolCallId,
+                title: typeof tool.name === "string" ? tool.name : "Copilot tool",
+                status: "pending"
+              }
+            });
+          }
+        }
+      }
+    } else if (typeof data.toolCallId === "string") {
+      const result = isRecord(data.result) ? data.result : undefined;
+      const error = isRecord(data.error) ? data.error : undefined;
+      const detail = typeof result?.detailedContent === "string" ? result.detailedContent
+        : typeof result?.content === "string" ? result.content
+          : typeof error?.message === "string" ? error.message
+            : "";
+      updates.push({
+        sessionId,
+        update: {
+          sessionUpdate: event.type === "tool.execution_start" ? "tool_call" : "tool_call_update",
+          toolCallId: data.toolCallId,
+          ...(typeof data.toolTitle === "string" ? { title: data.toolTitle }
+            : typeof data.toolName === "string" ? { title: data.toolName } : {}),
+          status: event.type === "tool.execution_start" ? "in_progress"
+            : data.success === false ? "failed" : "completed",
+          ...(detail ? { content: { type: "text", text: detail } } : {})
+        }
+      });
+    }
+  }
+  return updates;
+}
+
+export function mergePagedHistoryReplayUpdates(
+  sessionId: string,
+  events: readonly JsonObject[],
+  nativeMessages: readonly NativeMessage[],
+  cachedReplay: readonly JsonObject[],
+  liveReplay: readonly JsonObject[] = []
+): JsonObject[] {
+  const toolCallIds = new Set<string>();
+  for (const message of nativeMessages) {
+    for (const toolCallId of message.toolCallIds ?? []) {
+      toolCallIds.add(toolCallId);
+    }
+  }
+  for (const event of events) {
+    if (!isHistoryEvent(event) || !isRecord(event.data)) {
+      continue;
+    }
+    const data = event.data;
+    if (typeof data.toolCallId === "string") {
+      toolCallIds.add(data.toolCallId);
+    }
+    if (Array.isArray(data.toolRequests)) {
+      for (const request of data.toolRequests) {
+        if (isRecord(request) && typeof request.toolCallId === "string") {
+          toolCallIds.add(request.toolCallId);
+        }
+      }
+    }
+  }
+
+  const cachedTools = new Map<string, JsonObject[]>();
+  const cachedCommands = new Map<string, JsonObject[]>();
+  for (const params of cachedReplay) {
+    if (!isRecord(params.update)) {
+      continue;
+    }
+    const update = params.update;
+    if (params.nativeCommand === true) {
+      const promptId = typeof params.clientPromptId === "string"
+        ? params.clientPromptId
+        : "legacy-command";
+      const group = cachedCommands.get(promptId) ?? [];
+      group.push(params);
+      cachedCommands.set(promptId, group);
+      continue;
+    }
+    const toolCallId = typeof update.toolCallId === "string"
+      ? update.toolCallId
+      : undefined;
+    if (!toolCallId || !toolCallIds.has(toolCallId)) {
+      continue;
+    }
+    const group = cachedTools.get(toolCallId) ?? [];
+    group.push(params);
+    cachedTools.set(toolCallId, group);
+  }
+
+  const maximumCachedBytes = Math.floor(historyPageMaximumBytes / 2);
+  let cachedBytes = 0;
+  const keepRecentGroups = (
+    groups: Map<string, JsonObject[]>,
+    maximumGroups = groups.size
+  ): Map<string, JsonObject[]> => {
+    const entries = [...groups].slice(-maximumGroups);
+    const kept: Array<[string, JsonObject[]]> = [];
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (!entry) {
+        continue;
+      }
+      const size = Buffer.byteLength(JSON.stringify(entry[1]));
+      if (cachedBytes + size <= maximumCachedBytes) {
+        cachedBytes += size;
+        kept.unshift(entry);
+      }
+    }
+    return new Map(kept);
+  };
+  const recentTools = keepRecentGroups(cachedTools);
+  const recentCommands = keepRecentGroups(cachedCommands, 4);
+  const result: JsonObject[] = [];
+  const emittedTools = new Set<string>();
+  for (const params of historyReplayUpdates(sessionId, events)) {
+    const update = isRecord(params.update) ? params.update : undefined;
+    const toolCallId = typeof update?.toolCallId === "string"
+      ? update.toolCallId
+      : undefined;
+    if (toolCallId) {
+      const cached = recentTools.get(toolCallId);
+      if (cached && !emittedTools.has(toolCallId)) {
+        result.push(...cached);
+        emittedTools.add(toolCallId);
+      }
+    }
+    result.push(params);
+  }
+  for (const updates of recentCommands.values()) {
+    result.push(...updates);
+  }
+  result.push(...liveReplay);
+  return result;
 }
 
 export async function readAllPersistedEvents(
@@ -248,6 +630,7 @@ export class CopilotHistoryReader {
         this.failure ?? "Copilot persisted message history is unavailable"
       );
     }
+
     await this.client.start();
     // The SDK recreates RPC bindings after reconnecting, so resolve them for every read.
     return readAllPersistedEvents(
@@ -255,6 +638,14 @@ export class CopilotHistoryReader {
       sessionId,
       (event) => isNativeMessageEvent(event) && isRootAgentMessageEvent(event)
     );
+  }
+
+  public async readPage(request: PersistedEventsRequest): Promise<unknown> {
+    if (!this.ready || !this.client) {
+      throw new Error(this.failure ?? "Copilot persisted message history is unavailable");
+    }
+    await this.client.start();
+    return this.currentPageReader()(request);
   }
 
   private currentPageReader(): PersistedEventsPageReader {
