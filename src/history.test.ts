@@ -8,11 +8,18 @@ import {
   applyNativeMessageEvent,
   CopilotHistoryReader,
   createNativeMessageCollection,
+  HistoryCursorExpiredError,
+  HistoryPager,
+  historyPageMaximumBytes,
+  historyPageMaximumMessages,
+  historyReplayUpdates,
   mergeNativeMessages,
+  mergePagedHistoryReplayUpdates,
   nativeMessagesFromEvents,
   readAllPersistedEvents,
   type NativeMessage
 } from "./history.js";
+import { isRecord, type JsonObject } from "./acp.js";
 
 const reconnectingSdk = `
 export const RuntimeConnection = { forStdio: (options) => options };
@@ -349,4 +356,330 @@ test("merges persisted and buffered events without letting stale live text repla
   const mergedWithNewerLive = mergeNativeMessages(persisted, [], [newerLiveMessage]);
   assert.equal(mergedWithNewerLive[0]?.content, "Updated final answer");
   assert.equal(mergedWithNewerLive[0]?.reasoningText, "Thought before the answer");
+});
+
+function pagingFixture(count: number, content = "History") {
+  const events: JsonObject[] = Array.from({ length: count }, (_, index) => ({
+    id: `event-${index}`,
+    type: index % 2 === 0 ? "user.message" : "assistant.message",
+    timestamp: new Date(Date.UTC(2026, 9, 20, 0, index)).toISOString(),
+    data: { messageId: `message-${index}`, content: `${content} ${index}` }
+  }));
+  const calls: Array<{ cursor?: string; direction?: string; max: number }> = [];
+  const used = new Set<string>();
+  const positions = new Map<string, number>();
+  const pager = new HistoryPager(async (request) => {
+    calls.push(request);
+    assert.equal(request.direction, "backward");
+    if (request.cursor) {
+      assert.equal(used.has(request.cursor), false, "Native cursors must never be reused");
+      used.add(request.cursor);
+    }
+    const end = request.cursor === undefined ? events.length : positions.get(request.cursor);
+    assert.notEqual(end, undefined);
+    const boundary = end ?? 0;
+    const start = Math.max(0, boundary - request.max);
+    const next = `${calls.length}:${start}`;
+    positions.set(next, start);
+    return {
+      events: events.slice(start, boundary),
+      cursor: next,
+      hasMore: start > 0,
+      cursorStatus: "ok"
+    };
+  });
+  return { pager, events, calls };
+}
+
+test("pages newest-first with bounded counts and chronological, lossless messages", async () => {
+  const { pager, events, calls } = pagingFixture(103);
+  let page = await pager.read("session-1");
+  assert.deepEqual(page.events, events.slice(-historyPageMaximumMessages));
+  assert.equal(calls.length, 1, "The initial page must not scan the full journal");
+  let collected = page.events;
+  while (page.cursor) {
+    page = await pager.read("session-1", page.cursor);
+    assert.ok(page.events.length <= historyPageMaximumMessages);
+    collected = [...page.events, ...collected];
+  }
+  assert.deepEqual(collected, events);
+  assert.equal(page.hasMore, false);
+});
+
+test("uses byte limits before message limits and returns a single oversized event intact", async () => {
+  const { pager, events } = pagingFixture(10, "Long reply ".repeat(4000));
+  let page = await pager.read("session-1");
+  assert.ok(page.events.length < 10);
+  assert.ok(Buffer.byteLength(JSON.stringify(page.events)) <= historyPageMaximumBytes);
+  const collected = [...page.events];
+  while (page.cursor) {
+    page = await pager.read("session-1", page.cursor);
+    collected.unshift(...page.events);
+  }
+  assert.deepEqual(collected, events);
+  const oversized = pagingFixture(2, "x".repeat(historyPageMaximumBytes * 2));
+  const largePage = await oversized.pager.read("session-1");
+  assert.equal(largePage.events.length, 1);
+  assert.equal(largePage.oversized, true);
+  assert.deepEqual(largePage.events, oversized.events.slice(-1));
+});
+
+test("counts attachment-only assistant replies toward the page message limit", async () => {
+  const { pager, events } = pagingFixture(25);
+  for (const event of events) {
+    event.type = "assistant.message";
+    assert.ok(isRecord(event.data));
+    event.data.content = "";
+    event.data.attachments = [{
+      type: "file",
+      displayName: "reply.pdf",
+      mimeType: "application/pdf",
+      data: "YQ=="
+    }];
+  }
+
+  const page = await pager.read("session-1");
+
+  assert.equal(page.events.length, historyPageMaximumMessages);
+  assert.equal(page.hasMore, true);
+  assert.ok(page.cursor);
+});
+
+test("shares cursor reads for concurrent requests and retries without consuming native cursors twice", async () => {
+  const { pager, calls } = pagingFixture(60);
+  const first = await pager.read("session-1");
+  assert.ok(first.cursor);
+  const pages = await Promise.all([
+    pager.read("session-1", first.cursor),
+    pager.read("session-1", first.cursor)
+  ]);
+  assert.deepEqual(pages[0], pages[1]);
+  assert.deepEqual(await pager.read("session-1", first.cursor), pages[0]);
+  assert.equal(calls.length, 2);
+  await assert.rejects(pager.read("other-session", first.cursor), HistoryCursorExpiredError);
+  pager.forget("session-1");
+  await assert.rejects(pager.read("session-1", first.cursor), HistoryCursorExpiredError);
+});
+
+test("expires and bounds display cursors and rebases by stable message ID", async () => {
+  const { pager, events } = pagingFixture(300);
+  const first = await pager.read("session-1");
+  assert.ok(first.cursor);
+  let page = first;
+  for (let index = 0; index < 10; index += 1) {
+    assert.ok(page.cursor);
+    page = await pager.read("session-1", page.cursor);
+  }
+  await assert.rejects(pager.read("session-1", first.cursor), HistoryCursorExpiredError);
+  const older = await pager.seek("session-1", "message-270");
+  assert.deepEqual(older.events, events.slice(260, 270));
+  const source = await pager.seek("session-1", "message-5", true);
+  assert.deepEqual(source.events, events.slice(0, 6));
+  await assert.rejects(pager.seek("session-1", "missing-message"), HistoryCursorExpiredError);
+
+  let now = 0;
+  const expiring = new HistoryPager(async () => ({
+    events: events.slice(-20), cursor: "next", cursorStatus: "ok", hasMore: true
+  }), () => now);
+  const snapshot = await expiring.read("session-1");
+  assert.ok(snapshot.cursor);
+  now += 5 * 60_000;
+  await assert.rejects(expiring.read("session-1", snapshot.cursor), HistoryCursorExpiredError);
+});
+
+test("rejects native cursor expiry and malformed pages instead of returning partial success", async () => {
+  for (const response of [
+    { events: [], cursor: "", cursorStatus: "expired", hasMore: false },
+    { events: [], cursor: "", cursorStatus: "ok", hasMore: true },
+    { events: "not-events", cursor: "", cursorStatus: "ok", hasMore: false }
+  ]) {
+    const pager = new HistoryPager(async () => response);
+    await assert.rejects(pager.read("session-1"));
+  }
+});
+
+test("retries a failed history cursor without advancing or losing its pending events", async () => {
+  let fail = true;
+  const requests: Array<{ cursor?: string }> = [];
+  const latestEvents = Array.from({ length: historyPageMaximumMessages }, (_, index) => ({
+    id: `latest-${index}`,
+    type: "user.message",
+    data: { messageId: `latest-${index}`, content: `Latest ${index}` }
+  }));
+  const pager = new HistoryPager(async (request) => {
+    requests.push(request);
+    if (request.cursor === "native-cursor-1" && fail) {
+      fail = false;
+      throw new Error("Temporary persisted-history read failure");
+    }
+    if (request.cursor === undefined) {
+      return {
+        events: latestEvents,
+        cursor: "native-cursor-1",
+        cursorStatus: "ok",
+        hasMore: true
+      };
+    }
+    assert.equal(request.cursor, "native-cursor-1");
+    return {
+      events: [{ id: "older", type: "user.message", data: { messageId: "older", content: "Older" } }],
+      cursor: "",
+      cursorStatus: "ok",
+      hasMore: false
+    };
+  });
+  const first = await pager.read("session-1");
+  assert.ok(first.cursor);
+  await assert.rejects(pager.read("session-1", first.cursor), /Temporary persisted-history/);
+  const retry = await pager.read("session-1", first.cursor);
+  assert.equal(retry.events[0]?.id, "older");
+  assert.equal(requests.filter((request) => request.cursor === "native-cursor-1").length, 2);
+});
+
+test("pages past empty tool-only assistant messages until it finds visible chat", async () => {
+  const visible = pagingFixture(20).events;
+  const toolRounds = Array.from({ length: 60 }, (_, index) => ({
+    id: `tool-only-${index}`,
+    type: "assistant.message",
+    data: {
+      messageId: `tool-only-message-${index}`,
+      content: "",
+      toolRequests: [{ toolCallId: `tool-only-call-${index}`, name: "read_file" }]
+    }
+  }));
+  const events = [...visible, ...toolRounds];
+  const calls: Array<{ cursor?: string }> = [];
+  const positions = new Map<string, number>();
+  const pager = new HistoryPager(async (request) => {
+    calls.push(request);
+    const end = request.cursor === undefined ? events.length : positions.get(request.cursor);
+    assert.notEqual(end, undefined);
+    const boundary = end ?? 0;
+    const start = Math.max(0, boundary - request.max);
+    const cursor = `page-${calls.length}-${start}`;
+    positions.set(cursor, start);
+    return {
+      events: events.slice(start, boundary),
+      cursor,
+      cursorStatus: "ok",
+      hasMore: start > 0
+    };
+  });
+  const page = await pager.read("session-1");
+  assert.equal(calls.length, 4);
+  assert.equal(page.events.length, 80);
+  assert.equal(page.events.filter((event) => (
+    event.type === "user.message" ||
+    (event.type === "assistant.message" && isRecord(event.data) &&
+      typeof event.data.content === "string" && event.data.content.trim().length > 0)
+  )).length, historyPageMaximumMessages);
+  assert.deepEqual(page.events.slice(0, 20), visible);
+  assert.equal(page.hasMore, false);
+});
+
+test("projects persisted tools and reasoning without duplicating chat text or subagent events", () => {
+  const events = [
+    { id: "user", type: "user.message", data: { messageId: "u", content: "Question" } },
+    {
+      id: "thought", type: "assistant.message",
+      data: { messageId: "a", content: "", reasoningText: "Investigate", toolRequests: [
+        { toolCallId: "tool-1", name: "Read files" }
+      ] }
+    },
+    { id: "start", type: "tool.execution_start", data: { toolCallId: "tool-1", toolTitle: "Inspect source" } },
+    {
+      id: "finish", type: "tool.execution_complete",
+      data: { toolCallId: "tool-1", success: true, result: { content: "Output" } }
+    },
+    { id: "child", type: "assistant.message", agentId: "child", data: { messageId: "child", content: "Hidden" } }
+  ];
+  const updates = historyReplayUpdates("session-1", events);
+  assert.equal(updates.length, 5);
+  assert.ok(updates.every((entry) => entry.sessionId === "session-1"));
+  const final = updates.at(-1);
+  assert.ok(final && isRecord(final.update));
+  assert.equal(final.update.status, "completed");
+  assert.deepEqual(final.update.content, { type: "text", text: "Output" });
+  assert.equal(JSON.stringify(updates).includes("Question"), false);
+  assert.equal(JSON.stringify(updates).includes("Hidden"), false);
+});
+
+test("keeps native chat separate while merging bounded tool details, commands, and live updates", () => {
+  const events: JsonObject[] = [
+    { id: "user-event", type: "user.message", data: { messageId: "user-1", content: "Question" } },
+    {
+      id: "tool-request", type: "assistant.message",
+      data: { messageId: "assistant-tool", content: "", toolRequests: [
+        { toolCallId: "tool-1", name: "read_file" }
+      ] }
+    },
+    { id: "tool-start", type: "tool.execution_start", data: { toolCallId: "tool-1", toolTitle: "Read source" } },
+    { id: "tool-end", type: "tool.execution_complete", data: {
+      toolCallId: "tool-1", success: true, result: { detailedContent: "Stored output" }
+    } },
+    { id: "answer-event", type: "assistant.message", data: { messageId: "answer-1", content: "Persisted answer" } }
+  ];
+  const native = nativeMessagesFromEvents(events);
+  const update = (sessionUpdate: string, messageId: string, text: string, extra: JsonObject = {}): JsonObject => ({
+    sessionId: "session-1",
+    update: {
+      sessionUpdate,
+      messageId,
+      content: { type: "text", text },
+      ...extra
+    }
+  });
+  const cached: JsonObject[] = [
+    update("user_message_chunk", "user-1", "Question"),
+    update("agent_message_chunk", "assistant-tool", ""),
+    {
+      sessionId: "session-1",
+      update: { sessionUpdate: "tool_call", toolCallId: "tool-1", title: "Read source", status: "in_progress" }
+    },
+    {
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "tool_call_update", toolCallId: "tool-1", title: "Read source",
+        status: "completed", content: { type: "text", text: "Stored tool detail" }
+      }
+    },
+    update("agent_message_chunk", "answer-1", "Recovered answer text"),
+    {
+      sessionId: "session-1",
+      nativeCommand: true,
+      clientPromptId: "command-prompt",
+      update: { sessionUpdate: "agent_message_chunk", messageId: "command-answer", content: { type: "text", text: "MCP reload completed" } }
+    },
+    update("agent_message_chunk", "unrelated", "Do not include")
+  ];
+  const live: JsonObject[] = [{
+    sessionId: "session-1",
+    clientPromptId: "live-prompt",
+    update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Live reasoning" } }
+  }];
+  const merged = mergePagedHistoryReplayUpdates("session-1", events, native, cached, live);
+  const serialized = JSON.stringify(merged);
+  assert.equal(serialized.includes("Question"), false);
+  assert.equal(serialized.includes("Recovered answer text"), false);
+  assert.ok(serialized.includes("Stored tool detail"));
+  assert.ok(serialized.includes("MCP reload completed"));
+  assert.ok(serialized.includes("Live reasoning"));
+  assert.equal(serialized.includes("Do not include"), false);
+  assert.equal(native.find((message) => message.messageId === "answer-1")?.content, "Persisted answer");
+});
+
+test("budgets UTF-8 text and attachment data instead of only counting messages", async () => {
+  const unicode = pagingFixture(4, "\u{1f600}".repeat(20_000));
+  const textPage = await unicode.pager.read("session-1");
+  assert.equal(textPage.events.length, 1);
+  assert.ok(Buffer.byteLength(JSON.stringify(textPage.events)) < historyPageMaximumBytes);
+  const attachments = pagingFixture(4);
+  const data = Buffer.alloc(48 * 1024).toString("base64");
+  for (const event of attachments.events) {
+    assert.ok(isRecord(event.data));
+    event.data.attachments = [{ displayName: "image.png", mimeType: "image/png", data }];
+  }
+  const attachmentPage = await attachments.pager.read("session-1");
+  assert.equal(attachmentPage.events.length, 1);
+  assert.deepEqual(attachmentPage.events, attachments.events.slice(-1));
 });
