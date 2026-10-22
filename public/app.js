@@ -122,6 +122,7 @@ function createConversationState(sessionId = null) {
     historyGeneration: 0,
     newerHistoryHidden: false,
     lastScrollTop: 0,
+    lastScrollAtBottom: true,
     configurationBusy: false,
     attachmentBusy: false,
     pendingPermission: null,
@@ -2842,6 +2843,75 @@ function createToolGroup(toolGroupKey) {
   };
 }
 
+function mergeToolGroupContents(older, newer, target) {
+  const olderThinking = typeof older.thinkingText === "string" ? older.thinkingText : "";
+  const newerThinking = typeof newer.thinkingText === "string" ? newer.thinkingText : "";
+  if (!olderThinking) {
+    target.thinkingText = newerThinking;
+  } else if (!newerThinking || olderThinking.includes(newerThinking)) {
+    target.thinkingText = olderThinking;
+  } else if (newerThinking.includes(olderThinking)) {
+    target.thinkingText = newerThinking;
+  } else {
+    target.thinkingText = `${olderThinking}\n\n${newerThinking}`;
+  }
+
+  const activities = [];
+  const activitiesById = new Map();
+  const mergeActivities = (source, isNewer) => {
+    for (const activity of Array.isArray(source.toolActivities) ? source.toolActivities : []) {
+      const existing = activitiesById.get(activity.id);
+      if (!existing) {
+        const copy = { ...activity };
+        activities.push(copy);
+        activitiesById.set(copy.id, copy);
+        continue;
+      }
+      if (!isNewer) {
+        continue;
+      }
+      if (
+        typeof activity.title === "string" &&
+        activity.title.length > 0 &&
+        (activity.title !== "Copilot tool" || existing.title === "Copilot tool")
+      ) {
+        existing.title = activity.title;
+      }
+      if (typeof activity.status === "string" && activity.status.length > 0) {
+        existing.status = activity.status;
+      }
+      if (typeof activity.detail === "string" && activity.detail.length > 0) {
+        existing.detail = activity.detail;
+      }
+    }
+  };
+  mergeActivities(older, false);
+  mergeActivities(newer, true);
+  target.toolActivities = activities;
+  target.thinkingExpanded = older.thinkingExpanded === true || newer.thinkingExpanded === true;
+  target.toolActivitiesExpanded =
+    older.toolActivitiesExpanded === true || newer.toolActivitiesExpanded === true;
+  target.acpThinking = older.acpThinking === true || newer.acpThinking === true;
+  target.lastPart = newer.lastPart ?? older.lastPart;
+}
+
+// Page boundaries can split one uninterrupted Thinking panel into adjacent tool groups.
+function mergeAdjacentToolGroups(messages, conversation) {
+  for (let index = 0; index < messages.length - 1;) {
+    const older = messages[index];
+    const newer = messages[index + 1];
+    if (older?.role !== "tool" || newer?.role !== "tool") {
+      index += 1;
+      continue;
+    }
+    mergeToolGroupContents(older, newer, older);
+    if (conversation.currentToolGroupKey === newer.toolGroupKey) {
+      conversation.currentToolGroupKey = older.toolGroupKey;
+    }
+    messages.splice(index + 1, 1);
+  }
+}
+
 function ensureToolGroup(conversation = activeConversation() ?? state.composer) {
   conversation.lastStreamRole = "tool";
   let group = conversation.currentToolGroupKey
@@ -3902,6 +3972,7 @@ function mountMessageAtIndex(conversation, index) {
   const article = elements.messages.querySelector(`[data-message-index="${index}"]`);
   article?.scrollIntoView({ block: "center" });
   conversation.lastScrollTop = elements.messages.scrollTop;
+  conversation.lastScrollAtBottom = messagesAreAtBottom();
 }
 
 function createHistoryControl(conversation, newer = false) {
@@ -3980,6 +4051,7 @@ function restoreMessageScrollAnchor(conversation, anchor) {
     elements.messages.scrollTop = anchor.scrollTop;
   }
   conversation.lastScrollTop = elements.messages.scrollTop;
+  conversation.lastScrollAtBottom = messagesAreAtBottom();
 }
 
 function syncMessageEmptyState(conversation) {
@@ -4305,16 +4377,21 @@ function renderMessages(conversation = activeConversation()) {
   if (conversation !== activeConversation()) {
     return;
   }
+  const isRenderedConversation = renderedMessagesConversation === conversation;
   const preservedSelection = preserveMessageTextSelection(conversation);
-  if (renderedMessagesConversation !== conversation) {
+  if (!isRenderedConversation) {
     clearMessageSelectionHighlight();
   }
   const wasAtBottom = conversation?.scrollToLatest ||
-    (messagesAreAtBottom() && !conversation?.preserveHistoryAnchor);
-  const previousScrollTop = elements.messages.scrollTop;
-  const previousScrollLeft = elements.messages.scrollLeft;
+    (isRenderedConversation
+      ? messagesAreAtBottom() && !conversation?.preserveHistoryAnchor
+      : conversation?.lastScrollAtBottom === true);
+  const previousScrollTop = isRenderedConversation
+    ? elements.messages.scrollTop
+    : conversation?.lastScrollTop ?? 0;
+  const previousScrollLeft = isRenderedConversation ? elements.messages.scrollLeft : 0;
   const viewportTop = elements.messages.getBoundingClientRect().top;
-  const anchorArticle = renderedMessagesConversation === conversation
+  const anchorArticle = isRenderedConversation
     ? [...elements.messages.querySelectorAll(".message")]
       .find((article) => article.getBoundingClientRect().bottom > viewportTop + 1)
     : null;
@@ -4385,6 +4462,7 @@ function renderMessages(conversation = activeConversation()) {
   restoreMessageTextSelection(preservedSelection);
   updateScrollToBottomButton();
   conversation.lastScrollTop = elements.messages.scrollTop;
+  conversation.lastScrollAtBottom = messagesAreAtBottom();
   conversation.scrollToLatest = false;
 }
 
@@ -5883,7 +5961,17 @@ function persistComposerDraft() {
   conversation.draft = elements.input.value;
 }
 
+function saveActiveConversationScroll() {
+  const conversation = currentComposerConversation();
+  if (renderedMessagesConversation !== conversation) {
+    return;
+  }
+  conversation.lastScrollTop = elements.messages.scrollTop;
+  conversation.lastScrollAtBottom = messagesAreAtBottom();
+}
+
 function activateConversation(sessionId) {
+  saveActiveConversationScroll();
   persistComposerDraft();
   void stopVoiceInput();
   const conversation = conversationState(sessionId);
@@ -5912,6 +6000,7 @@ function activateConversation(sessionId) {
 }
 
 function activateComposerConversation(conversation = state.composer) {
+  saveActiveConversationScroll();
   state.activeSessionId = null;
   clearActiveSessionId();
   elements.input.value = conversation.draft;
@@ -6188,6 +6277,7 @@ function applyHistoryPage(page, conversation, replace = false) {
   temporary.nativeMessagesActive = true;
   temporary.nativeModeKnown = true;
   replayPagedNativeHistory(page.replayUpdates, page.nativeMessages, temporary);
+  mergeAdjacentToolGroups(temporary.messages, temporary);
   let addedMessages = [];
   const modifiedMessages = new Set();
   if (replace) {
@@ -6244,6 +6334,16 @@ function applyHistoryPage(page, conversation, replace = false) {
       }
       return true;
     });
+    const olderGroup = addedMessages.at(-1);
+    const newerGroup = conversation.messages[0];
+    if (olderGroup?.role === "tool" && newerGroup?.role === "tool") {
+      mergeToolGroupContents(olderGroup, newerGroup, newerGroup);
+      if (conversation.currentToolGroupKey === olderGroup.toolGroupKey) {
+        conversation.currentToolGroupKey = newerGroup.toolGroupKey;
+      }
+      addedMessages.pop();
+      modifiedMessages.add(newerGroup);
+    }
     conversation.messages.unshift(...addedMessages);
   }
   conversation.history = page.history;
@@ -7224,6 +7324,7 @@ elements.messages.addEventListener("scroll", () => {
   const top = elements.messages.scrollTop;
   const movedUp = top < conversation.lastScrollTop - 1;
   conversation.lastScrollTop = top;
+  conversation.lastScrollAtBottom = messagesAreAtBottom();
   if (movedUp && top < 160 && !conversation.historyError) {
     void loadOlderHistory(conversation);
   }
