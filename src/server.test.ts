@@ -3121,6 +3121,88 @@ test("groups persisted reasoning from consecutive tool rounds into one Thinking 
   `), ["History lookup", "Search files", "Read file"]);
 });
 
+test("keeps one Thinking panel when a refreshed turn spans history pages", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 30_000
+}, async (t) => {
+  const rounds = Array.from({ length: 6 }, (_, index) => nativeTranscriptEvent(
+    "assistant.message",
+    `paged-round-${index + 1}`,
+    "",
+    index + 1,
+    {
+      reasoningText: `Round ${index + 1} reasoning. ${"detail ".repeat(6_000)}`,
+      toolRequests: [{
+        toolCallId: `paged-round-tool-${index + 1}`,
+        name: `Inspect ${index + 1}`
+      }]
+    }
+  ));
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: {
+      events: [
+        nativeTranscriptEvent("user.message", "paged-round-user", "Investigate", 0),
+        ...rounds,
+        nativeTranscriptEvent("assistant.message", "paged-round-answer", "Investigation done", 7)
+      ]
+    }
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const historyComplete = `
+    document.querySelectorAll(".tool-activity-item").length === 6 &&
+    document.querySelector(".message.user .message-body")?.textContent === "Investigate" &&
+    !document.querySelector("#history-loading") &&
+    !document.querySelector("#load-older-messages")
+  `;
+  const loadAllPages = async () => {
+    for (let page = 0; page < 5; page += 1) {
+      if (await evaluate(historyComplete)) {
+        return;
+      }
+      if (!await scrollUpAndWaitForHistory(evaluate, waitFor)) {
+        break;
+      }
+    }
+    await waitFor(historyComplete);
+  };
+
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Investigation done")`);
+  await loadAllPages();
+
+  await evaluate("window.beforeThinkingReload = true");
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`
+    window.beforeThinkingReload !== true &&
+    document.querySelector("#messages")?.textContent.includes("Investigation done")
+  `);
+  await loadAllPages();
+
+  assert.equal(await evaluate(`document.querySelectorAll(".message.tool").length`), 1);
+  assert.deepEqual(await evaluate(`
+    Array.from(document.querySelectorAll(".tool-activity-title"))
+      .map((element) => element.textContent)
+  `), rounds.map((_, index) => `Inspect ${index + 1}`));
+  const reasoning = String(await evaluate(`
+    document.querySelector(".thinking-content-text")?.textContent ?? ""
+  `));
+  const reasoningPositions = rounds.map((_, index) => (
+    reasoning.indexOf(`Round ${index + 1} reasoning.`)
+  ));
+  assert.ok(reasoningPositions.every((position) => position >= 0), reasoning);
+  assert.deepEqual(
+    reasoningPositions,
+    [...reasoningPositions].sort((left, right) => left - right)
+  );
+});
+
 test("maps queued prompts to native messages and leaves cancelled replies untimed", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 30_000
@@ -3357,7 +3439,62 @@ test("shows a jump-to-bottom button without interrupting conversation scrolling"
   assert.equal(await evaluate(`${button}.hidden && ${button}.disabled`), true);
   await evaluate(`document.querySelector('button.session-item[data-session-id="session-1"]').click()`);
   await waitFor(`document.querySelector('#messages').textContent.includes('History paragraph 29.')`);
-  await waitFor(`${bottomDistance} < 1 && ${button}.hidden`);
+  await waitFor(`document.querySelector('#messages').scrollTop === 0 &&
+    !${button}.hidden && !${button}.disabled`);
+});
+
+test("keeps scroll positions independent when switching conversations", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const secondSessionId = await server.createSession();
+  const historyText = Array.from(
+    { length: 40 },
+    (_, index) => `History paragraph ${index}.`
+  ).join("\n\n");
+  for (const sessionId of [server.sessionId, secondSessionId]) {
+    assert.equal((await server.post("messages", { text: historyText }, sessionId)).status, 200);
+  }
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const selectConversation = async (sessionId: string) => {
+    const button = `document.querySelector('button.session-item[data-session-id="${sessionId}"]')`;
+    await waitFor(`Boolean(${button})`);
+    await evaluate(`${button}.click()`);
+    await waitFor(`
+      window.localStorage.getItem("copilot-web-active-session") === "${sessionId}" &&
+      document.querySelector("#messages").textContent.includes("History paragraph 39.") &&
+      !document.querySelector("#send-prompt").disabled
+    `);
+  };
+
+  await selectConversation(server.sessionId);
+  await selectConversation(secondSessionId);
+  await selectConversation(server.sessionId);
+
+  await evaluate(`(() => {
+    const messages = document.querySelector("#messages");
+    messages.scrollTop = 0;
+    messages.dispatchEvent(new Event("scroll"));
+  })()`);
+  await waitFor(`document.querySelector("#messages").scrollTop === 0`);
+  await selectConversation(secondSessionId);
+  await waitFor(`
+    document.querySelector("#messages").scrollHeight -
+      document.querySelector("#messages").scrollTop -
+      document.querySelector("#messages").clientHeight < 1
+  `);
+
+  await evaluate(`(() => {
+    const messages = document.querySelector("#messages");
+    messages.scrollTop = 150;
+    messages.dispatchEvent(new Event("scroll"));
+  })()`);
+  await waitFor(`document.querySelector("#messages").scrollTop === 150`);
+  await selectConversation(server.sessionId);
+  assert.equal(await evaluate(`document.querySelector("#messages").scrollTop`), 0);
+  await selectConversation(secondSessionId);
+  assert.equal(await evaluate(`document.querySelector("#messages").scrollTop`), 150);
 });
 
 test("attaches multiple selections and briefly highlights their source messages", {
