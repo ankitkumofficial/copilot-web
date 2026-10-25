@@ -461,6 +461,19 @@ input.on("line", (line) => {
         : Number(process.env.TEST_PROMPT_DELAY_MS ?? 20);
       const timer = setTimeout(() => {
         pendingNativePrompts.delete(request.params.sessionId);
+        const emitAicUsage = (totalNanoAiu) => emitNativeEvent(request.params.sessionId, {
+          id: require("node:crypto").randomUUID(),
+          parentId: null,
+          type: "assistant.usage",
+          timestamp: new Date().toISOString(),
+          data: { copilotUsage: { totalNanoAiu } }
+        });
+        for (let index = 0; index < Number(process.env.TEST_AIC_USAGE_EVENTS ?? 0); index++) {
+          emitAicUsage(1_000_000_000);
+        }
+        if (process.env.TEST_AIC_NOOP_USAGE_EVENT === "true") {
+          emitAicUsage(0);
+        }
         if (nativeEvents) {
           emitNativeEvent(request.params.sessionId, nativeEvents.delta);
           // A repeated final event must stay idempotent.
@@ -563,6 +576,20 @@ input.on("line", (line) => {
       respond({});
   }
 });
+`;
+
+const fakeGitHubCli = `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(
+  process.env.TEST_GH_LOG,
+  JSON.stringify(process.argv.slice(2)) + "\\n"
+);
+if (process.env.TEST_GH_MODE === "success") {
+  process.stdout.write(JSON.stringify({ used: 12.06, total: 300 }) + "\\n");
+} else {
+  process.stderr.write("gh auth login required\\n");
+  process.exitCode = 1;
+}
 `;
 
 const fakeCopilotSdk = `import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
@@ -725,6 +752,9 @@ async function startTestServer(t: TestContext, options: {
   reloadDelayMs?: number;
   historyText?: string;
   context?: "default" | "long_context";
+  quotaCommand?: "success" | "failure" | "missing";
+  aicUsageEvents?: number;
+  aicNoopUsageEvent?: boolean;
   nativeMessages?: boolean;
   nativeReplay?: boolean;
   nativeHistory?: {
@@ -743,12 +773,16 @@ async function startTestServer(t: TestContext, options: {
   const copilotHome = path.join(home, ".copilot");
   const copilotSdk = path.join(directory, "copilot-sdk");
   const fakeCommand = path.join(directory, "copilot-fake");
+  const fakeGitHubCommand = path.join(directory, "gh-fake");
+  const githubCliLogPath = path.join(projects, "gh-requests.log");
   const port = await unusedPort();
   await mkdir(home);
   await mkdir(projects);
   await mkdir(copilotHome);
   await writeFile(fakeCommand, fakeCopilot);
   await chmod(fakeCommand, 0o700);
+  await writeFile(fakeGitHubCommand, fakeGitHubCli);
+  await chmod(fakeGitHubCommand, 0o700);
   if (options.nativeHistory) {
     await mkdir(copilotSdk);
     await writeFile(path.join(copilotSdk, "package.json"), JSON.stringify({ type: "module" }));
@@ -768,6 +802,9 @@ async function startTestServer(t: TestContext, options: {
       COPILOT_HOME: copilotHome,
       COPILOT_PROJECTS_DIR: projects,
       COPILOT_BIN: fakeCommand,
+      GH_BIN: options.quotaCommand === "missing"
+        ? path.join(directory, "gh-not-installed")
+        : fakeGitHubCommand,
       COPILOT_ALLOW_ALL: "false",
       COPILOT_SDK_PATH: options.nativeHistory
         ? path.join(copilotSdk, "index.js")
@@ -785,6 +822,10 @@ async function startTestServer(t: TestContext, options: {
       TEST_NATIVE_REPLAY: String(options.nativeReplay ?? false),
       TEST_NATIVE_TIMESTAMP: options.nativeHistory?.timestamp ?? "2026-10-14T10:00:00.000Z",
       TEST_HISTORY_PAGE_SIZE: String(options.nativeHistory?.pageSize ?? 200),
+      TEST_GH_LOG: githubCliLogPath,
+      TEST_GH_MODE: options.quotaCommand === "success" ? "success" : "failure",
+      TEST_AIC_USAGE_EVENTS: String(options.aicUsageEvents ?? 0),
+      TEST_AIC_NOOP_USAGE_EVENT: String(options.aicNoopUsageEvent ?? false),
       TEST_HISTORY_READ_DELAY_MS: String(options.nativeHistory?.readDelayMs ?? 0),
       TEST_HISTORY_READ_ERROR: String(options.nativeHistory?.readError ?? false),
       TEST_HISTORY_CURSOR_EXPIRED: String(options.nativeHistory?.cursorExpired ?? false),
@@ -890,11 +931,57 @@ async function startTestServer(t: TestContext, options: {
       }
     },
     starts: () => readFile(path.join(projects, "copilot-start-count.txt"), "utf8"),
+    async githubCliRequests(): Promise<string[][]> {
+      try {
+        const log = await readFile(githubCliLogPath, "utf8");
+        return log.trim().split("\n").filter(Boolean).map((line) => {
+          const request: unknown = JSON.parse(line);
+          assert.ok(Array.isArray(request));
+          return request.map((argument: unknown) => {
+            assert.equal(typeof argument, "string");
+            return String(argument);
+          });
+        });
+      } catch (error) {
+        if (isRecord(error) && error.code === "ENOENT") return [];
+        throw error;
+      }
+    },
     post: (subroute: string, body: JsonObject, id = sessionId) => fetch(
       `${baseUrl}/api/sessions/${id}/${subroute}`,
       { method: "POST", headers, body: JSON.stringify(body) }
     )
   };
+}
+
+test("retrieves account quota through the authenticated GitHub CLI", async (t) => {
+  const server = await startTestServer(t, { quotaCommand: "success" });
+  const response = await fetch(`${server.baseUrl}/api/quota`, { headers: server.headers });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { used: 12.06, total: 300 });
+  assert.deepEqual(await server.githubCliRequests(), [[
+    "api",
+    "-H",
+    "X-GitHub-Api-Version: 2025-04-01",
+    "/copilot_internal/user",
+    "--jq",
+    "(.quota_snapshots.premium_models // .quota_snapshots.premium_interactions) as $q | {used: ($q.entitlement - $q.remaining), total: $q.entitlement}"
+  ]]);
+});
+
+for (const quotaCommand of ["failure", "missing"] as const) {
+  test(`reports an unavailable quota when gh is ${quotaCommand}`, async (t) => {
+    const server = await startTestServer(t, { quotaCommand });
+    const response = await fetch(`${server.baseUrl}/api/quota`, { headers: server.headers });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      error: "GitHub CLI (gh) not available or not authenticated; quota could not be retrieved."
+    });
+    assert.equal(
+      (await server.githubCliRequests()).length,
+      quotaCommand === "missing" ? 0 : 1
+    );
+  });
 }
 
 test("updates empty-session IDs through the API and preserves metadata and selected context", async (t) => {
@@ -3283,7 +3370,10 @@ test("sizes composer selectors to their labels and wraps usage without overlap",
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
 }, async (t) => {
-  const server = await startTestServer(t, { profileSessions: true });
+  const server = await startTestServer(t, {
+    profileSessions: true,
+    quotaCommand: "success"
+  });
   const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
   await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="${server.sessionId}"]'))`);
   await evaluate(`document.querySelector('button.session-item[data-session-id="${server.sessionId}"]').click()`);
@@ -3329,8 +3419,8 @@ test("sizes composer selectors to their labels and wraps usage without overlap",
     width: 1360, height: 900, deviceScaleFactor: 1, mobile: false
   }, sessionId);
   for (const [aic, context] of [
-    ["0.13 used", "36.8K / 872K tokens"],
-    ["144.04 used", "153.5K / 968K tokens"]
+    ["0.13 credits", "36.8K / 872K tokens"],
+    ["144.04 credits", "153.5K / 968K tokens"]
   ]) {
     await evaluate(`
       document.querySelector('#usage-aic').textContent = ${JSON.stringify(aic)};
@@ -3340,12 +3430,30 @@ test("sizes composer selectors to their labels and wraps usage without overlap",
       const usage = document.querySelector('#usage-summary').getBoundingClientRect();
       const settings = [...document.querySelectorAll('.composer-setting')]
         .map((element) => element.getBoundingClientRect());
-      return settings.every((box) => Math.abs(box.bottom - usage.bottom) < 1) &&
+      const settingsBottom = Math.max(...settings.map((box) => box.bottom));
+      const staysInline = settings.every((box) => Math.abs(box.bottom - usage.bottom) < 1) &&
         usage.left >= settings[2].right;
-    })()`), true, `Usage should stay inline with ${aic} and ${context}`);
+      return staysInline || usage.top >= settingsBottom - 1;
+    })()`), true, `Usage should stay inline or wrap below selectors with ${aic} and ${context}`);
     assert.equal(await evaluate(labelsFit), true, `Selector labels should fit with ${aic} and ${context}`);
     assert.equal(await evaluate(noOverlap), true);
   }
+  assert.equal(await evaluate(`(() => {
+    const labels = [...document.querySelectorAll(
+      '#usage-summary .usage-metric:not([hidden]) .usage-label'
+    )].map((label) => label.getBoundingClientRect().top);
+    return labels.every((top) => Math.abs(top - labels[0]) < 1);
+  })()`), true, "Usage metric labels should align vertically");
+  assert.equal(await evaluate(`
+    (() => {
+      const message = document.createElement("div");
+      message.className = "message";
+      document.body.append(message);
+      const messageWidth = getComputedStyle(message).maxWidth;
+      message.remove();
+      return getComputedStyle(document.querySelector(".composer")).maxWidth === messageWidth;
+    })()
+  `), true, "Composer and conversation history should share a maximum width");
   for (const width of [1200, 1000, 801, 768, 390, 320]) {
     await command("Emulation.setDeviceMetricsOverride", {
       width, height: 900, deviceScaleFactor: 1, mobile: false
@@ -3354,6 +3462,67 @@ test("sizes composer selectors to their labels and wraps usage without overlap",
     assert.equal(await evaluate(noOverlap), true, `Composer should not overflow or overlap at ${width}px`);
     assert.equal(await evaluate(`document.querySelector('#keep-awake').nextElementSibling.id`), "reconnect-tools");
   }
+});
+
+test("shows a focusable warning when the GitHub CLI cannot retrieve quota", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { quotaCommand: "missing" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`!document.querySelector("#usage-quota-warning").hidden`);
+  assert.equal(
+    await evaluate(`document.querySelector("#usage-quota-warning").title`),
+    "GitHub CLI (gh) not available or not authenticated; quota could not be retrieved."
+  );
+  assert.equal(
+    await evaluate(`document.querySelector("#usage-quota-warning").getAttribute("tabindex")`),
+    "0"
+  );
+  assert.equal(await evaluate(`document.querySelector("#usage-quota-value").hidden`), true);
+});
+
+test("refreshes quota after each AIC usage update", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true,
+    nativeMessages: true,
+    quotaCommand: "success",
+    aicUsageEvents: 2,
+    aicNoopUsageEvent: true
+  });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const session = `document.querySelector('button.session-item[data-session-id="${server.sessionId}"]')`;
+  await waitFor(`Boolean(${session})`);
+  await evaluate(`${session}.click()`);
+  await waitFor(`!document.querySelector("#prompt-input").disabled`);
+  await waitFor(`document.querySelector("#usage-quota-value").textContent === "12.06 / 300"`);
+  assert.equal((await server.githubCliRequests()).length, 1);
+
+  await evaluate(`
+    const input = document.querySelector("#prompt-input");
+    input.value = "quota refresh test";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await server.waitForPrompt("quota refresh test");
+  await waitFor(`document.querySelector("#usage-aic").textContent === "2 credits"`);
+  assert.equal(
+    await evaluate(`document.querySelector("#usage-aic-metric .usage-label").textContent`),
+    "SESSION"
+  );
+  assert.equal(
+    await evaluate(`document.querySelector("#usage-aic-metric").title`),
+    "Cumulative AI credits used in this session; when a session limit is shown, format is used / limit."
+  );
+  const deadline = Date.now() + 5_000;
+  while ((await server.githubCliRequests()).length < 4) {
+    assert.ok(Date.now() < deadline, "Quota was not refreshed for every AIC update");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal((await server.githubCliRequests()).length, 4);
 });
 
 test("shows a jump-to-bottom button without interrupting conversation scrolling", {
