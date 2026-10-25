@@ -4993,10 +4993,23 @@ test("renders user Markdown in live and restored history, rich copies, and selec
     "<script>window.userMarkupExecuted = true</script>",
     "[Unsafe](javascript:alert(1))"
   ].join("\n");
+  const assistantCode = [
+    "gh api \\",
+    "  -H 'X-GitHub-Api-Version: 2026-03-10' \\",
+    '  "/users/$(gh api user --jq .login)/settings/billing/ai_credit/usage" \\',
+    "  -f year=2026 -f month=10 \\",
+    "  --jq '[.usageItems[].grossQuantity] | add // 0'"
+  ].join("\n");
   const events = nativeHistoryEvents().map((event) => {
     if (event.id === "persisted-assistant-event") {
       assert.ok(isRecord(event.data));
-      return { ...event, data: { ...event.data, content: `Native historical reply\n\n${nestedEmphasisMarkdown}` } };
+      return {
+        ...event,
+        data: {
+          ...event.data,
+          content: `Native historical reply\n\n${nestedEmphasisMarkdown}\n\n\`\`\`sh\n${assistantCode}\n\`\`\``
+        }
+      };
     }
     if (event.type !== "user.message") return event;
     assert.ok(isRecord(event.data));
@@ -5068,6 +5081,17 @@ test("renders user Markdown in live and restored history, rich copies, and selec
   await waitFor(`window.clipboardWrites.length === 1`);
   assert.equal(await evaluate(`window.clipboardWrites[0].text`), `${historicalPrompt}\n\nAttachments: diagram.png`);
   assert.equal(await evaluate(`window.clipboardWrites[0].html.includes("<strong>Rules:</strong>")`), true);
+  assert.equal(await evaluate(`window.clipboardWrites[0].html.includes("code-copy")`), false);
+  await evaluate(`document.querySelector(".message.assistant .code-copy").click()`);
+  await waitFor(`window.clipboardWrites.length === 2`);
+  assert.equal(await evaluate(`window.clipboardWrites[1].text`), assistantCode);
+  assert.equal(await evaluate(`window.clipboardWrites[1].html.includes("<pre><code>")`), true);
+  assert.equal(await evaluate(`window.clipboardWrites[1].html.includes("code-copy")`), false);
+  assert.equal(await evaluate(`document.querySelector(".message.assistant .code-copy").getAttribute("aria-label")`), "Code copied");
+  await evaluate(`document.querySelector(".message.assistant .message-copy").click()`);
+  await waitFor(`window.clipboardWrites.length === 3`);
+  assert.equal(await evaluate(`window.clipboardWrites[2].text.includes(${JSON.stringify(assistantCode)})`), true);
+  assert.equal(await evaluate(`window.clipboardWrites[2].html.includes("code-copy")`), false);
 
   await evaluate(`
     (() => {
