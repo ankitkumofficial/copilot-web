@@ -514,9 +514,11 @@ function sseEvent(event: string, data: unknown): string {
 
 function replayUpdateSignature(params: JsonObject): string {
   const update = isRecord(params.update) ? params.update : {};
+  const isChatMessage = update.sessionUpdate === "user_message_chunk" ||
+    update.sessionUpdate === "agent_message_chunk";
   return JSON.stringify([
     update.sessionUpdate,
-    update.messageId,
+    isChatMessage ? null : update.messageId,
     update.toolCallId,
     update.status,
     update.content,
@@ -1591,12 +1593,19 @@ async function main(): Promise<void> {
       const completeReplay = [...replay, ...pendingUpdates];
       const fallbackTail = fallbackReplayTails.get(sessionId);
       if (fallbackTail) {
-        const signatures = new Set(completeReplay.map(replayUpdateSignature));
+        const signatures = new Map<string, number>();
+        for (const update of completeReplay) {
+          const signature = replayUpdateSignature(update);
+          signatures.set(signature, (signatures.get(signature) ?? 0) + 1);
+        }
         for (const update of fallbackTail) {
           const signature = replayUpdateSignature(update);
-          if (!signatures.has(signature)) {
+          const count = signatures.get(signature) ?? 0;
+          if (count > 0) {
+            signatures.set(signature, count - 1);
+          } else {
             completeReplay.push(update);
-            signatures.add(signature);
+            signatures.set(signature, 1);
           }
         }
         fallbackReplayTails.delete(sessionId);
