@@ -2207,6 +2207,189 @@ const mockSpeechRecognition = `
   };
 `;
 
+const holdConversationDeletions = `
+  window.heldConversationDeletions = new Map();
+  window.filteredDeletionLists = 0;
+  const nativeFetchForDeletionTest = window.fetch.bind(window);
+  window.fetch = async (resource, init) => {
+    const url = typeof resource === "string" ? resource : resource.url;
+    if (init?.method === "DELETE" && url.startsWith("/api/sessions/")) {
+      const sessionId = decodeURIComponent(url.slice("/api/sessions/".length));
+      return new Promise((resolve) => {
+        window.heldConversationDeletions.set(sessionId, async (failure, warnings) => {
+          let response;
+          if (failure) {
+            response = new Response(JSON.stringify({ error: failure }), { status: 500 });
+          } else {
+            const result = await nativeFetchForDeletionTest(resource, init);
+            response = new Response(JSON.stringify({
+              ...await result.json(),
+              ...(warnings ? { persistenceWarnings: warnings } : {})
+            }), { status: result.status });
+          }
+          window.heldConversationDeletions.delete(sessionId);
+          resolve(response);
+        });
+      });
+    }
+    const response = await nativeFetchForDeletionTest(resource, init);
+    if (url === "/api/sessions" && (init?.method ?? "GET") === "GET") {
+      const payload = await response.json();
+      payload.sessions = payload.sessions.filter((session) => (
+        !window.heldConversationDeletions.has(session.sessionId)
+      ));
+      if (window.heldConversationDeletions.size > 0) window.filteredDeletionLists += 1;
+      return new Response(JSON.stringify(payload), { status: response.status });
+    }
+    return response;
+  };
+`;
+
+test("deletes conversations in the background while navigating and sending new prompts", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeSessionDelete: true,
+    nativeHistory: {
+      events: [nativeTranscriptEvent("user.message", "original", "Original conversation", 0)]
+    }
+  });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    ${holdConversationDeletions}
+    ${mockSpeechRecognition}
+    window.SpeechRecognition.prototype.stop = function() { this.stopCalls += 1; };
+  `);
+  const original = `document.querySelector('.session-item[data-session-id="session-1"]')`;
+  const originalRow = `${original}.closest(".session-item-row")`;
+  await waitFor(`Boolean(${original})`);
+  await evaluate(`${original}.click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Original conversation") &&
+    !document.querySelector("#send-prompt").disabled`);
+  await evaluate(`${originalRow}.querySelector(".session-delete").click()`);
+  await waitFor(`document.querySelector("#delete-dialog").open`);
+  await evaluate(`document.querySelector("#delete-dialog").close("cancel")`);
+  await waitFor(`!document.querySelector("#delete-dialog").open`);
+  assert.equal(await evaluate(`window.heldConversationDeletions.size`), 0);
+  assert.equal(await evaluate(`${original}.classList.contains("active")`), true);
+
+  await evaluate(`document.querySelector("#voice-input").click()`);
+  await waitFor(`window.speechRecognitionTest.instances.length === 1`);
+  await evaluate(`${originalRow}.querySelector(".session-delete").click()`);
+  await waitFor(`document.querySelector("#delete-dialog").open`);
+  await evaluate(`document.querySelector("#delete-confirm").click()`);
+  await waitFor(`window.heldConversationDeletions.has("session-1")`);
+  assert.equal(await evaluate(`document.querySelector(".session-item.active") === null`), true);
+  assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes("Original conversation")`), false);
+  assert.equal(await evaluate(`${originalRow}.querySelector(".session-status").textContent`), "Deleting");
+  assert.equal(await evaluate(`${original}.disabled &&
+    ${originalRow}.querySelector(".session-delete").disabled &&
+    ${originalRow}.querySelector(".session-rename").disabled`), true);
+  assert.equal(await evaluate(`window.speechRecognitionTest.instances[0].stopCalls`), 1);
+  await evaluate(`window.speechRecognitionTest.instances[0].onend({ type: "end" })`);
+
+  const newSessionIds: string[] = [];
+  for (let index = 0; index < 2; index += 1) {
+    if (index > 0) {
+      await evaluate(`document.querySelector("#new-chat").click()`);
+      await waitFor(`document.querySelector(".session-item.active") === null`);
+    }
+    await waitFor(`!document.querySelector("#send-prompt").disabled`);
+    await evaluate(`(() => {
+      const input = document.querySelector("#prompt-input");
+      input.value = ${JSON.stringify(`New prompt ${index + 1}`)};
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector("#composer").requestSubmit();
+    })()`);
+    await waitFor(`Boolean(document.querySelector(".session-item.active")) &&
+      document.querySelector("#messages").textContent.includes("Done.") &&
+      !document.querySelector("#send-prompt").disabled`);
+    newSessionIds.push(String(await evaluate(`document.querySelector(".session-item.active").dataset.sessionId`)));
+  }
+  const [backgroundId, activeId] = newSessionIds;
+  assert.ok(backgroundId && activeId && backgroundId !== activeId && activeId !== "session-1");
+  assert.equal(await evaluate(`window.filteredDeletionLists > 0`), true);
+  assert.equal(await evaluate(`${originalRow}.querySelector(".session-status").textContent`), "Deleting");
+
+  await evaluate(`document.querySelector('.session-item[data-session-id="${backgroundId}"]').click()`);
+  await waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "${backgroundId}"`);
+  await evaluate(`document.querySelector('.session-item[data-session-id="${activeId}"]').click()`);
+  await waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "${activeId}"`);
+  await evaluate(`document.querySelector('.session-item[data-session-id="${backgroundId}"]')
+    .closest(".session-item-row").querySelector(".session-delete").click()`);
+  await waitFor(`document.querySelector("#delete-dialog").open`);
+  await evaluate(`document.querySelector("#delete-confirm").click()`);
+  await waitFor(`window.heldConversationDeletions.size === 2`);
+  assert.equal(await evaluate(`document.querySelectorAll(".session-status-deleting").length`), 2);
+  assert.equal(await evaluate(`document.querySelector(".session-item.active").dataset.sessionId`), activeId);
+
+  await server.removeSdk();
+  for (const id of [backgroundId, "session-1"]) {
+    await evaluate(`window.heldConversationDeletions.get("${id}")()`);
+    await waitFor(`!document.querySelector('.session-item[data-session-id="${id}"]')`);
+    assert.equal(await evaluate(`document.querySelector(".session-item.active").dataset.sessionId`), activeId);
+    assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes("New prompt 2")`), true);
+  }
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+});
+
+for (const outcome of ["failure", "warning"] as const) {
+  test(`shows background conversation deletion ${outcome} without losing the new draft`, {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 20_000
+  }, async (t) => {
+    const server = await startTestServer(t, {
+      existingSession: true,
+      nativeMessages: true,
+      nativeSessionDelete: true,
+      nativeHistory: {
+        events: [nativeTranscriptEvent("user.message", "original", "Original conversation", 0)]
+      }
+    });
+    const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, holdConversationDeletions);
+    const original = `document.querySelector('.session-item[data-session-id="session-1"]')`;
+    await waitFor(`Boolean(${original})`);
+    await evaluate(`${original}.click()`);
+    await waitFor(`document.querySelector("#messages").textContent.includes("Original conversation") &&
+      !document.querySelector("#send-prompt").disabled`);
+    await evaluate(`${original}.closest(".session-item-row").querySelector(".session-delete").click()`);
+    await waitFor(`document.querySelector("#delete-dialog").open`);
+    await evaluate(`document.querySelector("#delete-confirm").click()`);
+    await waitFor(`window.heldConversationDeletions.has("session-1")`);
+    await evaluate(`
+      const input = document.querySelector("#prompt-input");
+      input.value = "Keep this new draft";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    `);
+    const message = outcome === "failure" ? "Deletion failed" : "Title cleanup failed";
+    await server.removeSdk();
+    await evaluate(outcome === "failure"
+      ? `window.heldConversationDeletions.get("session-1")("${message}")`
+      : `window.heldConversationDeletions.get("session-1")(null, ["${message}"])`);
+    await waitFor(`document.querySelector("#messages").textContent.includes("${message}")`);
+    assert.equal(await evaluate(`document.querySelector(".session-item.active") === null`), true);
+    assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "Keep this new draft");
+    assert.equal(await evaluate(`document.querySelector(".session-status-deleting") === null`), true);
+    if (outcome === "failure") {
+      assert.equal(await evaluate(`!${original}.disabled &&
+        !${original}.closest(".session-item-row").querySelector(".session-delete").disabled`), true);
+      await evaluate(`${original}.click()`);
+      await waitFor(`document.querySelector("#messages").textContent.includes("Original conversation")`);
+      await evaluate(`${original}.closest(".session-item-row").querySelector(".session-delete").click()`);
+      await waitFor(`document.querySelector("#delete-dialog").open`);
+      await evaluate(`document.querySelector("#delete-confirm").click()`);
+      await waitFor(`window.heldConversationDeletions.has("session-1")`);
+      await evaluate(`window.heldConversationDeletions.get("session-1")()`);
+      await waitFor(`!${original}`);
+    } else {
+      assert.equal(await evaluate(`${original} === null`), true);
+    }
+    assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+  });
+}
+
 test("streams speech into the composer and stops from the microphone button", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
