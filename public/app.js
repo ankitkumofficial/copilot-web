@@ -1422,7 +1422,9 @@ function renderMarkdown(value) {
         index += 1;
       }
       const language = fence[2] ? ` class="language-${escapeHtml(fence[2])}"` : "";
-      blocks.push(`<pre><code${language}>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+      blocks.push(
+        `<div class="code-block">${codeCopyButtonMarkup}<pre><code${language}>${escapeHtml(codeLines.join("\n"))}</code></pre></div>`
+      );
       continue;
     }
 
@@ -2608,6 +2610,8 @@ const copyIconMarkup = `
     <path d="M16 8V6a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h1"></path>
   </svg>
 `;
+const codeCopyButtonMarkup =
+  `<button type="button" class="code-copy" title="Copy code" aria-label="Copy code">${copyIconMarkup.trim()}</button>`;
 const copiedIconMarkup = `
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <path d="m5 12 4 4L19 6"></path>
@@ -2639,21 +2643,29 @@ function messageClipboardText(message) {
   return text ? `${text}\n\n${attachmentText}` : attachmentText;
 }
 
+function removeCodeCopyButtons(html) {
+  const container = document.createElement("div");
+  container.innerHTML = html;
+  container.querySelectorAll(".code-copy").forEach((button) => button.remove());
+  return container.innerHTML;
+}
+
 function messageClipboardContent(message, button) {
   const fallbackText = messageClipboardText(message);
   if (message.role !== "assistant") {
+    const html = message.role === "user"
+      ? renderMarkdown(fallbackText)
+      : `<div>${escapeHtml(fallbackText).replaceAll("\n", "<br>")}</div>`;
     return {
       text: fallbackText,
-      html: message.role === "user"
-        ? renderMarkdown(fallbackText)
-        : `<div>${escapeHtml(fallbackText).replaceAll("\n", "<br>")}</div>`
+      html: removeCodeCopyButtons(html)
     };
   }
 
   const body = button.closest(".message")?.querySelector(".message-body");
   const html = body?.innerHTML ?? renderMarkdown(fallbackText);
   const text = body?.innerText || body?.textContent || fallbackText;
-  return { text, html };
+  return { text, html: removeCodeCopyButtons(html) };
 }
 
 async function copyRichMarkupWithLegacyApi(html) {
@@ -2712,6 +2724,35 @@ async function copyToClipboard({ text, html }) {
       return;
     }
     throw new Error("Clipboard access is unavailable");
+  }
+}
+
+async function copyCodeBlock(button) {
+  const code = button.closest(".code-block")?.querySelector("pre code");
+  if (!code) {
+    return;
+  }
+
+  const text = code.textContent ?? "";
+  try {
+    await copyToClipboard({
+      text,
+      html: `<pre><code>${escapeHtml(text)}</code></pre>`
+    });
+    button.classList.add("copied");
+    button.innerHTML = copiedIconMarkup;
+    button.title = "Code copied";
+    button.setAttribute("aria-label", "Code copied");
+    window.setTimeout(() => {
+      button.classList.remove("copied");
+      button.innerHTML = copyIconMarkup;
+      button.title = "Copy code";
+      button.setAttribute("aria-label", "Copy code");
+    }, 1400);
+  } catch {
+    setStatus("Could not copy code");
+    button.title = "Could not copy code";
+    button.setAttribute("aria-label", "Could not copy code");
   }
 }
 
@@ -7314,6 +7355,16 @@ function connectEvents() {
 
 elements.newChat.addEventListener("click", () => {
   startNewConversation();
+});
+elements.messages.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+  const button = target.closest("button.code-copy");
+  if (button) {
+    void copyCodeBlock(button);
+  }
 });
 elements.messages.addEventListener("scroll", updateScrollToBottomButton, { passive: true });
 elements.messages.addEventListener("scroll", () => {
