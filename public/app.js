@@ -13,6 +13,8 @@ const contextPreferences = ["default", "long_context"];
 const maximumAttachmentCount = 10;
 const maximumAttachmentBytes = 8 * 1024 * 1024;
 const maximumAttachmentTotalBytes = 16 * 1024 * 1024;
+const quotaUnavailableMessage =
+  "GitHub CLI (gh) not available or not authenticated; quota could not be retrieved.";
 const messagesBottomThreshold = 80;
 const maximumInitialHistoryPages = 32;
 const messagePanelPositions = new WeakMap();
@@ -488,6 +490,11 @@ const state = {
   projectsDirectory: "",
   newSessionDefaults: null,
   nativeMessageHistoryAvailable: false,
+  quota: {
+    status: "loading",
+    used: null,
+    total: null
+  },
   selectedContext: readContextPreference(),
   deletingSessionId: null,
   renamingSessionId: null,
@@ -562,6 +569,7 @@ function isActiveConversation(conversation) {
   return conversation === activeConversation();
 }
 let defaultsRequestId = 0;
+let quotaRequestId = 0;
 const eventReconnectInitialDelayMs = 1000;
 const eventReconnectMaximumDelayMs = 5000;
 let eventSource = null;
@@ -602,6 +610,9 @@ const elements = {
   usageAic: document.querySelector("#usage-aic"),
   usageContextMetric: document.querySelector("#usage-context-metric"),
   usageContext: document.querySelector("#usage-context"),
+  usageQuotaMetric: document.querySelector("#usage-quota-metric"),
+  usageQuotaValue: document.querySelector("#usage-quota-value"),
+  usageQuotaWarning: document.querySelector("#usage-quota-warning"),
   messages: document.querySelector("#messages"),
   scrollToBottom: document.querySelector("#scroll-to-bottom"),
   askSelection: document.querySelector("#ask-selection"),
@@ -2043,8 +2054,64 @@ const contextTokenFormatter = new Intl.NumberFormat(undefined, {
   maximumFractionDigits: 1
 });
 
+const quotaNumberFormatter = new Intl.NumberFormat(undefined, {
+  maximumFractionDigits: 2
+});
+
 function formatContextTokens(tokens) {
   return contextTokenFormatter.format(tokens);
+}
+
+function renderQuota() {
+  const quota = state.quota;
+  elements.usageQuotaMetric.hidden = false;
+  elements.usageQuotaWarning.hidden = quota.status !== "unavailable";
+  elements.usageQuotaWarning.title = quotaUnavailableMessage;
+  elements.usageQuotaWarning.setAttribute("aria-label", quotaUnavailableMessage);
+  elements.usageQuotaValue.hidden = quota.status === "unavailable";
+  elements.usageQuotaValue.title = quota.status === "available"
+    ? "Account-level quota usage: used / total."
+    : "";
+  elements.usageQuotaValue.textContent = quota.status === "available"
+    ? `${quotaNumberFormatter.format(quota.used)} / ${quotaNumberFormatter.format(quota.total)}`
+    : quota.status === "loading"
+      ? "Loading..."
+      : "";
+}
+
+async function refreshQuota() {
+  const requestId = ++quotaRequestId;
+  try {
+    const result = await api("/api/quota");
+    if (requestId !== quotaRequestId) {
+      return;
+    }
+    if (
+      typeof result.used !== "number" ||
+      !Number.isFinite(result.used) ||
+      result.used < 0 ||
+      typeof result.total !== "number" ||
+      !Number.isFinite(result.total) ||
+      result.total < 0
+    ) {
+      throw new Error("Quota response contains invalid values");
+    }
+    state.quota = {
+      status: "available",
+      used: result.used,
+      total: result.total
+    };
+  } catch {
+    if (requestId !== quotaRequestId) {
+      return;
+    }
+    state.quota = {
+      status: "unavailable",
+      used: null,
+      total: null
+    };
+  }
+  renderUsage();
 }
 
 function renderUsage(conversation = activeConversation()) {
@@ -2067,15 +2134,16 @@ function renderUsage(conversation = activeConversation()) {
 
   elements.usageAicMetric.hidden = !hasAicUsage;
   elements.usageContextMetric.hidden = !hasContextUsage;
-  elements.usageSummary.hidden = !hasAicUsage && !hasContextUsage;
+  elements.usageSummary.hidden = false;
   elements.usageAicMetric.title =
-    "Cumulative AI credit usage for this conversation; account-level quota is not included.";
+    "Cumulative AI credits used in this session; when a session limit is shown, format is used / limit.";
   elements.usageContextMetric.title =
     "Latest ACP-reported context usage: tokens used / total context-window size.";
+  renderQuota();
   if (hasAicUsage) {
-    elements.usageAic.textContent = `${formatAic(aicNano)} used${
+    elements.usageAic.textContent = `${formatAic(aicNano)}${
       Number.isFinite(aicLimit) ? ` / ${formatAic(aicLimit)}` : ""
-    }`;
+    } credits`;
   }
   if (hasContextUsage) {
     elements.usageContext.textContent =
@@ -2112,7 +2180,8 @@ function applySessionUsage(value, conversation, expectedRevision) {
   ) {
     return;
   }
-  conversation.usage = {
+  const previousUsage = conversation.usage;
+  const usage = {
     aicNano: typeof value.aicNano === "number" && Number.isFinite(value.aicNano)
       ? value.aicNano
       : null,
@@ -2120,6 +2189,10 @@ function applySessionUsage(value, conversation, expectedRevision) {
       ? value.aicLimit
       : null
   };
+  conversation.usage = usage;
+  if (usage.aicNano !== previousUsage.aicNano || usage.aicLimit !== previousUsage.aicLimit) {
+    void refreshQuota();
+  }
   if (conversation === activeConversation()) {
     renderUsage(conversation);
   }
@@ -5615,6 +5688,7 @@ function handleRawSessionEvent(params) {
   }
   if (usageChanged) {
     conversation.usageRevision += 1;
+    void refreshQuota();
   }
   renderUsage(conversation);
 }
@@ -7645,6 +7719,7 @@ renderConversationControls();
 renderAttachmentList();
 renderSelectionList();
 renderUsage();
+void refreshQuota();
 resizePromptInput();
 renderMessages();
 renderConnectionStatus();
