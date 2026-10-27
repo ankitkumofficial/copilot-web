@@ -59,6 +59,12 @@ const maximumPromptAttachmentBytes = 8 * 1024 * 1024;
 const maximumPromptAttachmentTotalBytes = 16 * 1024 * 1024;
 const maximumSessionTitleLength = 120;
 const nativeSessionDeleteTimeoutMs = 60_000;
+const githubQuotaCommandTimeoutMs = 10_000;
+const githubQuotaOutputLimitBytes = 16 * 1024;
+const githubQuotaUnavailableMessage =
+  "GitHub CLI (gh) not available or not authenticated; quota could not be retrieved.";
+const githubQuotaJq =
+  "(.quota_snapshots.premium_models // .quota_snapshots.premium_interactions) as $q | {used: ($q.entitlement - $q.remaining), total: $q.entitlement}";
 const sdkSessionDeleteScript = `
 import { pathToFileURL } from "node:url";
 
@@ -140,6 +146,11 @@ interface PagedHistoryReplayBuffer {
 interface SessionUsage {
   aicNano: number | null;
   aicLimit: number | null;
+}
+
+interface GitHubQuota {
+  used: number;
+  total: number;
 }
 
 type SessionTitleOverrides = Map<string, string>;
@@ -309,6 +320,92 @@ async function resolveExecutable(command: string): Promise<string> {
     }
   }
   return command;
+}
+
+async function readGitHubQuota(command: string, cwd: string): Promise<GitHubQuota> {
+  const output = await new Promise<string>((resolve, reject) => {
+    const child = spawn(command, [
+      "api",
+      "-H",
+      "X-GitHub-Api-Version: 2025-04-01",
+      "/copilot_internal/user",
+      "--jq",
+      githubQuotaJq
+    ], {
+      cwd,
+      env: {
+        ...process.env,
+        GH_PROMPT_DISABLED: "1"
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timer: NodeJS.Timeout;
+    const finish = (callback: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      callback();
+    };
+    timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      finish(() => reject(new Error("Timed out while retrieving GitHub quota")));
+    }, githubQuotaCommandTimeoutMs);
+    timer.unref();
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      if (Buffer.byteLength(stdout) + Buffer.byteLength(chunk) > githubQuotaOutputLimitBytes) {
+        child.kill("SIGTERM");
+        finish(() => reject(new Error("GitHub CLI returned too much quota data")));
+        return;
+      }
+      stdout += chunk;
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr = (stderr + chunk).slice(-4096);
+    });
+    child.once("error", (error) => {
+      finish(() => reject(error));
+    });
+    child.once("close", (code, signal) => {
+      if (code !== 0) {
+        const detail = stderr.trim();
+        finish(() => reject(new Error(
+          detail || `GitHub CLI exited with ${signal ?? `code ${code ?? "unknown"}`}`
+        )));
+        return;
+      }
+      finish(() => resolve(stdout.trim()));
+    });
+  });
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    throw new Error("GitHub CLI returned invalid quota JSON");
+  }
+  if (
+    !isRecord(parsed) ||
+    typeof parsed.used !== "number" ||
+    !Number.isFinite(parsed.used) ||
+    parsed.used < 0 ||
+    typeof parsed.total !== "number" ||
+    !Number.isFinite(parsed.total) ||
+    parsed.total < 0
+  ) {
+    throw new Error("GitHub CLI returned invalid quota values");
+  }
+  return {
+    used: parsed.used,
+    total: parsed.total
+  };
 }
 
 async function deleteSessionWithCopilotSdk(
@@ -907,6 +1004,7 @@ async function main(): Promise<void> {
     expandHome(process.env.COPILOT_PROJECTS_DIR ?? path.join(os.homedir(), "projects"))
   );
   const copilotCommand = process.env.COPILOT_BIN ?? "copilot";
+  const githubCommand = process.env.GH_BIN?.trim() || "gh";
   const copilotExecutable = await resolveExecutable(copilotCommand);
   const allowAll = readBooleanEnvironment("COPILOT_ALLOW_ALL");
   const nativeSessionDelete = process.env.COPILOT_NATIVE_SESSION_DELETE === undefined
@@ -1733,6 +1831,19 @@ async function main(): Promise<void> {
         nativeMessageHistoryAvailable: copilotHistory.available,
         newSessionDefaults
       });
+      return true;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/api/quota") {
+      let quota: GitHubQuota;
+      try {
+        quota = await readGitHubQuota(githubCommand, projectsDirectory);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(`[quota] Unable to retrieve quota with gh: ${detail}`);
+        throw new HttpError(503, githubQuotaUnavailableMessage);
+      }
+      jsonResponse(response, 200, quota);
       return true;
     }
 

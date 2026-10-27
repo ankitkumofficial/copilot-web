@@ -342,6 +342,11 @@ available.
 
 ## Configuration
 
+The composer displays account-level premium quota separately from the active
+session's AI-credit usage. Quota is retrieved with the authenticated GitHub CLI at
+startup and refreshed whenever an AI-credit usage update arrives. If `gh` cannot
+retrieve quota, the composer shows a warning in place of the numbers.
+
 | Variable | Default | Description |
 | --- | --- | --- |
 | `COPILOT_WEB_USER` | unset | User name used to derive the browser title, sidebar brand, brand mark, and ACP client title |
@@ -349,6 +354,7 @@ available.
 | `COPILOT_HOME` | `~/.copilot` | Copilot CLI configuration directory; used to read `settings.json` |
 | `COPILOT_PROJECTS_DIR` | `~/projects` | Starting directory for new conversations |
 | `COPILOT_BIN` | `copilot` | Copilot CLI executable |
+| `GH_BIN` | `gh` | GitHub CLI executable used to retrieve account quota |
 | `COPILOT_ALLOW_ALL` | `false` | Pass `--allow-all` to the Copilot ACP process |
 | `COPILOT_NATIVE_SESSION_DELETE` | `true` | Enable the SDK/native CLI fallback for deleting sessions |
 | `COPILOT_SDK_PATH` | auto-discovered | Optional path to the installed Copilot SDK `index.js`, used for session deletion and persisted-message history |
