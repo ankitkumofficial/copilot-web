@@ -818,7 +818,8 @@ button:disabled {
   text-transform: uppercase;
 }
 
-.message-copy {
+.message-copy,
+.code-copy {
   display: grid;
   width: 27px;
   height: 27px;
@@ -831,18 +832,22 @@ button:disabled {
 }
 
 .message-copy:hover,
-.message-copy:focus-visible {
+.message-copy:focus-visible,
+.code-copy:hover,
+.code-copy:focus-visible {
   border-color: var(--accent);
   background: var(--surface-hover);
   color: var(--accent-strong);
 }
 
-.message-copy.copied {
+.message-copy.copied,
+.code-copy.copied {
   border-color: rgba(81, 214, 138, 0.5);
   color: #2f9e63;
 }
 
-.message-copy svg {
+.message-copy svg,
+.code-copy svg {
   width: 15px;
   height: 15px;
   fill: none;
@@ -963,6 +968,29 @@ button:disabled {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--background);
+}
+
+.message-body .code-block {
+  position: relative;
+  max-width: 100%;
+  margin-bottom: 1em;
+}
+
+.message-body > .code-block:last-child,
+.message-text > .code-block:last-child {
+  margin-bottom: 0;
+}
+
+.message-body .code-block pre {
+  margin: 0;
+  padding-top: 44px;
+}
+
+.message-body .code-copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
 }
 
 .message-body pre code {
