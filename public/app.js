@@ -497,7 +497,7 @@ const state = {
     total: null
   },
   selectedContext: readContextPreference(),
-  deletingSessionId: null,
+  deletingSessionIds: new Set(),
   renamingSessionId: null,
   permissionDialogSessionId: null,
   connectionStatus: "connecting",
@@ -2638,20 +2638,24 @@ function renderSessionList() {
       conversation?.busy ||
       conversation?.recoveredPrompt;
     const queued = conversation?.promptQueue?.length ?? 0;
+    const deleting = state.deletingSessionIds.has(session.sessionId);
     const canDelete = state.capabilities.sessionCapabilities.delete;
     row.className = "session-item-row has-actions";
     const button = document.createElement("button");
     button.type = "button";
     button.className = `session-item${session.sessionId === state.activeSessionId ? " active" : ""}`;
     button.dataset.sessionId = session.sessionId;
+    button.disabled = deleting;
     button.innerHTML = `
       <span class="session-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
       <span class="session-meta">${escapeHtml(relativeTime(sessionActivityAt(session)))}</span>
-      ${working
-        ? `<span class="session-status">Working${queued > 0 ? ` · ${queued} queued` : ""}</span>`
-        : queued > 0
-          ? `<span class="session-status">${queued} queued</span>`
-          : ""}
+      ${deleting
+        ? `<span class="session-status session-status-deleting" role="status">Deleting</span>`
+        : working
+          ? `<span class="session-status">Working${queued > 0 ? ` · ${queued} queued` : ""}</span>`
+          : queued > 0
+            ? `<span class="session-status">${queued} queued</span>`
+            : ""}
     `;
     row.append(button);
 
@@ -2664,7 +2668,7 @@ function renderSessionList() {
       `Rename ${title}`
     );
     renameButton.disabled =
-      state.deletingSessionId !== null ||
+      deleting ||
       state.renamingSessionId !== null;
     renameButton.innerHTML = renameSessionIconMarkup;
     renameButton.addEventListener("click", (event) => {
@@ -5846,7 +5850,7 @@ function confirmRenameConversation(session) {
 async function renameConversation(sessionId) {
   if (
     state.renamingSessionId ||
-    state.deletingSessionId
+    state.deletingSessionIds.has(sessionId)
   ) {
     return;
   }
@@ -5919,7 +5923,7 @@ function conversationDeletionBlocked(sessionId) {
   const conversation = conversationState(sessionId, false);
   const session = state.sessions.find((item) => item.sessionId === sessionId);
   return Boolean(
-    state.deletingSessionId ||
+    state.deletingSessionIds.has(sessionId) ||
     state.renamingSessionId ||
     session?.busy ||
     conversation?.busy ||
@@ -5933,15 +5937,19 @@ async function deleteConversation(sessionId) {
   if (conversationDeletionBlocked(sessionId)) {
     return;
   }
-  const conversation = conversationState(sessionId, false);
   const session = state.sessions.find((item) => item.sessionId === sessionId);
   if (!session || elements.deleteDialog.open || !(await confirmDeleteConversation(session))) {
     return;
   }
+  if (conversationDeletionBlocked(sessionId)) {
+    return;
+  }
 
-  state.deletingSessionId = sessionId;
+  state.deletingSessionIds.add(sessionId);
   renderSessionList();
-  let activeConversationDeleted = false;
+  if (sessionId === state.activeSessionId) {
+    void startNewConversation({ discardDraft: true });
+  }
   let deleteError;
   let persistenceWarnings = [];
   try {
@@ -5953,27 +5961,19 @@ async function deleteConversation(sessionId) {
       : [];
     state.conversations.delete(sessionId);
     clearSelectionMessageMetadata(sessionId);
-    if (sessionId === state.activeSessionId) {
-      activeConversationDeleted = true;
-      startNewConversation({ discardDraft: true });
-    }
+    state.sessions = state.sessions.filter((item) => item.sessionId !== sessionId);
+    renderSessionList();
     await refreshSessions();
-    if (!activeConversationDeleted && persistenceWarnings.length === 0) {
-      setStatus("Ready", activeConversation() ?? state.composer);
-    }
   } catch (error) {
     deleteError = error;
   } finally {
-    state.deletingSessionId = null;
+    state.deletingSessionIds.delete(sessionId);
     renderSessionList();
   }
 
   const errorConversation = activeConversation() ?? state.composer;
   if (deleteError) {
-    showError(
-      deleteError,
-      activeConversationDeleted ? errorConversation : conversation ?? state.composer
-    );
+    showError(deleteError, errorConversation);
   }
   if (persistenceWarnings.length > 0) {
     showError(new Error(
@@ -5993,6 +5993,12 @@ async function refreshSessions() {
   }
   lastSessionListRequestId = request.requestId;
   const sessions = Array.isArray(result.sessions) ? result.sessions : [];
+  // The server omits in-progress deletions; keep their rows until the DELETE settles.
+  const listedSessionIds = new Set(sessions.map((session) => session.sessionId));
+  sessions.push(...state.sessions.filter((session) => (
+    state.deletingSessionIds.has(session.sessionId) &&
+    !listedSessionIds.has(session.sessionId)
+  )));
   state.sessions = sessions.map((session) => {
     const previousSession = state.sessions.find((item) => item.sessionId === session.sessionId);
     const conversation = conversationState(session.sessionId, false);
@@ -6172,12 +6178,13 @@ function activateComposerConversation(conversation = state.composer) {
 }
 
 async function startNewConversation({ discardDraft = false } = {}) {
-  if (state.deletingSessionId && !discardDraft) {
-    return;
-  }
   const voiceSession = voiceInputState.session;
   if (voiceSession) {
-    await stopVoiceInput(voiceSession);
+    if (discardDraft) {
+      void stopVoiceInput(voiceSession, { discardResults: true });
+    } else {
+      await stopVoiceInput(voiceSession);
+    }
   }
   if (!discardDraft) {
     persistComposerDraft();
@@ -6239,9 +6246,6 @@ function applyFallbackConversationTitle(queuedPrompt, conversation) {
 }
 
 function createServerConversation(sourceConversation = currentComposerConversation()) {
-  if (state.deletingSessionId) {
-    return Promise.resolve(null);
-  }
   const existingCreation = conversationCreationPromises.get(sourceConversation);
   if (existingCreation) {
     return existingCreation;
@@ -6256,9 +6260,6 @@ function createServerConversation(sourceConversation = currentComposerConversati
 }
 
 async function createServerConversationInternal(sourceConversation) {
-  if (state.deletingSessionId) {
-    return null;
-  }
   const previousConversation = sourceConversation;
   const hasActiveSession = state.activeSessionId !== null;
   const pendingDraft = hasActiveSession
@@ -6644,7 +6645,7 @@ function hasVisibleConversationMessages(conversation) {
 
 // Without a requested context, the server reuses the conversation's last context.
 async function loadConversation(sessionId, requestedContext = undefined, force = false) {
-  if (state.deletingSessionId) {
+  if (state.deletingSessionIds.has(sessionId)) {
     return false;
   }
   const session = state.sessions.find((item) => item.sessionId === sessionId);
