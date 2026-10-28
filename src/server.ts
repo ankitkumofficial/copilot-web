@@ -450,6 +450,36 @@ async function deleteSessionWithNativeCli(
   );
 }
 
+async function deleteSessionWithCopilotSdkOrNativeCli(
+  sdkPath: string | undefined,
+  copilotCommand: string,
+  copilotExecutable: string,
+  cwd: string,
+  sessionId: string,
+  allowAll: boolean
+): Promise<void> {
+  if (!sdkPath) {
+    await deleteSessionWithNativeCli(copilotCommand, cwd, sessionId, allowAll);
+    return;
+  }
+
+  try {
+    await deleteSessionWithCopilotSdk(
+      sdkPath,
+      copilotExecutable,
+      cwd,
+      sessionId,
+      allowAll
+    );
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (!detail.includes("ERR_MODULE_NOT_FOUND") || !detail.includes(sdkPath)) {
+      throw error;
+    }
+    await deleteSessionWithNativeCli(copilotCommand, cwd, sessionId, allowAll);
+  }
+}
+
 function parseCookies(header: string | undefined): Map<string, string> {
   const cookies = new Map<string, string>();
   if (!header) {
@@ -2049,22 +2079,14 @@ async function main(): Promise<void> {
           if (acp.getSessionContext(sessionId)) {
             await acp.closeSession(sessionId);
           }
-          if (copilotSdkPath) {
-            await deleteSessionWithCopilotSdk(
-              copilotSdkPath,
-              copilotExecutable,
-              projectsDirectory,
-              sessionId,
-              allowAll
-            );
-          } else {
-            await deleteSessionWithNativeCli(
-              copilotCommand,
-              projectsDirectory,
-              sessionId,
-              allowAll
-            );
-          }
+          await deleteSessionWithCopilotSdkOrNativeCli(
+            await findCopilotSdkPath(),
+            copilotCommand,
+            copilotExecutable,
+            projectsDirectory,
+            sessionId,
+            allowAll
+          );
           acp.forgetSession(sessionId);
         }
         deletedSessions.add(sessionId);

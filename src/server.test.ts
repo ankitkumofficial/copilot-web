@@ -28,6 +28,13 @@ const nativeTimestamp = process.env.TEST_NATIVE_TIMESTAMP ?? "2026-10-14T10:00:0
 const pendingNativePrompts = new Map();
 let streamThoughts = true;
 const sessionFile = (id) => path.join(process.cwd(), "profile-session-" + id + ".json");
+if (args.includes("-i")) {
+  fs.appendFileSync(
+    path.join(process.cwd(), "copilot-native-cli-requests.log"),
+    JSON.stringify(args) + "\\n"
+  );
+  process.exit(0);
+}
 const configOptions = (session) => profiles ? [
   {
     id: "model", type: "select", category: "model", currentValue: session.model,
@@ -752,6 +759,7 @@ async function startTestServer(t: TestContext, options: {
   reloadDelayMs?: number;
   historyText?: string;
   context?: "default" | "long_context";
+  nativeSessionDelete?: boolean;
   quotaCommand?: "success" | "failure" | "missing";
   aicUsageEvents?: number;
   aicNoopUsageEvent?: boolean;
@@ -809,7 +817,7 @@ async function startTestServer(t: TestContext, options: {
       COPILOT_SDK_PATH: options.nativeHistory
         ? path.join(copilotSdk, "index.js")
         : "",
-      COPILOT_NATIVE_SESSION_DELETE: "false",
+      COPILOT_NATIVE_SESSION_DELETE: String(options.nativeSessionDelete ?? false),
       TEST_MCP_COMMAND: String(options.advertiseMcp ?? true),
       TEST_MCP_RELOAD_ERROR: String(options.failReload ?? false),
       TEST_COMMAND_DELAY_MS: String(options.commandDelayMs ?? 0),
@@ -915,6 +923,26 @@ async function startTestServer(t: TestContext, options: {
     },
     sdkConnection: () => readFile(path.join(projects, "native-sdk-connection.json"), "utf8")
       .then((content) => JSON.parse(content) as unknown),
+    removeSdk: () => rm(path.join(copilotSdk, "index.js"), { force: true }),
+    async nativeCliRequests(): Promise<string[][]> {
+      try {
+        const log = await readFile(
+          path.join(projects, "copilot-native-cli-requests.log"),
+          "utf8"
+        );
+        return log.trim().split("\n").filter(Boolean).map((line) => {
+          const request: unknown = JSON.parse(line);
+          assert.ok(Array.isArray(request));
+          return request.map((argument: unknown) => {
+            assert.equal(typeof argument, "string");
+            return String(argument);
+          });
+        });
+      } catch (error) {
+        if (isRecord(error) && error.code === "ENOENT") return [];
+        throw error;
+      }
+    },
     async requests(): Promise<JsonObject[]> {
       const log = await readFile(path.join(projects, "copilot-requests.log"), "utf8");
       return log.trim().split("\n").map((line) => {
@@ -983,6 +1011,27 @@ for (const quotaCommand of ["failure", "missing"] as const) {
     );
   });
 }
+
+test("uses native CLI deletion when the cached Copilot SDK disappears", async (t) => {
+  const server = await startTestServer(t, {
+    nativeHistory: {},
+    nativeSessionDelete: true
+  });
+  await server.removeSdk();
+
+  const response = await fetch(
+    `${server.baseUrl}/api/sessions/${encodeURIComponent(server.sessionId)}`,
+    { method: "DELETE", headers: server.headers }
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { deleted: true });
+  assert.deepEqual(await server.nativeCliRequests(), [[
+    "--silent",
+    "--no-color",
+    "-i",
+    `/session delete ${server.sessionId} --yes --local-only`
+  ]]);
+});
 
 test("updates empty-session IDs through the API and preserves metadata and selected context", async (t) => {
   const server = await startTestServer(t, { profileSessions: true, context: "long_context" });
