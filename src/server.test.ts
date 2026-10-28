@@ -3990,7 +3990,7 @@ test("restores sent selection chips and source links after a page refresh", {
     "string"
   );
 
-  await evaluate(`
+  const askSelectionWasHidden = await evaluate(`
     (() => {
       const messages = document.querySelector("#messages");
       messages.scrollTop = 0;
@@ -4009,10 +4009,12 @@ test("restores sent selection chips and source links after a page refresh", {
         selection.addRange(range);
         break;
       }
+      const askSelectionWasHidden = document.querySelector("#ask-selection").hidden;
+      document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+      return askSelectionWasHidden;
     })();
   `);
-  assert.equal(await evaluate(`document.querySelector("#ask-selection").hidden`), true);
-  await evaluate(`document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }))`);
+  assert.equal(askSelectionWasHidden, true);
   await waitFor(`!document.querySelector("#ask-selection").hidden`);
   await evaluate(`document.querySelector("#ask-selection").click()`);
   assert.equal(await evaluate(`document.querySelector("#selection-list").children.length`), 1);
@@ -4030,6 +4032,13 @@ test("restores sent selection chips and source links after a page refresh", {
     await evaluate(`Boolean(window.localStorage.getItem("copilot-web-selection-messages"))`),
     true
   );
+  const activeSessionId = await evaluate(
+    `window.localStorage.getItem("copilot-web-active-session")`
+  );
+  assert.equal(typeof activeSessionId, "string");
+  const savedSession = await server.session(String(activeSessionId));
+  assert.ok(isRecord(savedSession) && Array.isArray(savedSession.messages));
+  assert.equal(savedSession.messages.length, 2);
 
   await evaluate(`window.beforeSelectionReload = true`);
   await command("Page.reload", {}, sessionId);
@@ -4082,7 +4091,12 @@ test("restores sent selection chips and source links after a page refresh", {
     !window.beforeStaleSelectionReload &&
     (() => {
       const messages = document.querySelector("#messages");
-      return messages?.getAttribute("aria-busy") === "false";
+      const users = messages?.querySelectorAll(".message.user");
+      const latest = users?.[users.length - 1];
+      return messages?.getAttribute("aria-busy") === "false" &&
+        users?.length === 2 &&
+        latest?.querySelector(".message-body")?.textContent ===
+          "Explain this selected passage.";
     })()
   `);
   const restoredSelectionState = await evaluate(`(() => {
@@ -4756,6 +4770,129 @@ function composerHelpers(command: Awaited<ReturnType<typeof startTestBrowser>>["
   };
   return { type, press, shift: 8, meta: process.platform === "darwin" ? 4 : 2 };
 }
+
+test("deduplicates repeated submits, shares session creation, and normalizes generated titles", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const delaySessionCreation = `
+    const NativeEventSource = window.EventSource;
+    window.EventSource = class extends NativeEventSource {
+      constructor(...args) {
+        super(...args);
+        window.testEventSource = this;
+      }
+    };
+    window.sessionCreationRequests = 0;
+    window.sessionCreationResponses = 0;
+    window.promptRequests = 0;
+    window.promptResponses = 0;
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      const url = typeof resource === "string" ? resource : resource.url;
+      if (url.endsWith("/api/sessions") && init?.method === "POST") {
+        window.sessionCreationRequests += 1;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const response = await nativeFetch(resource, init);
+        window.sessionCreationResponses += 1;
+        return response;
+      }
+      if (
+        url.includes("/api/sessions/") &&
+        url.endsWith("/messages") &&
+        init?.method === "POST"
+      ) {
+        window.promptRequests += 1;
+        const response = await nativeFetch(resource, init);
+        window.promptResponses += 1;
+        return response;
+      }
+      return nativeFetch(resource, init);
+    };
+  `;
+  const { evaluate, waitFor } = await startTestBrowser(
+    t,
+    server.baseUrl,
+    delaySessionCreation
+  );
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector("#new-chat").click()`);
+  await waitFor(`document.querySelector("#model-select").disabled === false`);
+  const firstPrompt =
+    "```\nTrinityVirusScanServiceInterface\ninitial request\n```";
+  const secondPrompt =
+    "```\nTrinityVirusScanServiceInterface\nfollow-up request\n```";
+  await evaluate(`
+    (() => {
+      const input = document.querySelector("#prompt-input");
+      input.value = ${JSON.stringify(firstPrompt)};
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      const form = document.querySelector("#composer");
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      input.value = ${JSON.stringify(secondPrompt)};
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    })()
+  `);
+  await waitFor(`
+    window.sessionCreationRequests > 0 &&
+    window.sessionCreationResponses === window.sessionCreationRequests &&
+    window.promptRequests === 2 &&
+    window.promptResponses === window.promptRequests &&
+    document.querySelector("#messages")?.textContent.includes("Done.")
+  `);
+
+  assert.equal(await evaluate(`window.sessionCreationRequests`), 1);
+  assert.equal(await evaluate(`window.promptRequests`), 2);
+  const requests = await server.requests();
+  const promptRequests = requests.filter((request) => request.method === "session/prompt");
+  assert.equal(promptRequests.length, 2);
+  assert.deepEqual(
+    promptRequests.map((request) => request.text).sort(),
+    [firstPrompt, secondPrompt].sort()
+  );
+  assert.equal(promptRequests[0]?.sessionId, promptRequests[1]?.sessionId);
+  const title = await evaluate(
+    `document.querySelector(".session-item.active .session-title")?.textContent`
+  );
+  assert.equal(typeof title, "string");
+  assert.ok(String(title).startsWith("TrinityVirusScanServiceInterface"));
+  assert.equal(String(title).includes("```"), false);
+
+  await waitFor(`Boolean(window.testEventSource)`);
+  const generatedTitleEvent = {
+    sessionId: server.sessionId,
+    update: {
+      sessionUpdate: "session_info_update",
+      title: "```\nGenerated title from Copilot\n```"
+    }
+  };
+  await evaluate(`
+    window.testEventSource.dispatchEvent(new MessageEvent("session-update", {
+      data: ${JSON.stringify(JSON.stringify(generatedTitleEvent))}
+    }));
+  `);
+  await waitFor(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"] .session-title'
+  )?.textContent === "Generated title from Copilot"`);
+
+  const customTitle = "``` custom title";
+  await evaluate(`
+    window.testEventSource.dispatchEvent(new MessageEvent("session-renamed", {
+      data: ${JSON.stringify(JSON.stringify({
+        sessionId: server.sessionId,
+        title: customTitle
+      }))}
+    }));
+  `);
+  await waitFor(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"] .session-title'
+  )?.textContent === ${JSON.stringify(customTitle)}`);
+});
 
 test("formats Markdown while typing in the composer and sends it as Markdown", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",

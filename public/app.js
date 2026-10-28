@@ -85,6 +85,7 @@ function createConversationState(sessionId = null) {
     nextSelectionNumber: 1,
     draft: "",
     promptQueue: [],
+    pendingSubmissions: [],
     syntheticMessageCounter: 0,
     lastStreamRole: null,
     currentTurnKey: null,
@@ -502,6 +503,7 @@ const state = {
   connectionStatus: "connecting",
   connectionLabel: "Connecting..."
 };
+const conversationCreationPromises = new WeakMap();
 
 function conversationState(sessionId, create = true) {
   if (!sessionId) {
@@ -2577,6 +2579,25 @@ applyTheme(themePreference);
 applySidebarWidth(preferredSidebarWidth);
 applySidebarState(sidebarCollapsed);
 
+function cleanGeneratedConversationTitle(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const title = value
+    .replace(/^ {0,3}(?:`{3,}|~{3,})[^\n]*\n/, "")
+    .replace(/\n {0,3}(?:`{3,}|~{3,})\s*$/, "")
+    .replace(/^ {0,3}(?:`{3,}|~{3,})[ \t]*/, "")
+    .replace(/[ \t]*(?:`{3,}|~{3,})$/, "");
+  return title.replace(/\s+/g, " ").trim();
+}
+
+function conversationTitleForDisplay(session) {
+  const title = typeof session.customTitle === "string"
+    ? session.customTitle
+    : cleanGeneratedConversationTitle(session.title);
+  return title || "Untitled conversation";
+}
+
 function renderSessionList() {
   const filter = elements.search.value.trim().toLowerCase();
   const sessions = state.sessions
@@ -2585,7 +2606,7 @@ function renderSessionList() {
         return true;
       }
       return [
-        session.title,
+        conversationTitleForDisplay(session),
         session.cwd,
         session.sessionId
       ].filter(Boolean).join(" ").toLowerCase().includes(filter);
@@ -2612,7 +2633,7 @@ function renderSessionList() {
   for (const session of sessions) {
     const row = document.createElement("div");
     const conversation = conversationState(session.sessionId, false);
-    const title = session.title || "Untitled conversation";
+    const title = conversationTitleForDisplay(session);
     const working = session.busy === true ||
       conversation?.busy ||
       conversation?.recoveredPrompt;
@@ -2637,10 +2658,10 @@ function renderSessionList() {
     const renameButton = document.createElement("button");
     renameButton.type = "button";
     renameButton.className = "session-action session-rename";
-    renameButton.title = `Rename ${session.title || "conversation"}`;
+    renameButton.title = `Rename ${title}`;
     renameButton.setAttribute(
       "aria-label",
-      `Rename ${session.title || "conversation"}`
+      `Rename ${title}`
     );
     renameButton.disabled =
       state.deletingSessionId !== null ||
@@ -2656,10 +2677,10 @@ function renderSessionList() {
       const deleteButton = document.createElement("button");
       deleteButton.type = "button";
       deleteButton.className = "session-action session-delete";
-      deleteButton.title = `Delete ${session.title || "conversation"}`;
+      deleteButton.title = `Delete ${title}`;
       deleteButton.setAttribute(
         "aria-label",
-        `Delete ${session.title || "conversation"}`
+        `Delete ${title}`
       );
       deleteButton.disabled = state.deletingSessionId !== null;
       deleteButton.innerHTML = deleteSessionIconMarkup;
@@ -5723,7 +5744,7 @@ function showPermissionRequest(event) {
     ? toolCall.title
     : "Copilot wants permission to use a tool.";
   elements.permissionDescription.textContent = session && sessionId !== state.activeSessionId
-    ? `${session.title || "Another conversation"}: ${toolDescription}`
+    ? `${conversationTitleForDisplay(session)}: ${toolDescription}`
     : toolDescription;
   elements.permissionOptions.replaceChildren();
   for (const option of options) {
@@ -5794,7 +5815,7 @@ function showError(error, conversation = activeConversation() ?? state.composer)
 }
 
 function confirmRenameConversation(session) {
-  const currentTitle = session.title || "";
+  const currentTitle = conversationTitleForDisplay(session);
   if (typeof elements.renameDialog.showModal !== "function") {
     const title = window.prompt("Rename conversation", currentTitle);
     return Promise.resolve(title === null ? null : title);
@@ -5854,6 +5875,7 @@ async function renameConversation(sessionId) {
     const renamedSession = state.sessions.find((item) => item.sessionId === sessionId);
     if (renamedSession) {
       renamedSession.title = renamedTitle;
+      renamedSession.customTitle = renamedTitle;
     }
     const conversation = conversationState(sessionId);
     conversation.activeSessionTitleOverride = renamedTitle;
@@ -5871,7 +5893,7 @@ async function renameConversation(sessionId) {
 }
 
 function confirmDeleteConversation(session) {
-  const title = session.title || "this conversation";
+  const title = conversationTitleForDisplay(session);
   if (typeof elements.deleteDialog.showModal !== "function") {
     return Promise.resolve(window.confirm(
       `Delete "${title}"? This removes its saved session data.`
@@ -6188,7 +6210,7 @@ function applyFallbackConversationTitle(queuedPrompt, conversation) {
   const source = queuedPrompt.displayText.trim() ||
     queuedPrompt.text.trim() ||
     (attachmentNames.length > 0 ? attachmentNames.join(", ") : "");
-  const compact = source.replace(/\s+/g, " ").trim();
+  const compact = cleanGeneratedConversationTitle(source);
   if (!compact) {
     return;
   }
@@ -6204,29 +6226,52 @@ function applyFallbackConversationTitle(queuedPrompt, conversation) {
   renderSessionList();
 }
 
-async function createServerConversation() {
+function createServerConversation(sourceConversation = currentComposerConversation()) {
+  if (state.deletingSessionId) {
+    return Promise.resolve(null);
+  }
+  const existingCreation = conversationCreationPromises.get(sourceConversation);
+  if (existingCreation) {
+    return existingCreation;
+  }
+  const creationPromise = createServerConversationInternal(sourceConversation).finally(() => {
+    if (conversationCreationPromises.get(sourceConversation) === creationPromise) {
+      conversationCreationPromises.delete(sourceConversation);
+    }
+  });
+  conversationCreationPromises.set(sourceConversation, creationPromise);
+  return creationPromise;
+}
+
+async function createServerConversationInternal(sourceConversation) {
   if (state.deletingSessionId) {
     return null;
   }
-  const previousConversation = activeConversation();
-  const pendingDraft = state.activeSessionId ? "" : elements.input.value;
-  const pendingAttachments = state.activeSessionId
+  const previousConversation = sourceConversation;
+  const hasActiveSession = state.activeSessionId !== null;
+  const pendingDraft = hasActiveSession
+    ? ""
+    : sourceConversation === currentComposerConversation()
+      ? elements.input.value
+      : sourceConversation.draft;
+  const pendingAttachments = hasActiveSession
     ? []
-    : state.composer.attachments.map((attachment) => ({ ...attachment }));
-  const pendingSelections = state.activeSessionId
+    : sourceConversation.attachments.map((attachment) => ({ ...attachment }));
+  const pendingSelections = hasActiveSession
     ? []
-    : state.composer.selections.map(copySelectionReference);
-  const pendingSelectionNumber = state.activeSessionId
+    : sourceConversation.selections.map(copySelectionReference);
+  const pendingSelectionNumber = hasActiveSession
     ? 1
-    : state.composer.nextSelectionNumber;
-  const configOverrides = state.activeSessionId
+    : sourceConversation.nextSelectionNumber;
+  const configOverrides = hasActiveSession
     ? {}
-    : selectedNewSessionConfigOverrides(state.composer);
+    : selectedNewSessionConfigOverrides(sourceConversation);
+  const context = state.selectedContext;
   try {
     const result = await api("/api/sessions", {
       method: "POST",
       body: JSON.stringify({
-        context: state.selectedContext,
+        context,
         configOverrides
       })
     });
@@ -6255,12 +6300,14 @@ async function createServerConversation() {
     state.newSessionDefaults = result.newSessionDefaults ?? state.newSessionDefaults;
     state.nativeMessageHistoryAvailable =
       result.nativeMessageHistoryAvailable === true;
-    applySessionSetup(result, state.selectedContext, conversation);
-    state.composer = createConversationState();
-    state.activeSessionId = session.sessionId;
-    activateConversation(session.sessionId);
-    setStatus("Ready", conversation);
-    elements.input.focus();
+    applySessionSetup(result, context, conversation);
+    if (currentComposerConversation() === sourceConversation) {
+      state.composer = createConversationState();
+      state.activeSessionId = session.sessionId;
+      activateConversation(session.sessionId);
+      setStatus("Ready", conversation);
+      elements.input.focus();
+    }
     return conversation;
   } catch (error) {
     showError(error, previousConversation ?? state.composer);
@@ -7054,12 +7101,26 @@ async function sendPrompt(event) {
   await submitPrompt();
 }
 
+function samePendingSubmission(left, right) {
+  return left.text === right.text &&
+    left.attachments.length === right.attachments.length &&
+    left.attachments.every((attachment, index) => (
+      attachment === right.attachments[index]
+    )) &&
+    left.selections.length === right.selections.length &&
+    left.selections.every((selection, index) => (
+      selection === right.selections[index]
+    ));
+}
+
 async function submitPrompt() {
   let conversation = currentComposerConversation();
   const text = elements.input.value;
-  const selections = conversation.selections.map(copySelectionReference);
+  const selectionReferences = [...conversation.selections];
+  const attachmentReferences = [...conversation.attachments];
+  const selections = selectionReferences.map(copySelectionReference);
   if (
-    (!text.trim() && conversation.attachments.length === 0 && selections.length === 0) ||
+    (!text.trim() && attachmentReferences.length === 0 && selections.length === 0) ||
     conversation.loading ||
     conversation.configurationBusy ||
     conversation.attachmentBusy
@@ -7072,7 +7133,7 @@ async function submitPrompt() {
     : selections.length > 0
       ? "Please explain these selected passages."
       : text;
-  const attachments = conversation.attachments.map((attachment) => ({ ...attachment }));
+  const attachments = attachmentReferences.map((attachment) => ({ ...attachment }));
   const capabilityError = attachmentCapabilityError(attachments);
   if (capabilityError) {
     addMessage("system", capabilityError, null, [], conversation);
@@ -7080,48 +7141,67 @@ async function submitPrompt() {
     return;
   }
 
-  if (!state.activeSessionId) {
-    conversation = await createServerConversation() ?? activeConversation();
-  }
-  if (!conversation?.sessionId) {
+  const submissionConversation = conversation;
+  const submission = {
+    text,
+    attachments: attachmentReferences,
+    selections: selectionReferences
+  };
+  if (submissionConversation.pendingSubmissions.some((pending) => (
+    samePendingSubmission(pending, submission)
+  ))) {
     return;
   }
-  if (conversation.newerHistoryHidden) {
-    const loaded = await loadConversation(conversation.sessionId, undefined, true);
-    if (!loaded || currentComposerConversation() !== conversation) {
+  submissionConversation.pendingSubmissions.push(submission);
+  try {
+    if (!state.activeSessionId) {
+      conversation = await createServerConversation(submissionConversation) ?? activeConversation();
+    }
+    if (!conversation?.sessionId) {
       return;
     }
-  }
-  if (conversation.activeSessionIsNew && conversation.messages.length === 0 &&
-      conversation.sessionContext !== state.selectedContext) {
-    conversation = await createServerConversation() ?? activeConversation();
-  }
-  if (!conversation?.sessionId) {
-    return;
-  }
+    if (conversation.newerHistoryHidden) {
+      const loaded = await loadConversation(conversation.sessionId, undefined, true);
+      if (!loaded || currentComposerConversation() !== conversation) {
+        return;
+      }
+    }
+    if (conversation.activeSessionIsNew && conversation.messages.length === 0 &&
+        conversation.sessionContext !== state.selectedContext) {
+      conversation = await createServerConversation(conversation) ?? activeConversation();
+    }
+    if (!conversation?.sessionId) {
+      return;
+    }
 
-  if (selections.length > 0) {
-    const persisted = persistSelectionMessageMetadata(
-      conversation.sessionId,
-      promptText,
-      displayText,
-      selections
-    );
-    if (!persisted) {
-      showSelectionNotice(
-        "Selections were sent, but browser storage is unavailable; their chips may expand after a refresh."
+    if (selections.length > 0) {
+      const persisted = persistSelectionMessageMetadata(
+        conversation.sessionId,
+        promptText,
+        displayText,
+        selections
       );
+      if (!persisted) {
+        showSelectionNotice(
+          "Selections were sent, but browser storage is unavailable; their chips may expand after a refresh."
+        );
+      }
+    }
+    elements.input.value = "";
+    conversation.draft = "";
+    resizePromptInput();
+    conversation.attachments = [];
+    conversation.selections = [];
+    conversation.nextSelectionNumber = 1;
+    renderAttachmentList();
+    renderSelectionList();
+    enqueuePrompt(conversation, promptText, attachments, false, displayText, selections);
+  } finally {
+    const submissionIndex = submissionConversation.pendingSubmissions.indexOf(submission);
+    if (submissionIndex >= 0) {
+      submissionConversation.pendingSubmissions.splice(submissionIndex, 1);
     }
   }
-  elements.input.value = "";
-  conversation.draft = "";
-  resizePromptInput();
-  conversation.attachments = [];
-  conversation.selections = [];
-  conversation.nextSelectionNumber = 1;
-  renderAttachmentList();
-  renderSelectionList();
-  enqueuePrompt(conversation, promptText, attachments, false, displayText, selections);
 }
 
 function enqueuePrompt(
@@ -7363,6 +7443,7 @@ function connectEvents() {
     const session = state.sessions.find((item) => item.sessionId === data.sessionId);
     if (session) {
       session.title = data.title;
+      session.customTitle = data.title;
     }
     const conversation = conversationState(data.sessionId);
     conversation.activeSessionTitleOverride = data.title;
