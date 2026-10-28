@@ -453,6 +453,14 @@ button:disabled {
   font-weight: 650;
 }
 
+.session-status-deleting {
+  display: inline-block;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-hover);
+}
+
 .session-empty {
   padding: 18px 10px;
   color: var(--muted);

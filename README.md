@@ -13,6 +13,10 @@ keeps the model, tools, authentication, and workspace local.
 - Show each conversation's title, last activity, and working or queued status.
 - Rename conversations from the browser; custom titles are stored locally and
   survive browser and server restarts.
+- Delete conversations in the background. Confirmation immediately opens a new
+  conversation if you are viewing the one being deleted. Its sidebar row shows
+  **Deleting** until deletion finishes, without blocking other conversations;
+  failures leave it available to retry and show an error in the current chat.
 - Select an existing conversation and load its latest messages, fetching older
   history automatically when scrolling upward.
 - Bound history pages by both message count and bytes while retaining loaded
