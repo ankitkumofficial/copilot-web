@@ -668,6 +668,182 @@ test("keeps native chat separate while merging bounded tool details, commands, a
   assert.equal(native.find((message) => message.messageId === "answer-1")?.content, "Persisted answer");
 });
 
+test("places cached reasoning and unpersisted tools after their native message anchors", () => {
+  const events: JsonObject[] = [
+    { type: "user.message", id: "user-event", data: { messageId: "user", content: "Question" } },
+    { type: "assistant.message", id: "preamble-event", data: {
+      messageId: "preamble", content: "I will investigate.",
+      toolRequests: [{ toolCallId: "second-tool", name: "Run tests" }]
+    } },
+    { type: "tool.execution_complete", id: "tool-event", data: {
+      toolCallId: "second-tool", success: true, result: { content: "Persisted completion" }
+    } }
+  ];
+  const cached: JsonObject[] = [
+    { afterMessageId: "user", update: {
+      sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "First reasoning." }
+    } },
+    { afterMessageId: "user", update: {
+      sessionUpdate: "tool_call", toolCallId: "first-tool", title: "Inspect code", status: "completed"
+    } },
+    { afterMessageId: "preamble", update: {
+      sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Second reasoning." }
+    } },
+    { afterMessageId: "preamble", update: {
+      sessionUpdate: "tool_call", toolCallId: "second-tool", title: "Run tests", status: "in_progress"
+    } },
+    { afterMessageId: "unrelated-user", update: {
+      sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Do not include" }
+    } }
+  ];
+  const replay = mergePagedHistoryReplayUpdates("session-1", events, nativeMessagesFromEvents(events), cached);
+  assert.deepEqual(replay.map((params) => {
+    assert.ok(isRecord(params.update));
+    const update = params.update;
+    return [update.sessionUpdate, update.messageId ?? update.toolCallId ??
+      (isRecord(update.content) ? update.content.text : undefined), update.status];
+  }), [
+    ["user_message_chunk", "user", undefined],
+    ["agent_thought_chunk", "First reasoning.", undefined],
+    ["tool_call", "first-tool", "completed"],
+    ["agent_message_chunk", "preamble", undefined],
+    ["agent_thought_chunk", "Second reasoning.", undefined],
+    ["tool_call", "second-tool", "in_progress"],
+    ["tool_call_update", "second-tool", "completed"]
+  ]);
+  assert.equal(JSON.stringify(replay).includes("Do not include"), false);
+  assert.equal(JSON.stringify(replay).includes("I will investigate."), false);
+});
+
+test("keeps a tool's cached completion with its original reply anchor", () => {
+  const events: JsonObject[] = [
+    { type: "user.message", id: "u", data: { messageId: "user", content: "Investigate" } },
+    { type: "assistant.message", id: "a1", data: {
+      messageId: "first", content: "I will investigate.",
+      toolRequests: [{ toolCallId: "tool-1", name: "Read file" }]
+    } },
+    { type: "tool.execution_start", id: "ts", data: { toolCallId: "tool-1" } },
+    { type: "tool.execution_complete", id: "te", data: {
+      toolCallId: "tool-1", success: true, result: { content: "Read completed" }
+    } },
+    { type: "assistant.message", id: "a2", data: { messageId: "second", content: "File read." } }
+  ];
+  const cached: JsonObject[] = [
+    { afterMessageId: "first", update: {
+      sessionUpdate: "tool_call", toolCallId: "tool-1", title: "Read file", status: "in_progress"
+    } },
+    { afterMessageId: "second", update: {
+      sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Now checking results." }
+    } },
+    { afterMessageId: "second", update: {
+      sessionUpdate: "tool_call_update", toolCallId: "tool-1", status: "completed"
+    } }
+  ];
+  const replay = mergePagedHistoryReplayUpdates("s", events, nativeMessagesFromEvents(events), cached);
+  const toolUpdates = replay.filter((entry) => isRecord(entry.update) && entry.update.toolCallId === "tool-1");
+  assert.equal(toolUpdates.length, 2);
+  assert.deepEqual(toolUpdates.map((entry) => {
+    assert.ok(isRecord(entry.update));
+    return [entry.afterMessageId, entry.update.status];
+  }), [["first", "in_progress"], ["first", "completed"]]);
+  const completedEntry = toolUpdates[1];
+  assert.ok(completedEntry);
+  const completion = completedEntry.update;
+  assert.ok(isRecord(completion) && isRecord(completion.content));
+  assert.equal(completion.content.text, "Read completed");
+  assert.ok(replay.indexOf(completedEntry) < replay.findIndex((entry) =>
+    isRecord(entry.update) && entry.update.messageId === "second"));
+  assert.equal(cached[2]?.afterMessageId, "second", "Merging must not mutate the source replay");
+});
+
+for (const cachedTitle of [undefined, "", "Copilot tool", "Latest descriptive title"]) {
+  for (const status of ["in_progress", "completed"]) {
+    test(`restores persisted tool metadata with ${cachedTitle ?? "missing title"} and ${status}`, () => {
+      const events: JsonObject[] = [
+        { type: "user.message", id: "u", data: { messageId: "user", content: "Inspect code" } },
+        { type: "assistant.message", id: "r", data: { messageId: "request", content: "",
+          toolRequests: [{ toolCallId: "tool-1", name: "read_file" }] } },
+        { type: "tool.execution_start", id: "ts", data: {
+          toolCallId: "tool-1", toolTitle: "Read important source"
+        } },
+        { type: "tool.execution_complete", id: "te", data: {
+          toolCallId: "tool-1", success: true, result: { content: "Stored result" }
+        } },
+        { type: "assistant.message", id: "a", data: { messageId: "answer", content: "Inspected" } }
+      ];
+      const cached: JsonObject[] = [{
+        afterMessageId: "user",
+        update: {
+          sessionUpdate: "tool_call_update", toolCallId: "tool-1", status,
+          ...(cachedTitle !== undefined ? { title: cachedTitle } : {})
+        }
+      }];
+      const replay = mergePagedHistoryReplayUpdates("s", events, nativeMessagesFromEvents(events), cached);
+      const toolUpdates = replay.filter((entry) => isRecord(entry.update) && entry.update.toolCallId === "tool-1");
+      const firstUpdate = toolUpdates[0]?.update;
+      assert.ok(isRecord(firstUpdate));
+      assert.equal(firstUpdate.title, cachedTitle === "Latest descriptive title"
+        ? cachedTitle : "Read important source");
+      assert.equal(firstUpdate.status, status);
+      assert.equal(toolUpdates.length, status === "completed" ? 1 : 2);
+      const lastUpdate = toolUpdates.at(-1)?.update;
+      assert.ok(isRecord(lastUpdate) && isRecord(lastUpdate.content));
+      assert.equal(lastUpdate.status, "completed");
+      assert.equal(lastUpdate.content.text, "Stored result");
+      assert.ok(isRecord(cached[0]?.update));
+      assert.equal(cached[0].update.title, cachedTitle, "Persisted metadata must not mutate cached input");
+    });
+  }
+}
+
+test("keeps reasoning and tool progress when cached tool output exceeds the activity budget", () => {
+  const events: JsonObject[] = [{
+    type: "user.message", id: "user-event", data: { messageId: "user", content: "Question" }
+  }];
+  const cached: JsonObject[] = [
+    { afterMessageId: "user", update: {
+      sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Preserved reasoning." }
+    } },
+    { afterMessageId: "user", update: {
+      sessionUpdate: "tool_call_update", toolCallId: "large-tool", title: "Read a large file",
+      status: "completed", content: { type: "text", text: "x".repeat(historyPageMaximumBytes) }
+    } }
+  ];
+  let truncated = false;
+  const replay = mergePagedHistoryReplayUpdates("session-1", events, nativeMessagesFromEvents(events),
+    cached, [], () => { truncated = true; });
+  assert.equal(truncated, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(replay)) < historyPageMaximumBytes / 2);
+  assert.ok(JSON.stringify(replay).includes("Preserved reasoning."));
+  assert.ok(replay.some((params) => isRecord(params.update) &&
+    params.update.toolCallId === "large-tool" && params.update.status === "completed"));
+  assert.equal(isRecord(cached[1]?.update) && isRecord(cached[1].update.content) &&
+    String(cached[1].update.content.text).length, historyPageMaximumBytes);
+});
+
+test("anchors cached activity after a native reply that is still streaming", () => {
+  const events: JsonObject[] = [
+    { type: "user.message", id: "user-event", data: { messageId: "user", content: "Question" } },
+    { type: "assistant.message_start", id: "start-event", data: { messageId: "streaming" } },
+    { type: "assistant.message_delta", id: "delta-event", data: {
+      messageId: "streaming", deltaContent: "An update."
+    } }
+  ];
+  const cached: JsonObject[] = [{
+    afterMessageId: "streaming",
+    update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Keep thinking." } }
+  }];
+  const replay = mergePagedHistoryReplayUpdates("session-1", events, nativeMessagesFromEvents(events), cached);
+  assert.deepEqual(replay.map((params) => {
+    assert.ok(isRecord(params.update));
+    return [params.update.sessionUpdate, params.update.messageId ?? params.afterMessageId];
+  }), [
+    ["user_message_chunk", "user"],
+    ["agent_message_chunk", "streaming"],
+    ["agent_thought_chunk", "streaming"]
+  ]);
+});
+
 test("budgets UTF-8 text and attachment data instead of only counting messages", async () => {
   const unicode = pagingFixture(4, "\u{1f600}".repeat(20_000));
   const textPage = await unicode.pager.read("session-1");

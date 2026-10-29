@@ -1231,6 +1231,27 @@ button:disabled {
   box-shadow: 0 0 0 3px rgba(139, 124, 255, 0.16), var(--shadow);
 }
 
+.pending-send-review {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+.pending-send-review span {
+  flex: 1 1 200px;
+  overflow-wrap: anywhere;
+}
+
+.pending-send-reviews[hidden] {
+  display: none;
+}
+
 .composer prompt-editor {
   position: relative;
   display: block;

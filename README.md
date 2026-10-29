@@ -30,6 +30,35 @@ keeps the model, tools, authentication, and workspace local.
   selected passages, cancellation state, streamed activities, and usage.
 - Recover an in-progress prompt after a browser refresh and continue showing
   its streamed result.
+- Keep newly created and live conversations visible while the CLI's persisted
+  conversation list catches up. Refresh restores the selected conversation by
+  its saved ID rather than treating an incomplete list snapshot as deletion;
+  a failed history load keeps that selection available for retry, unless the
+  server reports that the conversation no longer exists.
+- Keep newer activity timestamps when an older history response arrives, and
+  leave a newly opened conversation and its draft alone during background
+  creation or prompt recovery. Recovery is ordered within each conversation,
+  while independent conversations resume without waiting for each other's
+  replies. A send stopped by a failed latest-history load is not queued
+  for automatic replay, so an explicit retry cannot send it twice on refresh.
+- Keep each send bound to its original conversation: a creation failure never
+  redirects it to whichever conversation is currently selected. Draft text and
+  attachments composed after **Send** remain intact while creation finishes,
+  including edits in the same composer and files that are still being read.
+- Preserve submitted messages across an immediate refresh, even while the first
+  conversation is still being created. Pending sends are kept in this tab's
+  browser session storage until delivery is confirmed, including when a refresh
+  aborts the creation request. Retries reuse the same
+  conversation and prompt rather than sending either twice. Manually retrying
+  after a lost creation response also reuses the original creation request,
+  rather than leaving a duplicate empty conversation. If browser storage
+  is unavailable or full (for example, with large attachments), an explicit
+  warning asks you to keep the page open until sending finishes. Pending sends
+  with recorded native acceptance are not resent after a server restart.
+  Uncertain older sends appear separately above the composer with **Restore
+  draft** and **Dismiss** actions, plus a one-time warning. They never fill the
+  composer automatically, overwrite an existing draft, block newer sends, or
+  repeat that warning on each refresh, including while Copilot is thinking.
 - Reload a conversation after a CLI crash without duplicating its history or
   showing historical messages as new output.
 - Send prompts and receive streamed Copilot responses.
@@ -62,6 +91,24 @@ keeps the model, tools, authentication, and workspace local.
   buttons.
 - Show Copilot reasoning text when the ACP stream or persisted history exposes it.
 - Display tool activity while Copilot works.
+- Retain recent Thinking text and tool progress after refresh in paged
+  conversations, including activity that is not yet in the native journal.
+  Activity stays beside its source user message or visible Copilot reply;
+  updates received during history loading are merged without repeating them.
+  Native messages and ACP activity share a snapshot sequence, so newer Thinking
+  text and tool completions received during loading cannot be replaced by an
+  older history response. This sequence affects display recovery only, not the
+  native AI conversation.
+  Completion fallback retains each text chunk's original identity, so command
+  replies already restored from history are not appended again. Distinct chunks
+  with identical text remain separate and retain their original order.
+  Complete persisted reasoning fills in missing cached fragments after cache
+  eviction; overlapping fragments appear once, in chronological order. A tool
+  stays in its original Thinking panel even when its completion arrives after
+  another visible reply. Its recorded name is restored when the cached start
+  event is missing, without replacing newer descriptive live metadata.
+  If cached activity exceeds its display budget, large tool output is omitted
+  before reasoning and tool progress, and a history warning explains any loss.
 - Toggle **Keep awake** using the coffee-cup button immediately before
   **Reconnect tools** in the message bar. It uses the browser's Screen Wake Lock
   API to prevent the display from sleeping and normal display-sleep-triggered
@@ -207,6 +254,12 @@ message ID. Selection links use
 stable native message IDs to fetch an unloaded source passage. History-only
 requests never activate a session or submit a prompt.
 
+For a new active conversation, refresh can use its complete recorded live
+snapshot while the native journal is still being saved. This is used only while
+the entire snapshot fits one history page and neither live cache has been
+truncated or evicted. Older or larger histories still use persisted pagination
+or the explicit replay fallback.
+
 The initial ACP restore still replays history internally because this CLI does
 not advertise no-replay resume. Native AI-session state and its lifetime are
 deliberately not evicted by the web cache policy. If the persisted-history API
@@ -244,7 +297,11 @@ Per-conversation context, model, and reasoning preferences are stored in
 `~/.copilot-web/session-preferences.json`.
 These are web-interface metadata and do not modify the underlying Copilot
 session transcript. Selecting or loading a conversation does not update its
-last-activity timestamp. Writes to each metadata file are serialized and replace
+last-activity timestamp or move it to the top of the sidebar, including after
+a refresh. Submitting a prompt and actual server activity update the ordering.
+Replayed native events are historical: opening or switching a conversation does
+not count old usage again or treat it as new activity.
+Writes to each metadata file are serialized and replace
 the file atomically; graceful shutdown waits for pending writes. Deleting a
 conversation also removes its metadata, and the API reports any metadata
 cleanup failures to the browser. These guarantees apply within one server
