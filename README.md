@@ -90,7 +90,8 @@ keeps the model, tools, authentication, and workspace local.
   space permits and wrap below them otherwise, without overlapping action
   buttons.
 - Show Copilot reasoning text when the ACP stream or persisted history exposes it.
-- Display tool activity while Copilot works.
+- Display tool activity while Copilot works, summarized by the latest tool
+  call (for example, "Run tests and 2 other tool calls").
 - Retain recent Thinking text and tool progress after refresh in paged
   conversations, including activity that is not yet in the native journal.
   Activity stays beside its source user message or visible Copilot reply;

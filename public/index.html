@@ -130,21 +130,24 @@
           <div class="composer-footer">
             <span id="composer-hint" class="visually-hidden" aria-live="polite"></span>
             <div class="composer-settings" aria-label="Model settings">
-              <label class="setting-control composer-setting">
-                <span>Model</span>
+              <label class="setting-control composer-setting" title="Model">
+                <svg class="composer-setting-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"></rect><path d="M10 3v4m4-4v4m-4 10v4m4-4v4M3 10h4m-4 4h4m10-4h4m-4 4h4"></path></svg>
+                <span class="visually-hidden">Model</span>
                 <select id="model-select" disabled>
                   <option value="">Start a conversation</option>
                 </select>
               </label>
-              <label class="setting-control composer-setting">
-                <span>Context</span>
+              <label class="setting-control composer-setting" title="Context window">
+                <svg class="composer-setting-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5Z"></path><path d="m3 13 9 5 9-5"></path></svg>
+                <span class="visually-hidden">Context</span>
                 <select id="context-select">
                   <option value="default">Default</option>
                   <option value="long_context">Long context</option>
                 </select>
               </label>
-              <label class="setting-control composer-setting">
-                <span>Reasoning</span>
+              <label class="setting-control composer-setting" title="Reasoning effort">
+                <svg class="composer-setting-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6m-5 3h4"></path><path d="M12 3a6 6 0 0 0-3.5 10.9c.6.4 1 1.1 1 1.8v.3h5v-.3c0-.7.4-1.4 1-1.8A6 6 0 0 0 12 3Z"></path></svg>
+                <span class="visually-hidden">Reasoning</span>
                 <select id="reasoning-select" disabled>
                   <option value="">Start a conversation</option>
                 </select>
