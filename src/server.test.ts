@@ -4395,8 +4395,8 @@ test("sizes composer selectors to their labels and wraps usage without overlap",
     width: 1360, height: 900, deviceScaleFactor: 1, mobile: false
   }, sessionId);
   for (const [aic, context] of [
-    ["0.13 credits", "36.8K / 872K tokens"],
-    ["144.04 credits", "153.5K / 968K tokens"]
+    ["0.13 cr", "36.8K / 872K"],
+    ["144.04 cr", "153.5K / 968K"]
   ]) {
     await evaluate(`
       document.querySelector('#usage-aic').textContent = ${JSON.stringify(aic)};
@@ -4484,7 +4484,7 @@ test("refreshes quota after each AIC usage update", {
     document.querySelector("#composer").requestSubmit();
   `);
   await server.waitForPrompt("quota refresh test");
-  await waitFor(`document.querySelector("#usage-aic").textContent === "2 credits"`);
+  await waitFor(`document.querySelector("#usage-aic").textContent === "2 cr"`);
   assert.equal(
     await evaluate(`document.querySelector("#usage-aic-metric .usage-label").textContent`),
     "SESSION"
@@ -7748,7 +7748,7 @@ async function scrollUpAndWaitForHistory(
     observer.observe(messages, { childList: true, subtree: true });
     messages.scrollTop = messages.scrollHeight;
     messages.dispatchEvent(new Event("scroll"));
-    messages.scrollTop = Math.min(120, messages.scrollHeight);
+    messages.scrollTop = Math.min(120, Math.floor(messages.scrollTop / 2));
     messages.dispatchEvent(new Event("scroll"));
   })()`);
   await waitFor("window.historyLoadComplete");

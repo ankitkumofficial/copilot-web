@@ -2313,11 +2313,11 @@ function renderUsage(conversation = activeConversation()) {
   if (hasAicUsage) {
     elements.usageAic.textContent = `${formatAic(aicNano)}${
       Number.isFinite(aicLimit) ? ` / ${formatAic(aicLimit)}` : ""
-    } credits`;
+    } cr`;
   }
   if (hasContextUsage) {
     elements.usageContext.textContent =
-      `${formatContextTokens(used)} / ${formatContextTokens(size)} tokens`;
+      `${formatContextTokens(used)} / ${formatContextTokens(size)}`;
   }
 }
 
@@ -3370,6 +3370,18 @@ function updateScrollableContent(element, update) {
   element.scrollTop = stickToBottom ? element.scrollHeight : previousScrollTop;
 }
 
+function toolActivitySummary(activities, activeCount) {
+  const latest = activities.findLast((activity) => (
+    activity.status === "pending" || activity.status === "in_progress"
+  )) ?? activities.at(-1);
+  const title = typeof latest.title === "string" && latest.title.length > 0 ? latest.title : "Tool call";
+  const others = activities.length - 1;
+  const text = others > 0
+    ? `${title} and ${others} other tool call${others === 1 ? "" : "s"}`
+    : title;
+  return activeCount > 0 ? `${text} · In progress` : text;
+}
+
 function renderToolActivities(body, message) {
   const activities = Array.isArray(message.toolActivities) ? message.toolActivities : [];
   const thinkingText = typeof message.thinkingText === "string"
@@ -3433,11 +3445,13 @@ function renderToolActivities(body, message) {
       activity.status === "pending" || activity.status === "in_progress"
     )).length;
     const summary = activityPanel.querySelector("summary");
-    const summaryText = activeCount > 0
-      ? `Activities (${activities.length}) · In progress`
-      : `Activities (${activities.length})`;
+    const summaryText = toolActivitySummary(activities, activeCount);
     if (summary.textContent !== summaryText) {
-      summary.textContent = summaryText;
+      const text = document.createElement("span");
+      text.className = "tool-activity-summary-text";
+      text.textContent = summaryText;
+      summary.replaceChildren(text);
+      summary.title = summaryText;
     }
 
     const list = activityPanel.querySelector(".tool-activity-list");
