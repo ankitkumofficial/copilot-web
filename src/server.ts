@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   access,
   constants,
@@ -119,6 +119,7 @@ interface BusyPrompt {
   clientPromptId?: string;
   userMessageId?: string;
   nativeUserMessageId?: string;
+  lastVisibleNativeMessageId?: string;
   nativeAssistantHasContent?: boolean;
   acpAssistantUpdates?: JsonObject[];
   cancelController: AbortController;
@@ -158,11 +159,13 @@ type SessionActivityCache = Map<string, string>;
 
 class HttpError extends Error {
   public readonly status: number;
+  public readonly code: string | undefined;
 
-  public constructor(status: number, message: string) {
+  public constructor(status: number, message: string, code?: string) {
     super(message);
     this.name = "HttpError";
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -1122,7 +1125,60 @@ async function main(): Promise<void> {
   const sessionOperationWaiters = new Map<string, Set<() => void>>();
   const sseClients = new Set<SseClient>();
   const browserToken = randomBytes(32).toString("hex");
+  const requestScope = randomBytes(12).toString("hex");
+  let updateSequence = 0;
+  // Settled results stay long enough for refresh retries without growing for the server's lifetime.
+  const maximumSettledSubmissions = 256;
+  const submittedRequests = new Map<string, {
+    fingerprint: string;
+    result: Promise<JsonObject>;
+  }>();
+  const settledSubmissions = new Set<string>();
+  const runRequestOnce = (
+    request: IncomingMessage,
+    body: JsonObject,
+    operation: () => Promise<JsonObject>
+  ): Promise<JsonObject> => {
+    const requestId = request.headers["x-copilot-request-id"];
+    if (requestId === undefined) {
+      return operation();
+    }
+    if (typeof requestId !== "string" || !/^[A-Za-z0-9_-]{1,120}$/.test(requestId)) {
+      throw new HttpError(400, "Invalid submission identifier");
+    }
+    if (request.headers["x-copilot-request-scope"] !== requestScope) {
+      throw new HttpError(
+        409,
+        "The server restarted; the pending message was not resent automatically",
+        "server-restarted"
+      );
+    }
+    const key = `${request.url}:${requestId}`;
+    const fingerprint = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+    const previous = submittedRequests.get(key);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint) {
+        throw new HttpError(409, "Submission identifier was already used for a different request");
+      }
+      return previous.result;
+    }
+    const result = Promise.resolve().then(operation);
+    submittedRequests.set(key, { fingerprint, result });
+    const settle = (): void => {
+      settledSubmissions.add(key);
+      for (const oldest of settledSubmissions) {
+        if (settledSubmissions.size <= maximumSettledSubmissions) {
+          break;
+        }
+        settledSubmissions.delete(oldest);
+        submittedRequests.delete(oldest);
+      }
+    };
+    void result.then(settle, settle);
+    return result;
+  };
   const truncatedReplays = new Set<string>();
+  const completeLiveHistories = new Set<string>();
   const legacyReplaySessions = new Set<string>();
   const maximumReplayBytes = 512 * 1024;
   const maximumReplaySessions = 8;
@@ -1156,6 +1212,7 @@ async function main(): Promise<void> {
         replay.splice(0, start);
         measured.sizes.splice(0, start);
         truncatedReplays.add(sessionId);
+        completeLiveHistories.delete(sessionId);
       }
       if (!cache) {
         return;
@@ -1170,6 +1227,7 @@ async function main(): Promise<void> {
         }
         sessionReplayCache.delete(oldest);
         truncatedReplays.add(oldest);
+        completeLiveHistories.delete(oldest);
       }
     }
     if (cache) {
@@ -1196,6 +1254,7 @@ async function main(): Promise<void> {
         for (const oldKey of state.order.splice(0, index + 1)) {
           state.messages.delete(oldKey);
         }
+        completeLiveHistories.delete(sessionId);
         break;
       }
     }
@@ -1214,6 +1273,7 @@ async function main(): Promise<void> {
       }
       if (id !== sessionId && !busySessions.has(id)) {
         nativeMessageStates.delete(id);
+        completeLiveHistories.delete(id);
       }
     }
   };
@@ -1222,26 +1282,46 @@ async function main(): Promise<void> {
     sessionId: string,
     page: HistoryPage,
     includeReplay = false,
-    liveReplay: readonly JsonObject[] = []
+    liveReplay: readonly JsonObject[] = [],
+    liveNativeMessages?: NativeMessage[],
+    activityNativeMessages: NativeMessage[] = []
   ) => {
-    const nativeMessages = nativeMessagesFromEvents(page.events);
+    const nativeMessages = liveNativeMessages ?? nativeMessagesFromEvents(page.events);
+    const replayMessages = activityNativeMessages.length > 0
+      ? mergeNativeMessages([], [], [...nativeMessages, ...activityNativeMessages])
+      : nativeMessages;
     const cachedReplay = sessionReplayCache.get(sessionId) ?? [];
     const useCompleteReplay = includeReplay && cachedReplay.length > 0 &&
       !page.hasMore && !truncatedReplays.has(sessionId) &&
-      Buffer.byteLength(JSON.stringify({ cachedReplay, nativeMessages })) <= historyPageMaximumBytes;
+      Buffer.byteLength(JSON.stringify({ cachedReplay, nativeMessages: replayMessages })) <= historyPageMaximumBytes;
+    let activityTruncated = false;
     const replayUpdates = useCompleteReplay
       ? [...cachedReplay]
       : mergePagedHistoryReplayUpdates(
         sessionId,
         page.events,
-        nativeMessages,
+        replayMessages,
         cachedReplay,
-        []
+        [],
+        () => { activityTruncated = true; }
       );
+    const included = new Set(replayUpdates);
+    const includedTools = new Set(replayUpdates.flatMap((params) => (
+      typeof params.afterMessageId === "string" && isRecord(params.update) &&
+      typeof params.update.toolCallId === "string"
+        ? [params.update.toolCallId] : []
+    )));
+    const liveReplayUpdates = liveReplay.filter((params) => !included.has(params) && !(
+      typeof params.afterMessageId === "string" && isRecord(params.update) &&
+      includedTools.has(String(params.update.toolCallId))
+    ));
     return {
       nativeMessages,
       replayUpdates,
-      ...(liveReplay.length > 0 ? { liveReplayUpdates: [...liveReplay] } : {}),
+      ...(liveReplayUpdates.length > 0 ? { liveReplayUpdates } : {}),
+      ...(activityTruncated ? {
+        historyWarning: "Some cached reasoning or tool output exceeded the activity display budget and could not be restored."
+      } : {}),
       history: {
         hasMore: page.hasMore,
         cursor: page.cursor ?? null,
@@ -1521,6 +1601,8 @@ async function main(): Promise<void> {
     nativeMessageStates.delete(previousSessionId);
     nativePipelineModes.delete(previousSessionId);
     nativePipelineModes.set(setup.sessionId, copilotHistory.available);
+    completeLiveHistories.delete(previousSessionId);
+    completeLiveHistories.add(setup.sessionId);
     sessionUsageCache.delete(previousSessionId);
     const activity = sessionActivityCache.get(previousSessionId) ?? session.updatedAt;
     sessionActivityCache.delete(previousSessionId);
@@ -1624,10 +1706,23 @@ async function main(): Promise<void> {
     if (sessionId && deletedSessions.has(sessionId)) {
       return;
     }
+    const replaying = replayingSessions.has(sessionId ?? "");
+    const activePrompt = !replaying && sessionId
+      ? busySessions.get(sessionId)
+      : undefined;
+    const updateParams = replaying ? event.params : {
+      ...event.params,
+      updateScope: requestScope,
+      updateSequence: ++updateSequence,
+      ...(activePrompt?.clientPromptId ? { clientPromptId: activePrompt.clientPromptId } : {}),
+      ...(activePrompt?.lastVisibleNativeMessageId
+        ? { afterMessageId: activePrompt.lastVisibleNativeMessageId }
+        : {})
+    };
     if (sessionId) {
       const replay = replayingSessions.get(sessionId) ?? sessionReplayCache.get(sessionId) ?? [];
-      replay.push(event.params);
-      retainReplay(sessionId, replay, !replayingSessions.has(sessionId));
+      replay.push(updateParams);
+      retainReplay(sessionId, replay, !replaying);
     }
     if (
       sessionId &&
@@ -1637,13 +1732,9 @@ async function main(): Promise<void> {
     ) {
       touchSessionActivity(sessionId);
     }
-    const replaying = replayingSessions.has(sessionId ?? "");
     if (replaying) {
       return;
     }
-    const activePrompt = !replaying && sessionId
-      ? busySessions.get(sessionId)
-      : undefined;
     const update = isRecord(event.params.update) ? event.params.update : undefined;
     if (
       sessionId &&
@@ -1653,12 +1744,8 @@ async function main(): Promise<void> {
       update?.sessionUpdate === "agent_message_chunk"
     ) {
       activePrompt.acpAssistantUpdates ??= [];
-      activePrompt.acpAssistantUpdates.push(event.params);
+      activePrompt.acpAssistantUpdates.push(updateParams);
     }
-    const activePromptId = activePrompt?.clientPromptId;
-    const updateParams = activePromptId
-      ? { ...event.params, clientPromptId: activePromptId }
-      : event.params;
     const updateBytes = Buffer.byteLength(JSON.stringify(updateParams));
     for (const buffer of pagedHistoryReplayBuffers.get(sessionId ?? "") ?? []) {
       if (buffer.bytes + updateBytes <= Math.floor(historyPageMaximumBytes / 2) &&
@@ -1683,7 +1770,7 @@ async function main(): Promise<void> {
     if (sessionId && deletedSessions.has(sessionId)) {
       return;
     }
-    if (sessionId && replayingSessions.has(sessionId) && isNativeMessageEvent(event.params)) {
+    if (sessionId && replayingSessions.has(sessionId)) {
       return;
     }
     if (sessionId) {
@@ -1740,6 +1827,7 @@ async function main(): Promise<void> {
       }
       if (nativeMessage.role === "user" && busyPrompt) {
         busyPrompt.nativeUserMessageId = nativeMessage.messageId;
+        busyPrompt.lastVisibleNativeMessageId = nativeMessage.messageId;
       }
       if (
         nativeMessage.role === "assistant" &&
@@ -1747,6 +1835,7 @@ async function main(): Promise<void> {
         busyPrompt
       ) {
         busyPrompt.nativeAssistantHasContent = true;
+        busyPrompt.lastVisibleNativeMessageId = nativeMessage.messageId;
         busyPrompt.acpAssistantUpdates = [];
       }
       // Loads merge buffered events with their snapshot; other clients still need the live update.
@@ -1754,7 +1843,7 @@ async function main(): Promise<void> {
         liveEventId ? { ...event.params, id: liveEventId } : event.params
       );
       nativePipelineModes.set(sessionId, true);
-      publish("native-message", { ...nativeMessage, sessionId }, sessionId);
+      publish("native-message", { ...nativeMessage, sessionId, updateSequence: ++updateSequence }, sessionId);
       if (!busyPrompt) {
         touchSessionActivity(sessionId);
       }
@@ -1922,6 +2011,7 @@ async function main(): Promise<void> {
       response.setHeader("Connection", "keep-alive");
       response.flushHeaders();
       response.write(sseEvent("ready", {
+        requestScope,
         capabilities: browserCapabilities(),
         brandName: branding.brandName,
         brandInitial: branding.brandInitial,
@@ -1941,7 +2031,8 @@ async function main(): Promise<void> {
       const sessions = await acp.listSessions();
       const listed = new Set(sessions.map((session) => session.sessionId));
       for (const session of sessionCache.values()) {
-        if (acp.isSessionUnprompted(session.sessionId) && !listed.has(session.sessionId)) {
+        // The listing connection may not see a new session's persisted index yet.
+        if (acp.getSessionContext(session.sessionId) && !listed.has(session.sessionId)) {
           sessions.push(session);
         }
       }
@@ -1977,68 +2068,72 @@ async function main(): Promise<void> {
 
     if (request.method === "POST" && requestUrl.pathname === "/api/sessions") {
       const body = await readJsonBody(request);
-      const newSessionDefaults = await readCopilotDefaults();
-      const context = parseContext(body.context ?? newSessionDefaults.context);
-      const configOverrides: Record<string, string | boolean> = {};
-      const fallbackConfigIds = new Set<string>();
-      if (newSessionDefaults.model) {
-        configOverrides.model = newSessionDefaults.model;
-      }
-      if (newSessionDefaults.reasoningEffort) {
-        configOverrides.reasoning_effort = newSessionDefaults.reasoningEffort;
-        fallbackConfigIds.add("reasoning_effort");
-      }
-      if (body.configOverrides !== undefined) {
-        if (!isRecord(body.configOverrides)) {
-          throw new HttpError(400, "Configuration overrides must be an object");
+      const result = await runRequestOnce(request, body, async () => {
+        const newSessionDefaults = await readCopilotDefaults();
+        const context = parseContext(body.context ?? newSessionDefaults.context);
+        const configOverrides: Record<string, string | boolean> = {};
+        const fallbackConfigIds = new Set<string>();
+        if (newSessionDefaults.model) {
+          configOverrides.model = newSessionDefaults.model;
         }
-        for (const [configId, value] of Object.entries(body.configOverrides)) {
-          if (configId !== "model" && configId !== "reasoning_effort") {
-            throw new HttpError(400, `Unsupported new conversation setting: ${configId}`);
-          }
-          if (typeof value !== "string" && typeof value !== "boolean") {
-            throw new HttpError(400, `Invalid value for new conversation setting: ${configId}`);
-          }
-          configOverrides[configId] = value;
-          fallbackConfigIds.delete(configId);
+        if (newSessionDefaults.reasoningEffort) {
+          configOverrides.reasoning_effort = newSessionDefaults.reasoningEffort;
+          fallbackConfigIds.add("reasoning_effort");
         }
-      }
-      const createdAt = new Date().toISOString();
-      const setup = await acp.newSession(
-        projectsDirectory,
-        context,
-        Object.keys(configOverrides).length > 0 ? configOverrides : undefined,
-        fallbackConfigIds
-      );
-      const session: SessionInfo = {
-        sessionId: setup.sessionId,
-        cwd: projectsDirectory,
-        title: "New conversation",
-        updatedAt: createdAt
-      };
-      deletedSessions.delete(setup.sessionId);
-      sessionCache.set(setup.sessionId, session);
-      sessionActivityCache.set(setup.sessionId, createdAt);
-      nativePipelineModes.set(setup.sessionId, copilotHistory.available);
-      void queueSessionActivitySave().catch(() => {});
-      const sessionView = {
-        ...session,
-        context,
-        lastActivityAt: createdAt
-      };
-      publish("session-created", {
-        ...sessionView,
-        nativeMessageHistoryAvailable: copilotHistory.available
-      }, setup.sessionId);
-      jsonResponse(response, 201, {
-        session: sessionView,
-        context,
-        configOptions: setup.configOptions,
-        models: setup.models,
-        modes: setup.modes,
-        nativeMessageHistoryAvailable: copilotHistory.available,
-        newSessionDefaults
+        if (body.configOverrides !== undefined) {
+          if (!isRecord(body.configOverrides)) {
+            throw new HttpError(400, "Configuration overrides must be an object");
+          }
+          for (const [configId, value] of Object.entries(body.configOverrides)) {
+            if (configId !== "model" && configId !== "reasoning_effort") {
+              throw new HttpError(400, `Unsupported new conversation setting: ${configId}`);
+            }
+            if (typeof value !== "string" && typeof value !== "boolean") {
+              throw new HttpError(400, `Invalid value for new conversation setting: ${configId}`);
+            }
+            configOverrides[configId] = value;
+            fallbackConfigIds.delete(configId);
+          }
+        }
+        const createdAt = new Date().toISOString();
+        const setup = await acp.newSession(
+          projectsDirectory,
+          context,
+          Object.keys(configOverrides).length > 0 ? configOverrides : undefined,
+          fallbackConfigIds
+        );
+        const session: SessionInfo = {
+          sessionId: setup.sessionId,
+          cwd: projectsDirectory,
+          title: "New conversation",
+          updatedAt: createdAt
+        };
+        deletedSessions.delete(setup.sessionId);
+        sessionCache.set(setup.sessionId, session);
+        sessionActivityCache.set(setup.sessionId, createdAt);
+        nativePipelineModes.set(setup.sessionId, copilotHistory.available);
+        completeLiveHistories.add(setup.sessionId);
+        void queueSessionActivitySave().catch(() => {});
+        const sessionView = {
+          ...session,
+          context,
+          lastActivityAt: createdAt
+        };
+        publish("session-created", {
+          ...sessionView,
+          nativeMessageHistoryAvailable: copilotHistory.available
+        }, setup.sessionId);
+        return {
+          session: sessionView,
+          context,
+          configOptions: setup.configOptions,
+          models: setup.models,
+          modes: setup.modes,
+          nativeMessageHistoryAvailable: copilotHistory.available,
+          newSessionDefaults
+        };
       });
+      jsonResponse(response, 201, result);
       return true;
     }
 
@@ -2107,6 +2202,7 @@ async function main(): Promise<void> {
         legacyReplaySessions.delete(sessionId);
         fallbackReplayTails.delete(sessionId);
         nativePipelineModes.delete(sessionId);
+        completeLiveHistories.delete(sessionId);
         busySessions.delete(sessionId);
         replayingSessions.delete(sessionId);
         sessionActivityCache.delete(sessionId);
@@ -2204,6 +2300,16 @@ async function main(): Promise<void> {
         throw new HttpError(400, "historyPaging must be a boolean");
       }
       const sessionWasUnprompted = acp.isSessionUnprompted(sessionId);
+      const liveState = nativeMessageStates.get(sessionId);
+      // A new conversation's journal may not exist yet. Its complete live snapshot
+      // is authoritative while the first reply is being saved.
+      const useLiveHistory = body.historyPaging === true && copilotHistory.available &&
+        busySessions.has(sessionId) && completeLiveHistories.has(sessionId) &&
+        (liveState?.messages.size ?? 0) <= historyPageMaximumMessages &&
+        Buffer.byteLength(JSON.stringify({
+          replay: sessionReplayCache.get(sessionId) ?? [],
+          messages: liveState ? nativeMessagesForState(liveState) : []
+        })) <= historyPageMaximumBytes;
       const liveHistoryMessages = new Map<string, NativeMessage>();
       const historyPagingRequested = body.historyPaging === true;
       const liveHistoryReplay: PagedHistoryReplayBuffer = {
@@ -2221,14 +2327,14 @@ async function main(): Promise<void> {
       }
       let historyPage: HistoryPage | undefined;
       let historyWarning: string | undefined;
-      if (historyPagingRequested && sessionWasUnprompted) {
+      if (historyPagingRequested && (sessionWasUnprompted || useLiveHistory)) {
         historyPage = { events: [], hasMore: false, oversized: false };
       } else if (historyPagingRequested && !copilotHistory.available) {
         historyWarning = "This Copilot CLI cannot page stored history; using compatible ACP replay.";
       }
       if (
         historyPagingRequested &&
-        !sessionWasUnprompted &&
+        !sessionWasUnprompted && !useLiveHistory &&
         copilotHistory.available
       ) {
         try {
@@ -2400,7 +2506,15 @@ async function main(): Promise<void> {
             setup.sessionId,
             historyPage,
             true,
-            liveHistoryReplay.updates
+            liveHistoryReplay.updates,
+            useLiveHistory ? nativeMessages : undefined,
+            [
+              ...liveHistoryMessages.values(),
+              ...nativeMessagesForState(state).filter((message) => (
+                busyPrompt?.clientPromptId !== undefined &&
+                message.clientPromptId === busyPrompt.clientPromptId
+              ))
+            ]
           )
           : undefined;
         if (historyPage && busyPrompt) {
@@ -2412,12 +2526,14 @@ async function main(): Promise<void> {
         }
         const loadWarnings = [
           historyWarning,
+          pagedDisplay?.historyWarning,
           liveHistoryReplay.truncated
             ? "Some live activity arrived during history loading and could not fit in the page buffer."
             : undefined
         ].filter((warning): warning is string => warning !== undefined);
         jsonResponse(response, 200, {
           session: sessionView,
+          updateSequence,
           context,
           configOptions: setup.configOptions,
           models: setup.models,
@@ -2473,151 +2589,160 @@ async function main(): Promise<void> {
     }
 
     if (request.method === "POST" && subroute === "messages") {
-      if (configuringSessions.has(sessionId)) {
-        throw new HttpError(409, "Conversation is currently updating its settings");
-      }
-      if (busySessions.has(sessionId)) {
-        throw new HttpError(409, "Conversation is already processing a prompt");
-      }
       const body = await readJsonBody(request);
-      ensureSessionAvailable(sessionId);
-      if (configuringSessions.has(sessionId)) {
-        throw new HttpError(409, "Conversation is currently updating its settings");
-      }
-      if (body.reconnect !== undefined && typeof body.reconnect !== "boolean") {
-        throw new HttpError(400, "reconnect must be a boolean");
-      }
-      if (busySessions.has(sessionId)) {
-        throw new HttpError(409, "Conversation is already processing a prompt");
-      }
-      const nativeMcpReload = typeof body.text === "string" &&
-        body.text.trim() === "/mcp reload";
-      if (
-        body.reconnect === true &&
-        (!nativeMcpReload || (Array.isArray(body.attachments) && body.attachments.length > 0))
-      ) {
-        throw new HttpError(
-          400,
-          "reconnect can only be used with /mcp reload and no attachments"
-        );
-      }
-      const reloadMcp = body.reconnect === true || nativeMcpReload;
-      if ([...busySessions.values()].some((prompt) => prompt.reloadingMcp)) {
-        throw new HttpError(409, "MCP connections are currently reloading");
-      }
-      if (reloadMcp && busySessions.size > 0) {
-        throw new HttpError(
-          409,
-          "Cannot reload MCP connections while another conversation is processing a prompt"
-        );
-      }
-      const clientPromptId = parseOptionalPromptId(body.clientPromptId, "Client prompt id");
-      const promptId = randomBytes(12).toString("hex");
-      const busyPrompt: BusyPrompt = {
-        promptId,
-        cancelController: new AbortController(),
-        reloadingMcp: reloadMcp
-      };
-      if (clientPromptId !== undefined) {
-        busyPrompt.clientPromptId = clientPromptId;
-      }
-      busySessions.set(sessionId, busyPrompt);
-      const userReplayEntries: JsonObject[] = [];
-      let stopReason: string | undefined;
-      let errorMessage: string | undefined;
-      try {
-        publish("session-prompt-started", { sessionId, promptId }, sessionId);
-        const context = acp.getSessionContext(sessionId) ?? "default";
-        await acp.start(context);
-        const prompt = parsePrompt(body, acp.getCapabilities(context));
-        const replay = sessionReplayCache.get(sessionId) ?? [];
-        const userMessageId = `web-${randomBytes(12).toString("hex")}`;
-        busyPrompt.userMessageId = userMessageId;
-        for (const content of prompt) {
-          const entry: JsonObject = {
-            sessionId,
-            ...(busyPrompt.clientPromptId
-              ? { clientPromptId: busyPrompt.clientPromptId }
-              : {}),
-            update: {
-              sessionUpdate: "user_message_chunk",
-              messageId: userMessageId,
-              content
-            }
-          };
-          userReplayEntries.push(entry);
-          replay.push(entry);
+      const result = await runRequestOnce(request, body, async () => {
+        if (configuringSessions.has(sessionId)) {
+          throw new HttpError(409, "Conversation is currently updating its settings");
         }
-        retainReplay(sessionId, replay);
-        touchSessionActivity(sessionId);
-        if (body.reconnect === true && !busyPrompt.cancelController.signal.aborted) {
-          stopReason = await withSessionOperation(sessionId, () => (
-            acp.reloadMcpServers(session, busyPrompt.cancelController.signal)
-          ));
-          ensureSessionAvailable(sessionId);
+        if (busySessions.has(sessionId)) {
+          throw new HttpError(409, "Conversation is already processing a prompt");
         }
-        if (busyPrompt.cancelController.signal.aborted) {
-          stopReason = "cancelled";
-        } else if (body.reconnect !== true) {
-          stopReason = await acp.prompt(session, prompt, busyPrompt.cancelController.signal);
+        ensureSessionAvailable(sessionId);
+        if (configuringSessions.has(sessionId)) {
+          throw new HttpError(409, "Conversation is currently updating its settings");
         }
-        jsonResponse(response, 200, { stopReason });
-      } catch (error) {
-        errorMessage = error instanceof Error ? error.message : String(error);
-        throw error;
-      } finally {
-        if (busySessions.get(sessionId)?.promptId === promptId) {
-          if (nativePipelineModes.get(sessionId) === true) {
-            // Commands such as /mcp reload record no native messages, so their output has no
-            // recorded time and is not a history mismatch.
-            const commandPrompt = busyPrompt.nativeUserMessageId === undefined;
-            if (commandPrompt) {
-              for (const entry of userReplayEntries) {
-                entry.nativeCommand = true;
+        if (body.reconnect !== undefined && typeof body.reconnect !== "boolean") {
+          throw new HttpError(400, "reconnect must be a boolean");
+        }
+        if (busySessions.has(sessionId)) {
+          throw new HttpError(409, "Conversation is already processing a prompt");
+        }
+        const nativeMcpReload = typeof body.text === "string" &&
+          body.text.trim() === "/mcp reload";
+        if (
+          body.reconnect === true &&
+          (!nativeMcpReload || (Array.isArray(body.attachments) && body.attachments.length > 0))
+        ) {
+          throw new HttpError(
+            400,
+            "reconnect can only be used with /mcp reload and no attachments"
+          );
+        }
+        const reloadMcp = body.reconnect === true || nativeMcpReload;
+        if ([...busySessions.values()].some((prompt) => prompt.reloadingMcp)) {
+          throw new HttpError(409, "MCP connections are currently reloading");
+        }
+        if (reloadMcp && busySessions.size > 0) {
+          throw new HttpError(
+            409,
+            "Cannot reload MCP connections while another conversation is processing a prompt"
+          );
+        }
+        const clientPromptId = parseOptionalPromptId(body.clientPromptId, "Client prompt id");
+        const promptId = randomBytes(12).toString("hex");
+        const busyPrompt: BusyPrompt = {
+          promptId,
+          cancelController: new AbortController(),
+          reloadingMcp: reloadMcp
+        };
+        if (clientPromptId !== undefined) {
+          busyPrompt.clientPromptId = clientPromptId;
+        }
+        busySessions.set(sessionId, busyPrompt);
+        const userReplayEntries: JsonObject[] = [];
+        let stopReason: string | undefined;
+        let errorMessage: string | undefined;
+        try {
+          publish("session-prompt-started", { sessionId, promptId }, sessionId);
+          const context = acp.getSessionContext(sessionId) ?? "default";
+          await acp.start(context);
+          const prompt = parsePrompt(body, acp.getCapabilities(context));
+          const replay = sessionReplayCache.get(sessionId) ?? [];
+          const userMessageId = `web-${randomBytes(12).toString("hex")}`;
+          busyPrompt.userMessageId = userMessageId;
+          for (const content of prompt) {
+            const entry: JsonObject = {
+              sessionId,
+              ...(reloadMcp ? { nativeCommand: true } : {}),
+              ...(busyPrompt.clientPromptId
+                ? { clientPromptId: busyPrompt.clientPromptId }
+                : {}),
+              update: {
+                sessionUpdate: "user_message_chunk",
+                messageId: userMessageId,
+                content
               }
-            }
-            if (!busyPrompt.nativeAssistantHasContent) {
-              for (const update of busyPrompt.acpAssistantUpdates ?? []) {
-                if (commandPrompt) {
-                  update.nativeCommand = true;
+            };
+            userReplayEntries.push(entry);
+            replay.push(entry);
+          }
+          retainReplay(sessionId, replay);
+          touchSessionActivity(sessionId);
+          if (body.reconnect === true && !busyPrompt.cancelController.signal.aborted) {
+            stopReason = await withSessionOperation(sessionId, () => (
+              acp.reloadMcpServers(session, busyPrompt.cancelController.signal)
+            ));
+            ensureSessionAvailable(sessionId);
+          }
+          if (busyPrompt.cancelController.signal.aborted) {
+            stopReason = "cancelled";
+          } else if (body.reconnect !== true) {
+            stopReason = await acp.prompt(session, prompt, busyPrompt.cancelController.signal);
+          }
+          return stopReason === undefined ? {} : { stopReason };
+        } catch (error) {
+          errorMessage = error instanceof Error ? error.message : String(error);
+          throw error;
+        } finally {
+          if (busySessions.get(sessionId)?.promptId === promptId) {
+            if (nativePipelineModes.get(sessionId) === true) {
+              // Commands such as /mcp reload record no native messages, so their output has no
+              // recorded time and is not a history mismatch.
+              const commandPrompt = busyPrompt.nativeUserMessageId === undefined;
+              if (commandPrompt) {
+                for (const entry of userReplayEntries) {
+                  entry.nativeCommand = true;
                 }
-                if (busyPrompt.clientPromptId) {
-                  update.clientPromptId = busyPrompt.clientPromptId;
-                }
-                publish("session-update", {
-                  ...update,
-                  ...(busyPrompt.clientPromptId
-                    ? { clientPromptId: busyPrompt.clientPromptId }
-                    : {}),
-                  ...(commandPrompt ? { nativeCommand: true } : { nativeFallback: true })
-                }, sessionId);
               }
-            }
-            if (commandPrompt && busyPrompt.clientPromptId) {
-              for (const buffer of pagedHistoryReplayBuffers.get(sessionId) ?? []) {
-                for (const params of buffer.updates) {
-                  if (params.clientPromptId === busyPrompt.clientPromptId) {
-                    params.nativeCommand = true;
+              if (!busyPrompt.nativeAssistantHasContent) {
+                for (const update of busyPrompt.acpAssistantUpdates ?? []) {
+                  if (commandPrompt) {
+                    update.nativeCommand = true;
+                  } else {
+                    update.nativeFallback = true;
+                  }
+                  if (busyPrompt.clientPromptId) {
+                    update.clientPromptId = busyPrompt.clientPromptId;
+                  }
+                  // Delivery advances, but history and fallback still represent the same text chunk.
+                  update.sourceUpdateSequence ??= update.updateSequence;
+                  update.updateSequence = ++updateSequence;
+                  publish("session-update", {
+                    ...update,
+                    ...(busyPrompt.clientPromptId
+                      ? { clientPromptId: busyPrompt.clientPromptId }
+                      : {}),
+                    ...(commandPrompt ? { nativeCommand: true } : { nativeFallback: true })
+                  }, sessionId);
+                }
+              }
+              if (commandPrompt && busyPrompt.clientPromptId) {
+                for (const buffer of pagedHistoryReplayBuffers.get(sessionId) ?? []) {
+                  for (const params of buffer.updates) {
+                    if (params.clientPromptId === busyPrompt.clientPromptId) {
+                      params.nativeCommand = true;
+                    }
                   }
                 }
               }
             }
+            busySessions.delete(sessionId);
           }
-          busySessions.delete(sessionId);
+          touchSessionActivity(sessionId);
+          const completion: JsonObject = {
+            sessionId,
+            promptId
+          };
+          if (stopReason !== undefined) {
+            completion.stopReason = stopReason;
+          }
+          if (errorMessage !== undefined) {
+            completion.error = errorMessage;
+          }
+          publish("session-prompt-complete", completion, sessionId);
         }
-        touchSessionActivity(sessionId);
-        const completion: JsonObject = {
-          sessionId,
-          promptId
-        };
-        if (stopReason !== undefined) {
-          completion.stopReason = stopReason;
-        }
-        if (errorMessage !== undefined) {
-          completion.error = errorMessage;
-        }
-        publish("session-prompt-complete", completion, sessionId);
-      }
+      });
+      jsonResponse(response, 200, result);
       return true;
     }
 
@@ -2738,7 +2863,10 @@ async function main(): Promise<void> {
           console.error(`[server] ${message}`);
         }
         if (!response.headersSent) {
-          jsonResponse(response, status, { error: message });
+          jsonResponse(response, status, {
+            error: message,
+            ...(error instanceof HttpError && error.code ? { code: error.code } : {})
+          });
         } else {
           response.end();
         }
