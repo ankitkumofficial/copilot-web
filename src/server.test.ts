@@ -390,7 +390,17 @@ input.on("line", (line) => {
       const nativeEvents = nativeMessages && !reload
         ? emitNativePrompt(request, request.params.sessionId, reply)
         : null;
-      if (request.params.prompt[0]?.text === "evicted-thinking") {
+      if (request.params.prompt[0]?.text === "token-reasoning") {
+        update(request.params.sessionId, {
+          sessionUpdate: "tool_call", toolCallId: "early-tool", title: "Early tool", status: "in_progress"
+        });
+        for (let index = 0; index < 1_500; index += 1) {
+          update(request.params.sessionId, {
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: "t" + index + " " }
+          });
+        }
+      } else if (request.params.prompt[0]?.text === "evicted-thinking") {
         update(request.params.sessionId, {
           sessionUpdate: "agent_thought_chunk",
           content: { type: "text", text: "First preserved reasoning. " }
@@ -8577,11 +8587,53 @@ test("merges live output received while a paged history snapshot is loading", as
   assert.ok(replayUpdates.some((entry) =>
     isRecord(entry) && isRecord(entry.update) &&
     entry.update.sessionUpdate === "agent_thought_chunk"));
+  const thoughtText = replayUpdates.map((entry) => (
+    isRecord(entry) && isRecord(entry.update) && entry.update.sessionUpdate === "agent_thought_chunk" &&
+    isRecord(entry.update.content) ? String(entry.update.content.text) : ""
+  )).join("");
+  for (const fragment of ["Live reasoning: checking ", "the request."]) {
+    assert.equal(thoughtText.split(fragment).length, 2, thoughtText);
+  }
   assert.ok(replayUpdates.some((entry) =>
     isRecord(entry) && isRecord(entry.update) &&
     entry.update.toolCallId === "live-history-inspection" &&
     entry.update.status === "completed"));
   assert.equal((await server.requests()).filter((request) => request.method === "session/load").length, 1);
+});
+
+test("keeps a busy turn's early activity when reasoning streams token by token", async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    promptDelayMs: 2_000,
+    nativeHistory: { events: longConversationEvents(4) }
+  });
+  assert.equal((await server.post("load", { historyPaging: true })).status, 200);
+  const sending = server.post("messages", { text: "token-reasoning", clientPromptId: "token-reasoning" });
+  const expected = Array.from({ length: 1_500 }, (_, index) => `t${index} `).join("");
+  const thoughtText = (updates: unknown[]): string => updates.map((entry) => (
+    isRecord(entry) && isRecord(entry.update) && entry.update.sessionUpdate === "agent_thought_chunk" &&
+    isRecord(entry.update.content) ? String(entry.update.content.text) : ""
+  )).join("");
+  let replayUpdates: unknown[] = [];
+  const deadline = Date.now() + 5_000;
+  do {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const loaded: unknown = await (await server.post("load", { historyPaging: true })).json();
+    assert.ok(isRecord(loaded) && Array.isArray(loaded.replayUpdates));
+    if (loaded.busy !== true) {
+      continue;
+    }
+    replayUpdates = [
+      ...loaded.replayUpdates,
+      ...(Array.isArray(loaded.liveReplayUpdates) ? loaded.liveReplayUpdates : [])
+    ];
+  } while (!thoughtText(replayUpdates).endsWith("t1499 ") && Date.now() < deadline);
+  assert.equal(thoughtText(replayUpdates), expected);
+  assert.ok(replayUpdates.some((entry) => (
+    isRecord(entry) && isRecord(entry.update) && entry.update.toolCallId === "early-tool"
+  )), "The turn's first tool must not be evicted by reasoning fragments");
+  assert.equal((await sending).status, 200);
 });
 
 test("shows the latest text after restart when recent history contains only tool rounds", {
