@@ -7,10 +7,12 @@ import {
   mkdir,
   readFile,
   readdir,
+  realpath,
   rename,
   stat,
   writeFile
 } from "node:fs/promises";
+import { TextDecoder } from "node:util";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import os from "node:os";
@@ -65,6 +67,7 @@ const maximumBodyBytes = 25 * 1024 * 1024;
 const maximumPromptAttachments = 10;
 const maximumPromptAttachmentBytes = 8 * 1024 * 1024;
 const maximumPromptAttachmentTotalBytes = 16 * 1024 * 1024;
+const maximumPreviewFileBytes = 2 * 1024 * 1024;
 const maximumSessionTitleLength = 120;
 const nativeSessionDeleteTimeoutMs = 60_000;
 const githubQuotaCommandTimeoutMs = 10_000;
@@ -898,6 +901,95 @@ function parseAttachmentMimeType(name: string, value: unknown): string {
   return mimeType;
 }
 
+function isWithinDirectory(directory: string, filePath: string): boolean {
+  const relativePath = path.relative(directory, filePath);
+  return relativePath !== "" &&
+    relativePath !== ".." &&
+    !relativePath.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relativePath);
+}
+
+function decodePreviewText(content: Buffer): string | undefined {
+  if (content.includes(0)) {
+    return undefined;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(content);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function readLocalFilePreview(
+  projectsDirectory: string,
+  reference: string,
+  allowAll: boolean
+): Promise<JsonObject> {
+  if (reference.length === 0 || reference.length > 4096) {
+    throw new HttpError(400, "Invalid local file reference");
+  }
+
+  let requestedPath: string;
+  try {
+    if (/^file:/i.test(reference)) {
+      const fileUrl = new URL(reference);
+      if (fileUrl.protocol !== "file:" || (fileUrl.hostname && fileUrl.hostname !== "localhost")) {
+        throw new Error("Non-local file URL");
+      }
+      requestedPath = fileURLToPath(fileUrl);
+    } else {
+      const pathReference = decodeURIComponent(reference.split(/[?#]/, 1)[0] ?? "");
+      if (!pathReference) {
+        throw new Error("Empty local file path");
+      }
+      requestedPath = path.resolve(projectsDirectory, expandHome(pathReference));
+    }
+  } catch {
+    throw new HttpError(400, "Invalid local file reference");
+  }
+
+  let filePath: string;
+  try {
+    filePath = await realpath(requestedPath);
+  } catch (error) {
+    if (isRecord(error) && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
+      throw new HttpError(404, "Local file not found");
+    }
+    if (isRecord(error) && error.code === "EACCES") {
+      throw new HttpError(403, "Local file is not accessible");
+    }
+    throw error;
+  }
+  if (!allowAll && !isWithinDirectory(projectsDirectory, filePath)) {
+    throw new HttpError(403, "File previews are limited to the configured projects directory");
+  }
+
+  const fileStats = await stat(filePath);
+  if (!fileStats.isFile()) {
+    throw new HttpError(400, "Only files can be previewed");
+  }
+  if (fileStats.size > maximumPreviewFileBytes) {
+    throw new HttpError(413, "File is too large to preview (maximum size is 2 MB)");
+  }
+
+  const content = await readFile(filePath);
+  if (content.length > maximumPreviewFileBytes) {
+    throw new HttpError(413, "File is too large to preview (maximum size is 2 MB)");
+  }
+  const inferredMimeType = inferredAttachmentMimeType(filePath);
+  const text = inferredMimeType.startsWith("image/") || inferredMimeType === "application/pdf"
+    ? undefined
+    : decodePreviewText(content);
+  return {
+    name: path.basename(filePath),
+    mimeType: text === undefined ? inferredMimeType : "text/plain",
+    ...(text === undefined ? { data: content.toString("base64") } : { text })
+  };
+}
+
 function decodeAttachmentData(name: string, value: unknown): { data: string; size: number } {
   if (typeof value !== "string" || value.length === 0) {
     throw new HttpError(400, `Attachment ${name} does not contain data`);
@@ -1067,6 +1159,7 @@ async function main(): Promise<void> {
   if (!projectsStats?.isDirectory()) {
     throw new Error(`COPILOT_PROJECTS_DIR is not a directory: ${projectsDirectory}`);
   }
+  const projectsRoot = await realpath(projectsDirectory);
   const sessionTitlesPath = path.join(
     os.homedir(),
     ".copilot-web",
@@ -2035,6 +2128,15 @@ async function main(): Promise<void> {
         nativeMessageHistoryAvailable: copilotHistory.available,
         newSessionDefaults
       });
+      return true;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/api/file-preview") {
+      const reference = requestUrl.searchParams.get("path");
+      if (reference === null) {
+        throw new HttpError(400, "A local file path is required");
+      }
+      jsonResponse(response, 200, await readLocalFilePreview(projectsRoot, reference, allowAll));
       return true;
     }
 
