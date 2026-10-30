@@ -1391,9 +1391,9 @@ async function loadContextDefaults(context, resetToCopilotDefaults = false) {
     if (!contextPreferences.includes(effectiveContext)) {
       throw new Error("Copilot returned an invalid context profile");
     }
+    composer.sessionContext = effectiveContext;
     if (resetToCopilotDefaults) {
       state.selectedContext = effectiveContext;
-      composer.sessionContext = effectiveContext;
       saveContextPreference(effectiveContext);
     }
     const configOptions = Array.isArray(result.configOptions) ? result.configOptions : [];
@@ -6581,6 +6581,17 @@ async function startNewConversation({ discardDraft = false } = {}) {
     ? []
     : state.composer.selections.map(copySelectionReference);
   const pendingSelectionNumber = discardDraft ? 1 : state.composer.nextSelectionNumber;
+  // Settings stay with a composer once it is promoted, or being promoted, to a session.
+  const pendingContext = state.composer.sessionContext;
+  const pendingConfigOverrides = { ...state.composer.configOverrides };
+  const preserveSettings = !discardDraft &&
+    state.composer.sessionId === null &&
+    !conversationCreationPromises.has(state.composer) &&
+    contextPreferences.includes(pendingContext);
+  if (preserveSettings) {
+    state.selectedContext = pendingContext;
+    saveContextPreference(pendingContext);
+  }
   state.composer = createConversationState();
   state.composer.draft = pendingDraft;
   state.composer.attachments = pendingAttachments;
@@ -6589,8 +6600,11 @@ async function startNewConversation({ discardDraft = false } = {}) {
   state.composer.loaded = true;
   state.composer.sessionContext = state.selectedContext;
   state.composer.activeSessionIsNew = true;
+  if (preserveSettings) {
+    state.composer.configOverrides = pendingConfigOverrides;
+  }
   activateComposerConversation();
-  void loadContextDefaults(state.selectedContext, true);
+  void loadContextDefaults(state.selectedContext, !preserveSettings);
   elements.input.focus();
 }
 
