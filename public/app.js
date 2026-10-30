@@ -820,7 +820,9 @@ const elements = {
   renameInput: document.querySelector("#rename-input"),
   renameConfirm: document.querySelector("#rename-confirm"),
   imagePreviewDialog: document.querySelector("#image-preview-dialog"),
-  imagePreviewImage: document.querySelector("#image-preview-image")
+  imagePreviewImage: document.querySelector("#image-preview-image"),
+  filePreviewTitle: document.querySelector("#file-preview-title"),
+  filePreviewContent: document.querySelector("#file-preview-content")
 };
 
 const speechRecognitionConstructor = window.SpeechRecognition ?? window.webkitSpeechRecognition;
@@ -1449,10 +1451,61 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+const localFilePreviewRoute = "/api/file-preview";
+
+function localFileReference(target) {
+  if (/^file:/i.test(target)) {
+    try {
+      const url = new URL(target);
+      return url.protocol === "file:" && (!url.hostname || url.hostname === "localhost")
+        ? target
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  const filePath = target.split(/[?#]/, 1)[0] ?? "";
+  if (!filePath || filePath.startsWith("//")) {
+    return null;
+  }
+  const isWindowsPath = /^[A-Za-z]:[\\/]/.test(filePath);
+  const hasNoScheme = !/^[a-z][a-z0-9+.-]*:/i.test(target);
+  const hasFileExtension = /(?:^|\/)[^/]*\.[A-Za-z0-9_-]+$/i.test(filePath);
+  const isRelativePath = /^(?:\.{1,2}\/|~\/)/.test(filePath) ||
+    filePath.includes("/") ||
+    /^[A-Za-z0-9_-]+$/.test(filePath);
+
+  return isWindowsPath || (
+    hasNoScheme &&
+    (filePath.startsWith("/") || hasFileExtension || isRelativePath)
+  )
+    ? target
+    : null;
+}
+
+function localFilePreviewUrl(reference) {
+  let filePath = reference;
+  if (/^file:/i.test(reference)) {
+    const url = new URL(reference);
+    url.search = "";
+    url.hash = "";
+    filePath = url.href;
+  } else {
+    filePath = reference.split(/[?#]/, 1)[0] ?? reference;
+  }
+  return `${localFilePreviewRoute}?${new URLSearchParams({ path: filePath })}`;
+}
+
 function safeLink(value) {
   const target = value.trim().replace(/^<|>$/g, "");
   if (!target) {
     return null;
+  }
+
+  const fileReference = localFileReference(target);
+  if (fileReference) {
+    return localFilePreviewUrl(fileReference);
   }
 
   try {
@@ -1469,7 +1522,9 @@ function safeLink(value) {
 function renderInlineMarkdown(value) {
   return inlineMarkdownToHtml(value, {
     resolveLink: safeLink,
-    linkAttributes: ' target="_blank" rel="noopener noreferrer"',
+    linkAttributes: (href) => href.startsWith(`${localFilePreviewRoute}?`)
+      ? ' data-local-file-preview=""'
+      : ' target="_blank" rel="noopener noreferrer"',
     preserveDelimiters: false,
     strikeTag: "del"
   });
@@ -3690,13 +3745,147 @@ function scheduleMessagesRender(conversation = activeConversation(), message = n
   }
 }
 
-function openImagePreview(source, alt) {
-  elements.imagePreviewImage.src = source;
-  elements.imagePreviewImage.alt = alt;
+let filePreviewRequestSequence = 0;
+let filePreviewObjectUrl = null;
+
+function revokeFilePreviewObjectUrl() {
+  if (filePreviewObjectUrl) {
+    URL.revokeObjectURL(filePreviewObjectUrl);
+    filePreviewObjectUrl = null;
+  }
+}
+
+function resetFilePreviewContent() {
+  filePreviewRequestSequence += 1;
+  revokeFilePreviewObjectUrl();
+  elements.imagePreviewImage.removeAttribute("src");
+  elements.imagePreviewImage.alt = "";
+  elements.imagePreviewImage.hidden = false;
+  elements.filePreviewTitle.textContent = "";
+  elements.filePreviewTitle.hidden = true;
+  elements.filePreviewContent.replaceChildren();
+  elements.filePreviewContent.hidden = true;
+}
+
+function showFilePreviewDialog() {
+  if (elements.imagePreviewDialog.open) {
+    return;
+  }
   if (typeof elements.imagePreviewDialog.showModal === "function") {
     elements.imagePreviewDialog.showModal();
   } else {
     elements.imagePreviewDialog.setAttribute("open", "");
+  }
+}
+
+function openImagePreview(source, alt) {
+  filePreviewRequestSequence += 1;
+  revokeFilePreviewObjectUrl();
+  elements.filePreviewTitle.textContent = alt;
+  elements.filePreviewTitle.hidden = !alt;
+  elements.filePreviewContent.replaceChildren();
+  elements.filePreviewContent.hidden = true;
+  elements.imagePreviewImage.hidden = false;
+  elements.imagePreviewImage.src = source;
+  elements.imagePreviewImage.alt = alt;
+  showFilePreviewDialog();
+}
+
+function previewBlob(data, mimeType) {
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: mimeType });
+}
+
+function filePreviewDownloadLink(name, objectUrl) {
+  const link = document.createElement("a");
+  link.className = "file-preview-download";
+  link.href = objectUrl;
+  link.download = name;
+  link.textContent = `Download ${name}`;
+  return link;
+}
+
+async function openLocalFilePreview(url, fallbackName) {
+  const requestSequence = ++filePreviewRequestSequence;
+  revokeFilePreviewObjectUrl();
+  elements.imagePreviewImage.removeAttribute("src");
+  elements.imagePreviewImage.alt = "";
+  elements.imagePreviewImage.hidden = true;
+  elements.filePreviewTitle.textContent = fallbackName || "File preview";
+  elements.filePreviewTitle.hidden = false;
+  elements.filePreviewContent.hidden = false;
+  const loading = document.createElement("p");
+  loading.className = "file-preview-status";
+  loading.textContent = "Loading preview...";
+  elements.filePreviewContent.replaceChildren(loading);
+  showFilePreviewDialog();
+
+  try {
+    const preview = await api(url);
+    if (requestSequence !== filePreviewRequestSequence || !elements.imagePreviewDialog.open) {
+      return;
+    }
+    if (
+      !preview ||
+      typeof preview.name !== "string" ||
+      typeof preview.mimeType !== "string"
+    ) {
+      throw new Error("The server returned an invalid file preview");
+    }
+
+    elements.filePreviewTitle.textContent = preview.name;
+    if (typeof preview.text === "string") {
+      const text = document.createElement("pre");
+      text.className = "file-preview-text";
+      text.textContent = preview.text;
+      elements.filePreviewContent.replaceChildren(text);
+      return;
+    }
+    if (typeof preview.data !== "string") {
+      throw new Error("The file preview did not contain readable content");
+    }
+
+    const blob = previewBlob(preview.data, preview.mimeType);
+    filePreviewObjectUrl = URL.createObjectURL(blob);
+    if (preview.mimeType.startsWith("image/")) {
+      elements.filePreviewContent.replaceChildren();
+      elements.filePreviewContent.hidden = true;
+      elements.imagePreviewImage.src = filePreviewObjectUrl;
+      elements.imagePreviewImage.alt = preview.name;
+      elements.imagePreviewImage.hidden = false;
+      return;
+    }
+
+    const downloadLink = filePreviewDownloadLink(preview.name, filePreviewObjectUrl);
+    if (preview.mimeType === "application/pdf") {
+      const frame = document.createElement("iframe");
+      frame.className = "file-preview-frame";
+      frame.title = `Preview ${preview.name}`;
+      frame.src = filePreviewObjectUrl;
+      elements.filePreviewContent.replaceChildren(frame, downloadLink);
+      return;
+    }
+
+    const unavailable = document.createElement("div");
+    unavailable.className = "file-preview-unavailable";
+    const message = document.createElement("p");
+    message.textContent = `This file type cannot be previewed: ${preview.mimeType}`;
+    unavailable.append(message, downloadLink);
+    elements.filePreviewContent.replaceChildren(unavailable);
+  } catch (error) {
+    if (requestSequence !== filePreviewRequestSequence || !elements.imagePreviewDialog.open) {
+      return;
+    }
+    const message = document.createElement("p");
+    message.className = "file-preview-status";
+    message.textContent = `Unable to preview ${fallbackName || "file"}: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+    elements.filePreviewContent.replaceChildren(message);
   }
 }
 
@@ -3705,6 +3894,7 @@ function closeImagePreview() {
     elements.imagePreviewDialog.close();
   } else {
     elements.imagePreviewDialog.removeAttribute("open");
+    resetFilePreviewContent();
   }
 }
 
@@ -8185,6 +8375,15 @@ elements.messages.addEventListener("click", (event) => {
   if (!(target instanceof Element)) {
     return;
   }
+  const filePreviewLink = target.closest("a[data-local-file-preview]");
+  if (filePreviewLink instanceof HTMLAnchorElement && elements.messages.contains(filePreviewLink)) {
+    event.preventDefault();
+    void openLocalFilePreview(
+      filePreviewLink.href,
+      filePreviewLink.textContent?.trim() ?? "File preview"
+    );
+    return;
+  }
   const button = target.closest("button.block-copy");
   if (button?.classList.contains("code-copy")) {
     void copyCodeBlock(button);
@@ -8329,8 +8528,7 @@ elements.imagePreviewDialog.addEventListener("click", (event) => {
   }
 });
 elements.imagePreviewDialog.addEventListener("close", () => {
-  elements.imagePreviewImage.removeAttribute("src");
-  elements.imagePreviewImage.alt = "";
+  resetFilePreviewContent();
 });
 elements.attachFiles.addEventListener("click", () => {
   if (!elements.attachFiles.disabled) {

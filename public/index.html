@@ -260,10 +260,12 @@
       </form>
     </dialog>
 
-    <dialog id="image-preview-dialog" class="image-preview-dialog" aria-label="Image preview">
+    <dialog id="image-preview-dialog" class="image-preview-dialog" aria-label="File preview">
       <form method="dialog" class="image-preview-content">
-        <button class="image-preview-close" type="submit" value="close" aria-label="Close image preview" title="Close image preview">×</button>
+        <button class="image-preview-close" type="submit" value="close" aria-label="Close file preview" title="Close file preview">×</button>
+        <h2 id="file-preview-title" class="file-preview-title" hidden></h2>
         <img id="image-preview-image" class="image-preview-image" alt="">
+        <div id="file-preview-content" class="file-preview-content" hidden></div>
       </form>
     </dialog>
   </body>
