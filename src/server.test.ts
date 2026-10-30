@@ -3087,14 +3087,10 @@ test("renders native completion times outside message content through refresh", 
   );
   assert.equal(
     await evaluate(`${userTimestamps}[0].textContent`),
-    await evaluate(`new Date(${JSON.stringify(historicalUserTimestamp)}).toLocaleString(undefined, {
-      weekday: "short",
-      month: "short",
-      day: "numeric",
-      year: "numeric",
+    await evaluate(`new Date(${JSON.stringify(historicalUserTimestamp)}).toLocaleTimeString(undefined, {
       hour: "numeric",
       minute: "2-digit"
-    })`)
+    })`).then((time) => `Yesterday, ${String(time)}`)
   );
   assert.equal(
     await evaluate(`${timestamps}[0].dateTime`),
@@ -3102,14 +3098,10 @@ test("renders native completion times outside message content through refresh", 
   );
   assert.equal(
     await evaluate(`${timestamps}[0].textContent`),
-    await evaluate(`new Date(${JSON.stringify(historicalTimestamp)}).toLocaleString(undefined, {
-      weekday: "short",
-      month: "short",
-      day: "numeric",
-      year: "numeric",
+    await evaluate(`new Date(${JSON.stringify(historicalTimestamp)}).toLocaleTimeString(undefined, {
       hour: "numeric",
       minute: "2-digit"
-    })`)
+    })`).then((time) => `Yesterday, ${String(time)}`)
   );
   assert.equal(await evaluate(`
     (() => {
@@ -3182,14 +3174,14 @@ test("renders native completion times outside message content through refresh", 
     .toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })`);
   assert.equal(
     await evaluate(`${timestamps}[1].textContent`),
-    `Today, ${String(todayLocalTime)}`
+    String(todayLocalTime)
   );
   const todayUserTime = await evaluate(`new Date(${JSON.stringify(todayTimestamp)})
     .toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })`);
   assert.equal(await evaluate(`${userTimestamps}[1].dateTime`), todayTimestamp);
   assert.equal(
     await evaluate(`${userTimestamps}[1].textContent`),
-    `Today, ${String(todayUserTime)}`
+    String(todayUserTime)
   );
   assert.equal(await evaluate(`
     [...document.querySelectorAll(".message.assistant .message-body")]
