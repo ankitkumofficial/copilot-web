@@ -1,4 +1,10 @@
-import { inlineMarkdownToHtml, parseMarkdownList } from "./prompt-editor.js";
+import {
+  inlineMarkdownToHtml,
+  parseMarkdownList,
+  splitTableRow,
+  tableDelimiter,
+  tableDelimiterAlignments
+} from "./prompt-editor.js";
 
 const defaultBrandName = "Copilot Web";
 const defaultBrandInitial = "C";
@@ -1469,58 +1475,6 @@ function renderInlineMarkdown(value) {
   });
 }
 
-function splitTableRow(value) {
-  let row = String(value).trim();
-  if (row.startsWith("|")) {
-    row = row.slice(1);
-  }
-  if (row.endsWith("|") && !row.endsWith("\\|")) {
-    row = row.slice(0, -1);
-  }
-
-  const cells = [];
-  let cell = "";
-  let codeSpan = false;
-  for (let index = 0; index < row.length; index += 1) {
-    const character = row[index];
-    if (character === "\\" && row[index + 1] === "|") {
-      cell += "\\|";
-      index += 1;
-      continue;
-    }
-    if (character === "`") {
-      codeSpan = !codeSpan;
-    }
-    if (character === "|" && !codeSpan) {
-      cells.push(cell.trim());
-      cell = "";
-      continue;
-    }
-    cell += character;
-  }
-  cells.push(cell.trim());
-  return cells;
-}
-
-function tableDelimiterAlignments(line) {
-  const cells = splitTableRow(line);
-  if (
-    cells.length === 0 ||
-    cells.some((cell) => !/^:?-{3,}:?$/.test(cell))
-  ) {
-    return null;
-  }
-  return cells.map((cell) => (
-    cell.startsWith(":") && cell.endsWith(":")
-      ? "center"
-      : cell.startsWith(":")
-        ? "left"
-        : cell.endsWith(":")
-          ? "right"
-          : null
-  ));
-}
-
 function renderTable(header, alignments, rows) {
   const columnCount = header.length;
   const renderCell = (cell, index, tagName) => {
@@ -1538,11 +1492,14 @@ function renderTable(header, alignments, rows) {
   }).join("");
 
   return `
-    <div class="markdown-table-wrap">
-      <table>
-        <thead><tr>${headerCells}</tr></thead>
-        <tbody>${bodyRows}</tbody>
-      </table>
+    <div class="markdown-table">
+      <div class="block-toolbar">${tableCopyButtonMarkup}</div>
+      <div class="markdown-table-wrap">
+        <table>
+          <thead><tr>${headerCells}</tr></thead>
+          <tbody>${bodyRows}</tbody>
+        </table>
+      </div>
     </div>
   `;
 }
@@ -1601,7 +1558,7 @@ function renderMarkdown(value) {
       }
       const language = fence[2] ? ` class="language-${escapeHtml(fence[2])}"` : "";
       blocks.push(
-        `<div class="code-block">${codeCopyButtonMarkup}<pre><code${language}>${escapeHtml(codeLines.join("\n"))}</code></pre></div>`
+        `<div class="code-block"><div class="block-toolbar">${codeCopyButtonMarkup}</div><pre><code${language}>${escapeHtml(codeLines.join("\n"))}</code></pre></div>`
       );
       continue;
     }
@@ -2879,7 +2836,9 @@ const copyIconMarkup = `
   </svg>
 `;
 const codeCopyButtonMarkup =
-  `<button type="button" class="code-copy" title="Copy code" aria-label="Copy code">${copyIconMarkup.trim()}</button>`;
+  `<button type="button" class="block-copy code-copy" title="Copy code" aria-label="Copy code">${copyIconMarkup.trim()}</button>`;
+const tableCopyButtonMarkup =
+  `<button type="button" class="block-copy table-copy" title="Copy table" aria-label="Copy table">${copyIconMarkup.trim()}</button>`;
 const copiedIconMarkup = `
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <path d="m5 12 4 4L19 6"></path>
@@ -2911,10 +2870,10 @@ function messageClipboardText(message) {
   return text ? `${text}\n\n${attachmentText}` : attachmentText;
 }
 
-function removeCodeCopyButtons(html) {
+function removeBlockToolbars(html) {
   const container = document.createElement("div");
   container.innerHTML = html;
-  container.querySelectorAll(".code-copy").forEach((button) => button.remove());
+  container.querySelectorAll(".block-toolbar").forEach((toolbar) => toolbar.remove());
   return container.innerHTML;
 }
 
@@ -2926,14 +2885,14 @@ function messageClipboardContent(message, button) {
       : `<div>${escapeHtml(fallbackText).replaceAll("\n", "<br>")}</div>`;
     return {
       text: fallbackText,
-      html: removeCodeCopyButtons(html)
+      html: removeBlockToolbars(html)
     };
   }
 
   const body = button.closest(".message")?.querySelector(".message-body");
   const html = body?.innerHTML ?? renderMarkdown(fallbackText);
   const text = body?.innerText || body?.textContent || fallbackText;
-  return { text, html: removeCodeCopyButtons(html) };
+  return { text, html: removeBlockToolbars(html) };
 }
 
 async function copyRichMarkupWithLegacyApi(html) {
@@ -2995,6 +2954,26 @@ async function copyToClipboard({ text, html }) {
   }
 }
 
+async function copyBlock(button, content, noun) {
+  try {
+    await copyToClipboard(content);
+    button.classList.add("copied");
+    button.innerHTML = copiedIconMarkup;
+    button.title = `${noun} copied`;
+    button.setAttribute("aria-label", `${noun} copied`);
+    window.setTimeout(() => {
+      button.classList.remove("copied");
+      button.innerHTML = copyIconMarkup;
+      button.title = `Copy ${noun.toLowerCase()}`;
+      button.setAttribute("aria-label", `Copy ${noun.toLowerCase()}`);
+    }, 1400);
+  } catch {
+    setStatus(`Could not copy ${noun.toLowerCase()}`);
+    button.title = `Could not copy ${noun.toLowerCase()}`;
+    button.setAttribute("aria-label", `Could not copy ${noun.toLowerCase()}`);
+  }
+}
+
 async function copyCodeBlock(button) {
   const code = button.closest(".code-block")?.querySelector("pre code");
   if (!code) {
@@ -3002,26 +2981,29 @@ async function copyCodeBlock(button) {
   }
 
   const text = code.textContent ?? "";
-  try {
-    await copyToClipboard({
-      text,
-      html: `<pre><code>${escapeHtml(text)}</code></pre>`
-    });
-    button.classList.add("copied");
-    button.innerHTML = copiedIconMarkup;
-    button.title = "Code copied";
-    button.setAttribute("aria-label", "Code copied");
-    window.setTimeout(() => {
-      button.classList.remove("copied");
-      button.innerHTML = copyIconMarkup;
-      button.title = "Copy code";
-      button.setAttribute("aria-label", "Copy code");
-    }, 1400);
-  } catch {
-    setStatus("Could not copy code");
-    button.title = "Could not copy code";
-    button.setAttribute("aria-label", "Could not copy code");
+  await copyBlock(button, { text, html: `<pre><code>${escapeHtml(text)}</code></pre>` }, "Code");
+}
+
+function tableMarkdown(table) {
+  const cellText = (cell) => (cell.textContent ?? "").replace(/\s+/g, " ").trim().replaceAll("|", "\\|");
+  const rows = Array.from(table.rows).map((row) => `| ${Array.from(row.cells).map(cellText).join(" | ")} |`);
+  const header = table.rows[0];
+  if (header) {
+    const delimiters = Array.from(header.cells).map((cell) => tableDelimiter(cell.style.textAlign));
+    rows.splice(1, 0, `| ${delimiters.join(" | ")} |`);
   }
+  return rows.join("\n");
+}
+
+async function copyTable(button) {
+  const table = button.closest(".markdown-table")?.querySelector("table");
+  if (!table) {
+    return;
+  }
+
+  // Rich targets (including the composer) paste the HTML table; plain-text
+  // targets get equivalent Markdown.
+  await copyBlock(button, { text: tableMarkdown(table), html: table.outerHTML }, "Table");
 }
 
 async function copyMessage(message, button) {
@@ -8103,9 +8085,11 @@ elements.messages.addEventListener("click", (event) => {
   if (!(target instanceof Element)) {
     return;
   }
-  const button = target.closest("button.code-copy");
-  if (button) {
+  const button = target.closest("button.block-copy");
+  if (button?.classList.contains("code-copy")) {
     void copyCodeBlock(button);
+  } else if (button?.classList.contains("table-copy")) {
+    void copyTable(button);
   }
 });
 elements.messages.addEventListener("scroll", updateScrollToBottomButton, { passive: true });

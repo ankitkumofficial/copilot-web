@@ -883,7 +883,7 @@ button:disabled {
 }
 
 .message-copy,
-.code-copy {
+.block-copy {
   display: grid;
   width: 27px;
   height: 27px;
@@ -897,8 +897,8 @@ button:disabled {
 
 .message-copy:hover,
 .message-copy:focus-visible,
-.code-copy:hover,
-.code-copy:focus-visible {
+.block-copy:hover,
+.block-copy:focus-visible {
   border-color: var(--accent);
   background: var(--surface-hover);
   color: var(--accent-strong);
@@ -911,13 +911,13 @@ button:disabled {
 }
 
 .message-copy.copied,
-.code-copy.copied {
+.block-copy.copied {
   border-color: rgba(81, 214, 138, 0.5);
   color: #2f9e63;
 }
 
 .message-copy svg,
-.code-copy svg {
+.block-copy svg {
   width: 15px;
   height: 15px;
   fill: none;
@@ -1047,7 +1047,6 @@ button:disabled {
 }
 
 .message-body .code-block {
-  position: relative;
   max-width: 100%;
   margin-bottom: 0.85em;
 }
@@ -1059,14 +1058,17 @@ button:disabled {
 
 .message-body .code-block pre {
   margin: 0;
-  padding-top: 40px;
 }
 
-.message-body .code-copy {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 1;
+.message-body .block-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 4px;
+}
+
+.message-body .block-copy {
+  width: 24px;
+  height: 24px;
 }
 
 .message-body pre code {
@@ -1077,9 +1079,13 @@ button:disabled {
   white-space: pre;
 }
 
-.markdown-table-wrap {
+.markdown-table {
   max-width: 100%;
   margin: 0.85em 0;
+}
+
+.markdown-table-wrap {
+  max-width: 100%;
   overflow-x: auto;
 }
 
@@ -1453,6 +1459,32 @@ button:disabled {
 
 .composer prompt-editor a {
   color: var(--accent);
+}
+
+.composer prompt-editor table {
+  margin: 4px 0;
+  border-collapse: collapse;
+}
+
+.composer prompt-editor :is(th, td) {
+  min-width: 2em;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.composer prompt-editor th {
+  background: var(--surface-hover);
+  font-weight: 650;
+}
+
+.composer prompt-editor :is(th, td)[data-align="center"] {
+  text-align: center;
+}
+
+.composer prompt-editor :is(th, td)[data-align="right"] {
+  text-align: right;
 }
 
 .selection-list {
