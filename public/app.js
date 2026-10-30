@@ -3293,6 +3293,24 @@ function upsertThinking(update, conversation = activeConversation() ?? state.com
   scheduleMessagesRender(conversation, group);
 }
 
+// ACP plan updates carry the complete plan, so each turn keeps one plan message and replaces it.
+function upsertPlan(update, conversation = activeConversation() ?? state.composer) {
+  const entries = normalizePlanEntries(update.entries);
+  const key = `plan:${conversation.currentTurnKey ?? "session"}`;
+  const index = conversation.messageKeys.get(key);
+  let message = Number.isInteger(index) ? conversation.messages[index] : null;
+  if (!message) {
+    if (entries.length === 0) {
+      return;
+    }
+    addMessage("system", planSummaryText(entries), key, [], conversation);
+    message = conversation.messages[conversation.messageKeys.get(key)];
+  }
+  message.plan = entries;
+  message.text = planSummaryText(entries);
+  scheduleMessagesRender(conversation, message);
+}
+
 function upsertToolActivity(update, conversation = activeConversation() ?? state.composer) {
   const toolCallId = typeof update.toolCallId === "string" ||
     typeof update.toolCallId === "number"
@@ -3508,7 +3526,9 @@ function renderMessageBody(body, message) {
   }
 
   body.replaceChildren();
-  if (message.role === "assistant") {
+  if (Array.isArray(message.plan)) {
+    renderPlanEntries(body, message.plan);
+  } else if (message.role === "assistant") {
     body.innerHTML = renderMarkdown(message.text);
   } else {
     if (message.text) {
@@ -3523,6 +3543,61 @@ function renderMessageBody(body, message) {
     }
     renderMessageAttachments(body, message.attachments);
   }
+}
+
+const planStatusLabels = {
+  pending: "Pending",
+  in_progress: "In progress",
+  completed: "Completed"
+};
+const planStatusMarkers = { pending: "○", in_progress: "◐", completed: "✓" };
+
+function normalizePlanEntries(entries) {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+  return entries
+    .filter((entry) => typeof entry?.content === "string" && entry.content.trim())
+    .map((entry) => ({
+      content: entry.content.trim(),
+      status: Object.hasOwn(planStatusLabels, entry.status) ? entry.status : "pending"
+    }));
+}
+
+function planSummaryText(entries) {
+  if (entries.length === 0) {
+    return "Plan cleared.";
+  }
+  const completed = entries.filter((entry) => entry.status === "completed").length;
+  return `${completed} of ${entries.length} ${entries.length === 1 ? "task" : "tasks"} completed`;
+}
+
+function renderPlanEntries(body, entries) {
+  const summary = document.createElement("div");
+  summary.className = "plan-summary";
+  summary.textContent = planSummaryText(entries);
+  body.append(summary);
+  if (entries.length === 0) {
+    return;
+  }
+  const list = document.createElement("ol");
+  list.className = "plan-entries";
+  for (const entry of entries) {
+    const item = document.createElement("li");
+    item.className = `plan-entry plan-status-${entry.status}`;
+    const marker = document.createElement("span");
+    marker.className = "plan-entry-marker";
+    marker.textContent = planStatusMarkers[entry.status];
+    marker.title = planStatusLabels[entry.status];
+    marker.setAttribute("role", "img");
+    marker.setAttribute("aria-label", planStatusLabels[entry.status]);
+    const content = document.createElement("span");
+    content.className = "plan-entry-content";
+    content.textContent = entry.content;
+    item.append(marker, content);
+    list.append(item);
+  }
+  body.append(list);
 }
 
 // Chat-style labels: "10:03", "Yesterday, 10:03", "Mon 10:03", "Oct 27, 10:03", "Oct 27, 2025, 10:03".
@@ -4603,6 +4678,9 @@ function renderMessageSelectionSummary(message, messageIndex) {
 function createMessageArticle(message, index) {
   const article = document.createElement("article");
   article.className = `message ${message.role}`;
+  if (Array.isArray(message.plan)) {
+    article.classList.add("plan");
+  }
   article.dataset.messageIndex = String(index);
   article.dataset.messageKey = messageIdentity(message) ?? "";
   const header = document.createElement("div");
@@ -4613,9 +4691,11 @@ function createMessageArticle(message, index) {
     ? "You"
     : message.role === "tool"
       ? "Thinking"
-      : message.role === "system"
-        ? state.brandName
-        : "Copilot";
+      : Array.isArray(message.plan)
+        ? "Plan"
+        : message.role === "system"
+          ? state.brandName
+          : "Copilot";
   header.append(label);
   if (message.role === "user" || message.role === "assistant") {
     const copy = document.createElement("button");
@@ -5918,7 +5998,7 @@ function handleSessionUpdate(params, expectedSessionId = null, targetConversatio
       break;
     case "plan":
       conversation.lastStreamRole = "system";
-      addMessage("system", "Copilot is preparing a plan.", "plan", [], conversation);
+      upsertPlan(update, conversation);
       break;
     case "usage_update":
       applyContextUsage(update, conversation);
