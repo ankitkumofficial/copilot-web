@@ -412,6 +412,13 @@ export function historyReplayUpdates(sessionId: string, events: readonly JsonObj
   return updates;
 }
 
+export function thoughtChunkText(params: JsonObject | undefined): string | undefined {
+  const update = isRecord(params?.update) ? params.update : undefined;
+  const content = isRecord(update?.content) ? update.content : undefined;
+  return update?.sessionUpdate === "agent_thought_chunk" && content?.type === "text" &&
+    typeof content.text === "string" ? content.text : undefined;
+}
+
 export function mergePagedHistoryReplayUpdates(
   sessionId: string,
   events: readonly JsonObject[],
@@ -464,12 +471,30 @@ export function mergePagedHistoryReplayUpdates(
         (params.nativeFallback === true && update.sessionUpdate === "agent_message_chunk"))
     ) {
       let anchor = params.afterMessageId;
+      let activity = params;
       if (typeof update.toolCallId === "string") {
         anchor = activityToolAnchors.get(update.toolCallId) ?? anchor;
         activityToolAnchors.set(update.toolCallId, anchor);
+        // The browser never renders raw tool payloads, which can be several times larger than content.
+        if ("rawInput" in update || "rawOutput" in update) {
+          const { rawInput: _rawInput, rawOutput: _rawOutput, ...displayUpdate } = update;
+          activity = { ...params, update: displayUpdate };
+        }
       }
       const group = cachedActivity.get(anchor) ?? [];
-      group.push(anchor === params.afterMessageId ? params : { ...params, afterMessageId: anchor });
+      const previous = group.at(-1);
+      const previousThought = previous ? thoughtChunkText(previous) : undefined;
+      const thought = thoughtChunkText(activity);
+      if (previous && isRecord(previous.update) && previousThought !== undefined && thought !== undefined &&
+          previous.update.messageId === update.messageId) {
+        // Thoughts stream almost per token; one envelope per fragment would exhaust the activity budget.
+        group[group.length - 1] = {
+          ...activity,
+          update: { ...update, content: { type: "text", text: previousThought + thought } }
+        };
+      } else {
+        group.push(anchor === params.afterMessageId ? activity : { ...activity, afterMessageId: anchor });
+      }
       cachedActivity.set(anchor, group);
       continue;
     }
@@ -602,6 +627,41 @@ export function mergePagedHistoryReplayUpdates(
       }
     }
   };
+  const appendDetachedActivity = (messageId: string): void => {
+    const message = nativeById.get(messageId);
+    if (!message || emittedActivity.has(messageId)) {
+      return;
+    }
+    result.push({
+      sessionId,
+      update: {
+        sessionUpdate: message.role === "user" ? "user_message_chunk" : "agent_message_chunk",
+        messageId,
+        content: { type: "text", text: "" }
+      }
+    });
+    appendActivity(messageId);
+  };
+  const pageMessageIds = new Set(baseUpdates.flatMap((params) => (
+    isRecord(params.update) && typeof params.update.messageId === "string" &&
+    (params.update.sessionUpdate === "user_message_chunk" ||
+      params.update.sessionUpdate === "agent_message_chunk")
+      ? [params.update.messageId] : []
+  )));
+  const activityAnchors = [...recentActivity.keys()];
+  const firstPagedAnchor = activityAnchors.findIndex((messageId) => pageMessageIds.has(messageId));
+  const pageStartedAt = Date.parse(String(events.find((event) => typeof event.timestamp === "string")?.timestamp));
+  // A busy turn can start before this page; its earlier activity must stay above the page content.
+  activityAnchors.forEach((messageId, index) => {
+    if (pageMessageIds.has(messageId)) {
+      return;
+    }
+    const message = nativeById.get(messageId);
+    const messageAt = Date.parse(message?.timestamp ?? message?.updatedAt ?? "");
+    if (firstPagedAnchor >= 0 ? index < firstPagedAnchor : messageAt < pageStartedAt) {
+      appendDetachedActivity(messageId);
+    }
+  });
   let anchor: string | undefined;
   for (const params of baseUpdates) {
     const update = isRecord(params.update) ? params.update : undefined;
@@ -627,22 +687,8 @@ export function mergePagedHistoryReplayUpdates(
     result.push(params);
   }
   appendActivity(anchor);
-  for (const [messageId] of recentActivity) {
-    if (emittedActivity.has(messageId)) {
-      continue;
-    }
-    const message = nativeById.get(messageId);
-    if (message) {
-      result.push({
-        sessionId,
-        update: {
-          sessionUpdate: message.role === "user" ? "user_message_chunk" : "agent_message_chunk",
-          messageId,
-          content: { type: "text", text: "" }
-        }
-      });
-      appendActivity(messageId);
-    }
+  for (const messageId of activityAnchors) {
+    appendDetachedActivity(messageId);
   }
   for (const updates of recentCommands.values()) {
     result.push(...updates);
