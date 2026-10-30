@@ -3525,6 +3525,29 @@ function renderMessageBody(body, message) {
   }
 }
 
+// Chat-style labels: "10:03", "Yesterday, 10:03", "Mon 10:03", "Oct 27, 10:03", "Oct 27, 2025, 10:03".
+function formatMessageTimestamp(date, now = new Date()) {
+  const time = { hour: "numeric", minute: "2-digit" };
+  const startOfDay = (value) =>
+    new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+  const daysAgo = Math.round((startOfDay(now) - startOfDay(date)) / 86_400_000);
+  if (daysAgo === 0) {
+    return date.toLocaleTimeString(undefined, time);
+  }
+  if (daysAgo === 1) {
+    return `Yesterday, ${date.toLocaleTimeString(undefined, time)}`;
+  }
+  if (daysAgo > 1 && daysAgo < 7) {
+    return date.toLocaleString(undefined, { weekday: "short", ...time });
+  }
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    ...(date.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }),
+    ...time
+  });
+}
+
 function renderMessageTimestamp(article, message) {
   let timestamp = article.querySelector("time.message-timestamp");
   const date = (message.role === "assistant" || message.role === "user") &&
@@ -3541,24 +3564,7 @@ function renderMessageTimestamp(article, message) {
     timestamp.className = "message-timestamp";
   }
   timestamp.dateTime = date.toISOString();
-  const now = new Date();
-  const isToday = date.getFullYear() === now.getFullYear() &&
-    date.getMonth() === now.getMonth() &&
-    date.getDate() === now.getDate();
-  const time = date.toLocaleTimeString(undefined, {
-    hour: "numeric",
-    minute: "2-digit"
-  });
-  timestamp.textContent = isToday
-    ? `Today, ${time}`
-    : date.toLocaleString(undefined, {
-      weekday: "short",
-      month: "short",
-      day: "numeric",
-      year: "numeric",
-      hour: "numeric",
-      minute: "2-digit"
-    });
+  timestamp.textContent = formatMessageTimestamp(date);
   timestamp.title = date.toLocaleString(undefined, {
     dateStyle: "full",
     timeStyle: "long"
