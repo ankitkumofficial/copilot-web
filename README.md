@@ -365,8 +365,15 @@ brand mark uses `C`.
   support. Copilot CLI stores non-image attachments as temporary files with
   generated names, so the model does not see the original filename and file
   types without a known extension are saved as `.bin`. Copilot CLI history
-  does not keep the contents of non-image attachments, so they are not shown
-  again after a conversation is reloaded or the page is refreshed.
+  does not keep the contents of non-image attachments, so Copilot Web stores a
+  display-only copy in `~/.copilot-web/attachments/<conversation-id>/` and
+  restores the file name, type, and contents after a reload or refresh. The
+  copy is identified by a content hash embedded in the attachment's resource
+  URI, verified when read, and deleted when the conversation is deleted from
+  Copilot Web; conversations deleted outside Copilot Web leave their copies
+  in place. Non-image
+  attachments sent before this feature, or whose stored copy is missing, are
+  not shown again.
 - Long-running prompt turns remain active until Copilot completes, the user
   cancels them, or a new prompt requests an interruption; they are not cut off
   by the bridge's short request timeout.
