@@ -48,6 +48,13 @@ import {
   type NativeMessage,
   type NativeMessageCollection
 } from "./history.js";
+import {
+  AttachmentStore,
+  attachmentId,
+  attachmentUri,
+  hydrateAttachmentEvent,
+  type StoredAttachment
+} from "./attachments.js";
 import { SerialTaskQueue } from "./persistence.js";
 
 const applicationVersion = "0.1.0";
@@ -122,6 +129,7 @@ interface BusyPrompt {
   lastVisibleNativeMessageId?: string;
   nativeAssistantHasContent?: boolean;
   acpAssistantUpdates?: JsonObject[];
+  attachments?: Map<string, StoredAttachment>;
   cancelController: AbortController;
   reloadingMcp: boolean;
 }
@@ -926,7 +934,10 @@ function attachmentName(value: unknown): string {
   return name;
 }
 
-function parsePrompt(body: JsonObject, capabilities: AgentCapabilities): PromptContentBlock[] {
+function parsePrompt(
+  body: JsonObject,
+  capabilities: AgentCapabilities
+): { prompt: PromptContentBlock[]; storedAttachments: StoredAttachment[] } {
   if (body.text !== undefined && typeof body.text !== "string") {
     throw new HttpError(400, "Message text must be a string");
   }
@@ -945,6 +956,7 @@ function parsePrompt(body: JsonObject, capabilities: AgentCapabilities): PromptC
   }
 
   const prompt: PromptContentBlock[] = [];
+  const storedAttachments: StoredAttachment[] = [];
   if (text.trim().length > 0) {
     prompt.push({ type: "text", text });
   }
@@ -977,10 +989,12 @@ function parsePrompt(body: JsonObject, capabilities: AgentCapabilities): PromptC
     if (!capabilities.promptCapabilities.embeddedContext) {
       throw new HttpError(409, "This Copilot agent does not support file attachments");
     }
+    const storedAttachment = { name, mimeType, data: attachment.data };
+    storedAttachments.push(storedAttachment);
     prompt.push({
       type: "resource",
       resource: {
-        uri: `urn:copilot-web:attachment:${index}:${encodeURIComponent(name)}`,
+        uri: attachmentUri(storedAttachment),
         blob: attachment.data,
         mimeType
       }
@@ -990,7 +1004,7 @@ function parsePrompt(body: JsonObject, capabilities: AgentCapabilities): PromptC
   if (prompt.length === 0) {
     throw new HttpError(400, "Message text or at least one attachment is required");
   }
-  return prompt;
+  return { prompt, storedAttachments };
 }
 
 function isModelConfigOption(option: JsonObject): boolean {
@@ -1075,6 +1089,9 @@ async function main(): Promise<void> {
   const sessionTitleOverrides = await loadSessionTitleOverrides(sessionTitlesPath);
   const sessionUsageCache = await loadSessionUsage(sessionUsagePath);
   const sessionActivityCache = await loadSessionActivity(sessionActivityPath);
+  const attachmentStore = new AttachmentStore(
+    path.join(os.homedir(), ".copilot-web", "attachments")
+  );
 
   const acp = new AcpConnectionManager({
     command: copilotCommand,
@@ -1092,7 +1109,10 @@ async function main(): Promise<void> {
     allowAll
   });
   await copilotHistory.initialize();
-  const historyPager = new HistoryPager((request) => copilotHistory.readPage(request));
+  const historyPager = new HistoryPager(async (request) => attachmentStore.hydratePage(
+    request.sessionId,
+    await copilotHistory.readPage(request)
+  ));
 
   const browserCapabilities = () => {
     const capabilities = acp.getCapabilities();
@@ -1349,7 +1369,9 @@ async function main(): Promise<void> {
     let read = nativeHistoryReads.get(sessionId);
     if (!read) {
       read = {
-        promise: copilotHistory.read(sessionId),
+        promise: copilotHistory.read(sessionId).then((events) => (
+          attachmentStore.hydrateEvents(sessionId, events)
+        )),
         bufferedEvents: [],
         consumers: 0
       };
@@ -1810,9 +1832,13 @@ async function main(): Promise<void> {
       const liveEventId = typeof event.params.id === "string" && event.params.id
         ? undefined
         : `live:${randomBytes(12).toString("hex")}`;
+      const nativeEvent = hydrateAttachmentEvent(
+        event.params,
+        (id) => busyPrompt?.attachments?.get(id)
+      );
       const nativeMessage = applyNativeMessageEvent(
         nativeMessageState(sessionId),
-        event.params,
+        nativeEvent,
         {
           ...(busyPrompt?.clientPromptId ? { clientPromptId: busyPrompt.clientPromptId } : {}),
           ...(liveEventId ? { liveEventId } : {})
@@ -1840,7 +1866,7 @@ async function main(): Promise<void> {
       }
       // Loads merge buffered events with their snapshot; other clients still need the live update.
       nativeHistoryReads.get(sessionId)?.bufferedEvents.push(
-        liveEventId ? { ...event.params, id: liveEventId } : event.params
+        liveEventId ? { ...nativeEvent, id: liveEventId } : nativeEvent
       );
       nativePipelineModes.set(sessionId, true);
       publish("native-message", { ...nativeMessage, sessionId, updateSequence: ++updateSequence }, sessionId);
@@ -2208,11 +2234,12 @@ async function main(): Promise<void> {
         sessionActivityCache.delete(sessionId);
         sessionUsageCache.delete(sessionId);
 
-        const cleanupLabels = ["session usage", "session activity", "custom titles"];
+        const cleanupLabels = ["session usage", "session activity", "custom titles", "attachments"];
         const cleanupResults = await Promise.allSettled([
           queueSessionUsageSave(),
           queueSessionActivitySave(),
-          persistSessionTitleOverride(sessionId, undefined, false, true)
+          persistSessionTitleOverride(sessionId, undefined, false, true),
+          attachmentStore.deleteSession(sessionId)
         ]);
         const persistenceWarnings: string[] = [];
         cleanupResults.forEach((result, index) => {
@@ -2646,7 +2673,22 @@ async function main(): Promise<void> {
           publish("session-prompt-started", { sessionId, promptId }, sessionId);
           const context = acp.getSessionContext(sessionId) ?? "default";
           await acp.start(context);
-          const prompt = parsePrompt(body, acp.getCapabilities(context));
+          const { prompt, storedAttachments } = parsePrompt(
+            body,
+            acp.getCapabilities(context)
+          );
+          if (storedAttachments.length > 0) {
+            busyPrompt.attachments = new Map(storedAttachments.map((attachment) => (
+              [attachmentId(attachment), attachment]
+            )));
+            await attachmentStore.save(sessionId, storedAttachments).catch((error: unknown) => {
+              console.warn(
+                `[attachments] Unable to store attachments for ${sessionId}; they will not be restored after reload: ${
+                  error instanceof Error ? error.message : String(error)
+                }`
+              );
+            });
+          }
           const replay = sessionReplayCache.get(sessionId) ?? [];
           const userMessageId = `web-${randomBytes(12).toString("hex")}`;
           busyPrompt.userMessageId = userMessageId;

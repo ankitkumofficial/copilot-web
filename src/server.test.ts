@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -163,11 +164,11 @@ function emitNativePrompt(request, sessionId, reply) {
       }];
     }
     if (block.type === "resource") {
+      // Like the CLI, persist embedded resources only as references to deleted temp files.
       return [{
-        type: "blob",
-        displayName: "prompt-document.pdf",
-        mimeType: block.resource.mimeType,
-        data: block.resource.blob
+        type: "file",
+        path: "/tmp/acp-resource-test.bin",
+        displayName: block.resource.uri.replace(/[^A-Za-z0-9.-]/g, "_")
       }];
     }
     return [];
@@ -1020,6 +1021,7 @@ async function startTestServer(t: TestContext, options: {
       path.join(copilotHome, "settings.json"),
       JSON.stringify(settings)
     ),
+    attachmentsDirectory: path.join(home, ".copilot-web", "attachments"),
     metadata: (name: string) => readFile(path.join(home, ".copilot-web", name), "utf8")
       .then((content) => JSON.parse(content) as unknown),
     nativeHistory: () => readFile(path.join(projects, "native-history.json"), "utf8")
@@ -1474,7 +1476,7 @@ test("preserves prompt text and attachments", async (t) => {
           {
             type: "resource",
             resource: {
-              uri: "urn:copilot-web:attachment:1:document.pdf",
+              uri: attachmentUriFor("document.pdf", "application/pdf", pdfData),
               blob: pdfData,
               mimeType: "application/pdf"
             }
@@ -1482,7 +1484,7 @@ test("preserves prompt text and attachments", async (t) => {
           {
             type: "resource",
             resource: {
-              uri: "urn:copilot-web:attachment:2:notes.txt",
+              uri: attachmentUriFor("notes.txt", "text/plain", textData),
               blob: textData,
               mimeType: "text/plain"
             }
@@ -1490,7 +1492,7 @@ test("preserves prompt text and attachments", async (t) => {
           {
             type: "resource",
             resource: {
-              uri: "urn:copilot-web:attachment:3:archive.bin",
+              uri: attachmentUriFor("archive.bin", "application/octet-stream", binaryData),
               blob: binaryData,
               mimeType: "application/octet-stream"
             }
@@ -1499,6 +1501,125 @@ test("preserves prompt text and attachments", async (t) => {
       }
     ]
   );
+});
+
+function attachmentUriFor(name: string, mimeType: string, data: string): string {
+  const id = createHash("sha256").update(JSON.stringify([name, mimeType, data])).digest("hex");
+  return `urn:copilot-web:attachment:${id}:${encodeURIComponent(name)}`;
+}
+
+function persistedAttachmentReference(uri: string): JsonObject {
+  return {
+    type: "file",
+    path: "/tmp/acp-resource-deleted.bin",
+    displayName: uri.replace(/[^A-Za-z0-9.-]/g, "_")
+  };
+}
+
+test("stores non-image attachments for history and removes them with the conversation", async (t) => {
+  const server = await startTestServer(t, {
+    nativeMessages: true,
+    nativeHistory: {},
+    nativeSessionDelete: true
+  });
+  const text = "prompt with restorable attachments";
+  const expected = [
+    {
+      name: "Bericht (final) \u00fc.txt",
+      mimeType: "text/plain",
+      data: Buffer.from("attachment text").toString("base64")
+    },
+    {
+      name: "archive.bin",
+      mimeType: "application/octet-stream",
+      data: Buffer.from([0, 1, 2]).toString("base64")
+    }
+  ];
+  const response = await server.post("messages", {
+    text,
+    attachments: [expected[0], { name: "archive.bin", data: expected[1]?.data }]
+  });
+  assert.equal(response.status, 200);
+
+  const sessionDirectory = path.join(server.attachmentsDirectory, server.sessionId);
+  const stored = await Promise.all((await readdir(sessionDirectory)).sort().map(async (file) => (
+    JSON.parse(await readFile(path.join(sessionDirectory, file), "utf8")) as unknown
+  )));
+  assert.deepEqual(
+    stored.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+    [...expected].sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
+  );
+
+  const loadedResponse = await server.post("load", { historyPaging: true });
+  assert.equal(loadedResponse.status, 200);
+  const loaded: unknown = await loadedResponse.json();
+  assert.ok(isRecord(loaded) && Array.isArray(loaded.nativeMessages));
+  const user = loaded.nativeMessages.filter(isRecord)
+    .find((message) => message.role === "user" && message.content === text);
+  assert.deepEqual(user?.attachments, expected);
+
+  await server.removeSdk();
+  const deleted = await fetch(
+    `${server.baseUrl}/api/sessions/${encodeURIComponent(server.sessionId)}`,
+    { method: "DELETE", headers: server.headers }
+  );
+  assert.equal(deleted.status, 200);
+  assert.deepEqual(await deleted.json(), { deleted: true });
+  assert.equal(existsSync(sessionDirectory), false);
+});
+
+test("restores stored non-image attachment contents from persisted CLI references", async (t) => {
+  const restored = {
+    name: "notes.txt",
+    mimeType: "text/plain",
+    data: Buffer.from("restored notes").toString("base64")
+  };
+  const tampered = {
+    name: "tampered.txt",
+    mimeType: "text/plain",
+    data: Buffer.from("original").toString("base64")
+  };
+  const restoredUri = attachmentUriFor(restored.name, restored.mimeType, restored.data);
+  const tamperedUri = attachmentUriFor(tampered.name, tampered.mimeType, tampered.data);
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: {
+      events: [{
+        id: "persisted-user-event",
+        type: "user.message",
+        timestamp: "2026-10-13T12:00:00.000Z",
+        parentId: null,
+        data: {
+          messageId: "native-user-1",
+          content: "Historical prompt with files",
+          attachments: [
+            persistedAttachmentReference(restoredUri),
+            persistedAttachmentReference(tamperedUri),
+            persistedAttachmentReference("urn:copilot-web:attachment:0:legacy.txt")
+          ]
+        }
+      }]
+    }
+  });
+  const sessionDirectory = path.join(server.attachmentsDirectory, server.sessionId);
+  await mkdir(sessionDirectory, { recursive: true });
+  const storedId = (uri: string) => uri.split(":")[3];
+  await writeFile(path.join(sessionDirectory, `${storedId(restoredUri)}.json`), JSON.stringify(restored));
+  await writeFile(
+    path.join(sessionDirectory, `${storedId(tamperedUri)}.json`),
+    JSON.stringify({ ...tampered, data: Buffer.from("changed!").toString("base64") })
+  );
+
+  for (const body of [{ context: "default" }, { historyPaging: true }]) {
+    const response = await server.post("load", body);
+    assert.equal(response.status, 200);
+    const loaded: unknown = await response.json();
+    assert.ok(isRecord(loaded) && Array.isArray(loaded.nativeMessages));
+    const user = loaded.nativeMessages.filter(isRecord)
+      .find((message) => message.messageId === "native-user-1");
+    assert.deepEqual(user?.attachments, [restored], JSON.stringify(body));
+  }
 });
 
 test("retries conversation creation and prompts without repeating accepted work", async (t) => {
@@ -6575,7 +6696,11 @@ test("recovers a pending message and attachment in an existing conversation", {
   assert.deepEqual(prompts[0]?.prompt, [
     { type: "text", text: "Keep this existing conversation" },
     { type: "resource", resource: {
-      uri: "urn:copilot-web:attachment:0:notes.txt",
+      uri: attachmentUriFor(
+        "notes.txt",
+        "text/plain",
+        Buffer.from("Keep this attachment").toString("base64")
+      ),
       blob: Buffer.from("Keep this attachment").toString("base64"),
       mimeType: "text/plain"
     } }
