@@ -13,7 +13,6 @@
   --accent-foreground: #11121a;
   --danger: #f2788b;
   --user: #272d48;
-  --tool-text: #cce9d9;
   --tool-label: #73c69b;
   --shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
 }
@@ -32,7 +31,6 @@
   --accent-foreground: #ffffff;
   --danger: #c23f59;
   --user: #e8e7ff;
-  --tool-text: #24533a;
   --tool-label: #176b40;
   --shadow: 0 18px 48px rgba(35, 40, 60, 0.14);
 }
@@ -52,7 +50,6 @@
     --accent-foreground: #ffffff;
     --danger: #c23f59;
     --user: #e8e7ff;
-    --tool-text: #24533a;
     --tool-label: #176b40;
     --shadow: 0 18px 48px rgba(35, 40, 60, 0.14);
   }
@@ -1200,7 +1197,7 @@ button:disabled {
   overflow-y: auto;
   overflow-x: hidden;
   overflow-anchor: none;
-  color: var(--tool-text);
+  color: var(--muted);
   line-height: 1.45;
   white-space: normal;
   overflow-wrap: anywhere;

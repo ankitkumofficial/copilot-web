@@ -155,12 +155,15 @@ New sessions use `~/projects` as their starting directory. Copilot can then
 navigate to repositories below that directory when prompted. Resumed sessions
 use the working directory recorded with the original session.
 
-Every click on **New conversation** reloads the Copilot CLI defaults from
-`$COPILOT_HOME/settings.json` (default: `~/.copilot/settings.json`): `model`,
-`contextTier`, and `effortLevel`. Browser settings from the previous
-conversation do not carry over. The backend applies these defaults to the ACP
-session before the first prompt. After starting a conversation, changes to
-model, context, or reasoning apply to its next prompt.
+Once a conversation has started, the next click on **New conversation** reloads
+the Copilot CLI defaults from `$COPILOT_HOME/settings.json` (default:
+`~/.copilot/settings.json`): `model`, `contextTier`, and `effortLevel`.
+Browser settings from the previous conversation do not carry over. A new
+conversation that has not been sent yet keeps its draft, model, context, and
+reasoning selections when you switch to another conversation and return. The
+backend applies the selected settings to the ACP session before the first
+prompt. After starting a conversation, changes to model, context, or reasoning
+apply to its next prompt.
 The model and reasoning controls use the options advertised by the installed
 Copilot CLI. Changing the model refreshes the available reasoning options using
 the selected context profile; an unsupported reasoning default falls back to
