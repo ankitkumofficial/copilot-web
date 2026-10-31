@@ -7212,6 +7212,31 @@ test("pastes rich HTML and Markdown text into the composer as formatted content"
   `);
   assert.equal(await evaluate(`${input}.value`), "***Both***");
   assert.equal(await evaluate(`${input}.querySelector("strong em")?.textContent`), "Both");
+
+  const tableMarkdown = "| Group | Decision |\n| --- | :---: |\n| **9 modules** | Uses a \\| pipe |";
+  const tableHtml = "<table><thead><tr><th>Group</th><th style=\"text-align:center\">Decision</th></tr></thead>" +
+    "<tbody><tr><td><strong>9 modules</strong></td><td style=\"text-align:center\">Uses a | pipe</td></tr></tbody></table>";
+  const tableCells = `[...${input}.querySelectorAll("table tr")].map((row) => [...row.cells].map((cell) => cell.textContent))`;
+  for (const data of [{ "text/html": tableHtml, "text/plain": tableMarkdown }, { "text/plain": tableMarkdown }]) {
+    assert.equal(await paste(data), `${tableMarkdown}\n`, JSON.stringify(data));
+    assert.deepEqual(await evaluate(tableCells), [["Group", "Decision"], ["9 modules", "Uses a | pipe"]]);
+    assert.equal(await evaluate(`${input}.querySelector("td strong")?.textContent`), "9 modules");
+    assert.equal(await evaluate(`${input}.querySelector("th[data-align='center']")?.textContent`), "Decision");
+  }
+  await evaluate(`${input}.insertClipboard({ text: "After" })`);
+  assert.equal(await evaluate(`${input}.value`), `${tableMarkdown}\nAfter`);
+  await evaluate(`
+    (() => {
+      const cell = ${input}.querySelectorAll("td")[1];
+      window.getSelection().collapse(cell.firstChild, 4);
+      ${input}.insertClipboard({ html: "<p>One</p><p>Two</p>" });
+      ${input}.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", shiftKey: true, bubbles: true, cancelable: true }));
+      ${input}.insertClipboard({ text: "Below" });
+    })()
+  `);
+  assert.equal(await evaluate(`${input}.querySelectorAll("td")[1].textContent`), "UsesOne Two a | pipe");
+  assert.equal(await evaluate(`${input}.value`),
+    "| Group | Decision |\n| --- | :---: |\n| **9 modules** | UsesOne Two a \\| pipe |\nBelow\nAfter");
 });
 
 test("indents list subtrees without flattening their descendants", {
@@ -7490,6 +7515,7 @@ test("renders user Markdown in live and restored history, rich copies, and selec
     "  -f year=2026 -f month=10 \\",
     "  --jq '[.usageItems[].grossQuantity] | add // 0'"
   ].join("\n");
+  const assistantTable = "| Group | Decision |\n| --- | ---: |\n| **9 modules** | Enabled `a|b` and \\| pipes |";
   const events = nativeHistoryEvents().map((event) => {
     if (event.id === "persisted-assistant-event") {
       assert.ok(isRecord(event.data));
@@ -7497,7 +7523,7 @@ test("renders user Markdown in live and restored history, rich copies, and selec
         ...event,
         data: {
           ...event.data,
-          content: `Native historical reply\n\n${nestedEmphasisMarkdown}\n\n\`\`\`sh\n${assistantCode}\n\`\`\``
+          content: `Native historical reply\n\n${nestedEmphasisMarkdown}\n\n\`\`\`sh\n${assistantCode}\n\`\`\`\n\n${assistantTable}`
         }
       };
     }
@@ -7582,6 +7608,30 @@ test("renders user Markdown in live and restored history, rich copies, and selec
   await waitFor(`window.clipboardWrites.length === 3`);
   assert.equal(await evaluate(`window.clipboardWrites[2].text.includes(${JSON.stringify(assistantCode)})`), true);
   assert.equal(await evaluate(`window.clipboardWrites[2].html.includes("code-copy")`), false);
+  assert.equal(await evaluate(`window.clipboardWrites[2].html.includes("table-copy")`), false);
+  assert.equal(await evaluate(`
+    (() => {
+      const block = document.querySelector(".message.assistant .code-block");
+      return block.querySelector(".code-copy").getBoundingClientRect().bottom <=
+        block.querySelector("pre").getBoundingClientRect().top;
+    })()
+  `), true);
+  await evaluate(`document.querySelector(".message.assistant .table-copy").click()`);
+  await waitFor(`window.clipboardWrites.length === 4`);
+  assert.equal(await evaluate(`window.clipboardWrites[3].text`),
+    "| Group | Decision |\n| --- | ---: |\n| 9 modules | Enabled a\\|b and \\| pipes |");
+  assert.equal(await evaluate(`window.clipboardWrites[3].html.startsWith("<table>")`), true);
+  assert.equal(await evaluate(`document.querySelector(".message.assistant .table-copy").getAttribute("aria-label")`), "Table copied");
+  assert.equal(await evaluate(`
+    (() => {
+      ${input}.value = "";
+      ${input}.focus();
+      ${input}.insertClipboard(window.clipboardWrites[3]);
+      return ${input}.value;
+    })()
+  `), `${assistantTable}\n`);
+  assert.equal(await evaluate(`${input}.querySelectorAll("table th, table td").length`), 4);
+  await evaluate(`${input}.value = ""`);
 
   await evaluate(`
     (() => {

@@ -163,6 +163,72 @@ export function parseMarkdownList(lines, startIndex, renderInline = inlineMarkdo
   return { html: `<${tag}${attributes}>${items.join("")}</${tag}>`, next: index };
 }
 
+export function splitTableRow(value) {
+  let row = String(value).trim();
+  if (row.startsWith("|")) {
+    row = row.slice(1);
+  }
+  if (row.endsWith("|") && !row.endsWith("\\|")) {
+    row = row.slice(0, -1);
+  }
+
+  const cells = [];
+  let cell = "";
+  let codeSpan = false;
+  for (let index = 0; index < row.length; index += 1) {
+    const character = row[index];
+    if (character === "\\" && row[index + 1] === "|") {
+      cell += "\\|";
+      index += 1;
+      continue;
+    }
+    if (character === "`") {
+      codeSpan = !codeSpan;
+    }
+    if (character === "|" && !codeSpan) {
+      cells.push(cell.trim());
+      cell = "";
+      continue;
+    }
+    cell += character;
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+
+export function tableDelimiterAlignments(line) {
+  const cells = splitTableRow(line);
+  if (
+    cells.length === 0 ||
+    cells.some((cell) => !/^:?-{3,}:?$/.test(cell))
+  ) {
+    return null;
+  }
+  return cells.map((cell) => (
+    cell.startsWith(":") && cell.endsWith(":")
+      ? "center"
+      : cell.startsWith(":")
+        ? "left"
+        : cell.endsWith(":")
+          ? "right"
+          : null
+  ));
+}
+
+const TABLE_ALIGNMENTS = new Set(["left", "center", "right"]);
+
+// Cells hold inline HTML; the table always gets a header row because a
+// Markdown table cannot exist without one.
+function editorTableHtml(rows, alignments) {
+  const columns = Math.max(1, ...rows.map((row) => row.length));
+  const rowHtml = (row, tag) => `<tr>${Array.from({ length: columns }, (_, index) => {
+    const alignment = TABLE_ALIGNMENTS.has(alignments[index]) ? ` data-align="${alignments[index]}"` : "";
+    return `<${tag}${alignment}>${row[index] || "<br>"}</${tag}>`;
+  }).join("")}</tr>`;
+  const body = rows.slice(1).map((row) => rowHtml(row, "td")).join("");
+  return `<table><thead>${rowHtml(rows[0] ?? [], "th")}</thead>${body ? `<tbody>${body}</tbody>` : ""}</table>`;
+}
+
 function markdownLinesToHtml(lines) {
   const html = [];
   let index = 0;
@@ -187,6 +253,18 @@ function markdownLinesToHtml(lines) {
       // A trailing newline in a <pre> is only rendered when another follows it.
       const text = code.join("\n") + (code.length > 1 && code.at(-1) === "" ? "\n" : "");
       html.push(`<pre${attributes}>${escapeHtml(text) || "<br>"}</pre>`);
+      continue;
+    }
+    const header = line.includes("|") ? splitTableRow(line) : null;
+    const alignments = header && index + 1 < lines.length ? tableDelimiterAlignments(lines[index + 1]) : null;
+    if (alignments && alignments.length === header.length) {
+      const rows = [header];
+      index += 2;
+      while (index < lines.length && lines[index].trim() && lines[index].includes("|")) {
+        rows.push(splitTableRow(lines[index]));
+        index += 1;
+      }
+      html.push(editorTableHtml(rows.map((row) => row.map((cell) => inlineMarkdownToHtml(cell))), alignments));
       continue;
     }
     const heading = line.match(/^(#{1,6}) (.*)$/);
@@ -571,13 +649,34 @@ function serializeList(list) {
   return lines.length > 0 ? lines : [anchorLine(list, 0)];
 }
 
+function serializeTableCell(cell) {
+  // A Markdown table cell is a single line, so line breaks become spaces.
+  return serializeInlineBlock(cell)
+    .flatMap((line, index) => index === 0 ? line : [{ text: " ", node: null, offset: 0 }, ...line])
+    .map((piece) => ({ ...piece, cell: true }));
+}
+
+export function tableDelimiter(alignment) {
+  return { left: ":---", center: ":---:", right: "---:" }[alignment] ?? "---";
+}
+
 function serializeTable(table) {
+  const rows = Array.from(table.rows);
+  if (rows.length === 0) {
+    return [anchorLine(table, 0)];
+  }
+  const columns = Math.max(1, ...rows.map((row) => row.cells.length));
   const lines = [];
-  Array.from(table.querySelectorAll("tr")).forEach((row, index) => {
-    const cells = Array.from(row.cells).map((cell) => cell.textContent.replace(/\s+/g, " ").trim());
-    lines.push([{ text: `| ${cells.join(" | ")} |`, node: null, offset: 0 }]);
-    if (index === 0 && row.querySelector("th")) {
-      lines.push([{ text: `| ${cells.map(() => "---").join(" | ")} |`, node: null, offset: 0 }]);
+  rows.forEach((row, rowIndex) => {
+    const line = [{ text: "|", node: null, offset: 0 }];
+    for (let index = 0; index < columns; index += 1) {
+      const cell = row.cells[index];
+      line.push({ text: " ", node: null, offset: 0 }, ...(cell ? serializeTableCell(cell) : []), { text: " |", node: null, offset: 0 });
+    }
+    lines.push(line);
+    if (rowIndex === 0) {
+      const delimiters = Array.from({ length: columns }, (_, index) => tableDelimiter(row.cells[index]?.dataset.align));
+      lines.push([{ text: `| ${delimiters.join(" | ")} |`, node: null, offset: 0 }]);
     }
   });
   return lines;
@@ -649,9 +748,10 @@ function escapeLinePieces(line) {
       return [piece];
     }
     const pieces = [];
+    const special = piece.cell ? /[\\*_~`[\]|]/ : /[\\*_~`[\]]/;
     let runStart = 0;
     for (let index = 0; index < piece.text.length; index += 1) {
-      if (/[\\*_~`[\]]/.test(piece.text[index]) || start + index === blockEscape) {
+      if (special.test(piece.text[index]) || start + index === blockEscape) {
         if (index > runStart) {
           pieces.push({ ...piece, text: piece.text.slice(runStart, index), offset: piece.offset + runStart });
         }
@@ -743,6 +843,18 @@ function pastedInlineHtml(node) {
     inner = `<${mark}>${inner}</${mark}>`;
   }
   return inner;
+}
+
+function pastedTableHtml(table) {
+  const rows = Array.from(table.rows).filter((row) => !isHiddenElement(row) && row.cells.length > 0);
+  const cells = rows.map((row) => Array.from(row.cells).map((cell) =>
+    trimInlineHtml(Array.from(cell.childNodes).map(pastedInlineHtml).join("").replaceAll("<br>", " "))));
+  if (!cells.flat().some(Boolean)) {
+    return "";
+  }
+  const alignments = Array.from(rows[0].cells).map((cell) =>
+    (cell.style?.textAlign || cell.getAttribute("align") || "").toLowerCase());
+  return editorTableHtml(cells, alignments);
 }
 
 function pastedListItemHtml(item) {
@@ -862,13 +974,10 @@ function collectPastedBlocks(parent, blocks) {
       }
     } else if (tagName === "TABLE") {
       flush();
-      Array.from(child.querySelectorAll("tr")).forEach((row, index) => {
-        const cells = Array.from(row.cells).map((cell) => escapeHtml(collapseWhitespace(cell.textContent).trim()));
-        blocks.push({ type: "row", html: `<p>| ${cells.join(" | ")} |</p>` });
-        if (index === 0 && row.querySelector("th")) {
-          blocks.push({ type: "row", html: `<p>| ${cells.map(() => "---").join(" | ")} |</p>` });
-        }
-      });
+      const html = pastedTableHtml(child);
+      if (html) {
+        blocks.push({ type: "table", html });
+      }
     } else if (tagName === "HR") {
       flush();
       blocks.push({ type: "p", html: "<p>---</p>" });
@@ -917,7 +1026,7 @@ function joinPastedBlocks(blocks) {
     }
     // Pasted blocks are visually separated in their source; keep that as a
     // blank line so the serialized Markdown keeps separate paragraphs.
-    if (previous && !(previous.type === "row" && block.type === "row")) {
+    if (previous) {
       html.push("<p><br></p>");
     }
     html.push(block.html);
@@ -1044,6 +1153,16 @@ function lastTextPosition(element) {
     return [element, Array.prototype.indexOf.call(element.childNodes, brs[0])];
   }
   return [element, nested >= 0 ? nested : element.childNodes.length];
+}
+
+function flattenedText(root) {
+  const copy = root.cloneNode(true);
+  for (const element of copy.querySelectorAll("*")) {
+    if (isBlockNode(element) || isElement(element, "BR")) {
+      element.after(" ");
+    }
+  }
+  return collapseWhitespace(copy.textContent).trim();
 }
 
 function renameElement(element, tagName) {
@@ -1314,12 +1433,18 @@ class PromptEditor extends HTMLElement {
   #closestBlock(node) {
     let element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
     while (element && element !== this) {
-      if (TEXT_BLOCK_TAGS.has(element.tagName) || element.tagName === "BLOCKQUOTE") {
+      if (TEXT_BLOCK_TAGS.has(element.tagName) || ["BLOCKQUOTE", "TD", "TH"].includes(element.tagName)) {
         return element;
       }
       element = element.parentElement;
     }
     return this;
+  }
+
+  #closestCell(node) {
+    const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+    const cell = element?.closest("td, th");
+    return cell && this.contains(cell) ? cell : null;
   }
 
   #offsetFromPoint(container, offset, pieces) {
@@ -1446,7 +1571,7 @@ class PromptEditor extends HTMLElement {
     const strayNodes = Array.from(this.childNodes).some((node) => !isBlockNode(node));
     const artifacts = this.querySelector("span, font, [style], p > ul, p > ol, p > p, p > pre, p > blockquote");
     const zeroWidth = this.textContent.includes(ZERO_WIDTH_SPACE);
-    const emptyBlocks = Array.from(this.querySelectorAll("p, div, li, h1, h2, h3, h4, h5, h6, pre"))
+    const emptyBlocks = Array.from(this.querySelectorAll("p, div, li, h1, h2, h3, h4, h5, h6, pre, td, th"))
       .filter((block) => !block.firstChild);
     if (!strayNodes && !artifacts && !zeroWidth && emptyBlocks.length === 0 && this.firstElementChild) {
       return;
@@ -1700,6 +1825,13 @@ class PromptEditor extends HTMLElement {
     if (!range) {
       return;
     }
+    const cell = this.#closestCell(range.startContainer);
+    if (cell) {
+      this.#checkpoint();
+      this.#exitTable(cell.closest("table"));
+      this.#emitInput("insertParagraph");
+      return;
+    }
     if (range.collapsed && this.#applyBlockRule(true)) {
       return;
     }
@@ -1773,6 +1905,16 @@ class PromptEditor extends HTMLElement {
     const paragraph = document.createElement("p");
     paragraph.append(document.createElement("br"));
     pre.after(paragraph);
+    this.#setCaret(paragraph, 0);
+  }
+
+  #exitTable(table) {
+    let paragraph = table.nextElementSibling;
+    if (!isElement(paragraph, "P") || visibleText(paragraph) !== "") {
+      paragraph = document.createElement("p");
+      paragraph.append(document.createElement("br"));
+      table.after(paragraph);
+    }
     this.#setCaret(paragraph, 0);
   }
 
@@ -1887,7 +2029,7 @@ class PromptEditor extends HTMLElement {
 
   #ensureTrailingParagraph() {
     const last = this.lastElementChild;
-    if (!last || !["PRE", "BLOCKQUOTE", "UL", "OL"].includes(last.tagName)) {
+    if (!last || !["PRE", "BLOCKQUOTE", "UL", "OL", "TABLE"].includes(last.tagName)) {
       return;
     }
     const range = this.#currentRange();
@@ -2142,7 +2284,10 @@ class PromptEditor extends HTMLElement {
     range = this.#currentRange();
     const template = document.createElement("template");
     template.innerHTML = html;
-    const nodes = Array.from(template.content.childNodes);
+    let nodes = Array.from(template.content.childNodes);
+    if (this.#closestCell(range.startContainer) && nodes.some(isBlockNode)) {
+      nodes = [document.createTextNode(flattenedText(template.content))];
+    }
     const single = nodes.length === 1 && isElement(nodes[0], "P");
     if (single || !nodes.some(isBlockNode)) {
       const fragment = document.createDocumentFragment();
@@ -2217,14 +2362,16 @@ class PromptEditor extends HTMLElement {
     if (blockEmpty && !merged && block.isConnected) {
       block.remove();
     }
-    const caret = lastTextPosition(lastInserted);
+    // Typing continues below a pasted table rather than in its last cell.
+    const endsWithTable = isElement(lastInserted, "TABLE");
+    const caret = endsWithTable ? firstTextPosition(tail) : lastTextPosition(lastInserted);
     const tailMergeable = !tailEmpty && TEXT_BLOCK_TAGS.has(lastInserted.tagName) && lastInserted.tagName !== "PRE" &&
       !Array.from(lastInserted.childNodes).some(isListElement) &&
       (inList || !/^H[1-6]$/.test(lastInserted.tagName));
     if (tailMergeable) {
       this.#appendInline(lastInserted, tail);
       tail.remove();
-    } else if (tailEmpty) {
+    } else if (tailEmpty && !endsWithTable) {
       tail.remove();
     } else if (lastInserted !== block) {
       lastInserted.after(tail);
@@ -2265,7 +2412,9 @@ class PromptEditor extends HTMLElement {
         continue;
       }
       const item = document.createElement("li");
-      if (node.tagName === "PRE" || node.tagName === "BLOCKQUOTE") {
+      if (node.tagName === "TABLE") {
+        item.textContent = flattenedText(node);
+      } else if (node.tagName === "PRE" || node.tagName === "BLOCKQUOTE") {
         item.textContent = node.textContent;
       } else {
         item.append(...node.childNodes);
