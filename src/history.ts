@@ -417,8 +417,10 @@ export function mergePagedHistoryReplayUpdates(
   events: readonly JsonObject[],
   nativeMessages: readonly NativeMessage[],
   cachedReplay: readonly JsonObject[],
-  liveReplay: readonly JsonObject[] = []
+  liveReplay: readonly JsonObject[] = [],
+  onActivityTruncated?: () => void
 ): JsonObject[] {
+  const nativeById = new Map(nativeMessages.map((message) => [message.messageId, message]));
   const toolCallIds = new Set<string>();
   for (const message of nativeMessages) {
     for (const toolCallId of message.toolCallIds ?? []) {
@@ -444,11 +446,33 @@ export function mergePagedHistoryReplayUpdates(
 
   const cachedTools = new Map<string, JsonObject[]>();
   const cachedCommands = new Map<string, JsonObject[]>();
+  // Native message IDs keep unpersisted activity beside the visible message it followed.
+  const cachedActivity = new Map<string, JsonObject[]>();
+  const activityToolAnchors = new Map<string, string>();
   for (const params of cachedReplay) {
     if (!isRecord(params.update)) {
       continue;
     }
     const update = params.update;
+    if (
+      typeof params.afterMessageId === "string" &&
+      nativeById.has(params.afterMessageId) &&
+      (update.sessionUpdate === "agent_thought_chunk" ||
+        update.sessionUpdate === "tool_call" ||
+        update.sessionUpdate === "tool_call_update" ||
+        update.sessionUpdate === "plan" ||
+        (params.nativeFallback === true && update.sessionUpdate === "agent_message_chunk"))
+    ) {
+      let anchor = params.afterMessageId;
+      if (typeof update.toolCallId === "string") {
+        anchor = activityToolAnchors.get(update.toolCallId) ?? anchor;
+        activityToolAnchors.set(update.toolCallId, anchor);
+      }
+      const group = cachedActivity.get(anchor) ?? [];
+      group.push(anchor === params.afterMessageId ? params : { ...params, afterMessageId: anchor });
+      cachedActivity.set(anchor, group);
+      continue;
+    }
     if (params.nativeCommand === true) {
       const promptId = typeof params.clientPromptId === "string"
         ? params.clientPromptId
@@ -473,7 +497,8 @@ export function mergePagedHistoryReplayUpdates(
   let cachedBytes = 0;
   const keepRecentGroups = (
     groups: Map<string, JsonObject[]>,
-    maximumGroups = groups.size
+    maximumGroups = groups.size,
+    preserveActivity = false
   ): Map<string, JsonObject[]> => {
     const entries = [...groups].slice(-maximumGroups);
     const kept: Array<[string, JsonObject[]]> = [];
@@ -482,24 +507,117 @@ export function mergePagedHistoryReplayUpdates(
       if (!entry) {
         continue;
       }
-      const size = Buffer.byteLength(JSON.stringify(entry[1]));
+      let updates = entry[1];
+      let size = Buffer.byteLength(JSON.stringify(updates));
+      if (preserveActivity && cachedBytes + size > maximumCachedBytes) {
+        // Large tool output must not evict the entire Thinking panel.
+        updates = updates.map((params) => {
+          if (!isRecord(params.update) || typeof params.update.toolCallId !== "string") {
+            return params;
+          }
+          const { content: _content, ...metadata } = params.update;
+          return { ...params, update: metadata };
+        });
+        size = Buffer.byteLength(JSON.stringify(updates));
+        if (cachedBytes + size > maximumCachedBytes) {
+          updates = updates.filter((params) => (
+            !isRecord(params.update) || params.update.sessionUpdate !== "agent_thought_chunk"
+          ));
+          size = Buffer.byteLength(JSON.stringify(updates));
+        }
+        onActivityTruncated?.();
+      }
       if (cachedBytes + size <= maximumCachedBytes) {
         cachedBytes += size;
-        kept.unshift(entry);
+        kept.unshift([entry[0], updates]);
       }
     }
     return new Map(kept);
   };
+  const recentActivity = keepRecentGroups(cachedActivity, cachedActivity.size, true);
+  const activityToolIds = new Set([...recentActivity.values()].flatMap((updates) => (
+    updates.flatMap((params) => isRecord(params.update) && typeof params.update.toolCallId === "string"
+      ? [params.update.toolCallId] : [])
+  )));
   const recentTools = keepRecentGroups(cachedTools);
   const recentCommands = keepRecentGroups(cachedCommands, 4);
   const result: JsonObject[] = [];
   const emittedTools = new Set<string>();
-  for (const params of historyReplayUpdates(sessionId, events)) {
+  const baseUpdates = historyReplayUpdates(sessionId, events);
+  const persistedToolMetadata = new Map<string, JsonObject>();
+  const persistedToolCompletions = new Map<string, JsonObject>();
+  const terminalStatuses = new Set(["completed", "failed", "cancelled"]);
+  for (const params of baseUpdates) {
+    if (isRecord(params.update) && typeof params.update.toolCallId === "string") {
+      const { sessionUpdate: _sessionUpdate, status: _status, content: _content, ...metadata } = params.update;
+      persistedToolMetadata.set(params.update.toolCallId, {
+        ...persistedToolMetadata.get(params.update.toolCallId), ...metadata
+      });
+      if (terminalStatuses.has(String(params.update.status))) {
+        persistedToolCompletions.set(params.update.toolCallId, params);
+      }
+    }
+  }
+  const emittedActivity = new Set<string>();
+  const appendActivity = (messageId: string | undefined): void => {
+    if (messageId === undefined || emittedActivity.has(messageId)) {
+      return;
+    }
+    const updates = recentActivity.get(messageId);
+    if (!updates) {
+      return;
+    }
+    emittedActivity.add(messageId);
+    result.push(...updates.map((params) => {
+      if (!isRecord(params.update) || typeof params.update.toolCallId !== "string") {
+        return params;
+      }
+      const metadata = persistedToolMetadata.get(params.update.toolCallId);
+      const completion = persistedToolCompletions.get(params.update.toolCallId);
+      const persistedContent = isRecord(completion?.update) ? completion.update.content : undefined;
+      const restoreTitle = (!params.update.title || params.update.title === "Copilot tool") &&
+        typeof metadata?.title === "string";
+      const restoreContent = terminalStatuses.has(String(params.update.status)) &&
+        !params.update.content && persistedContent !== undefined;
+      return {
+        ...params,
+        update: {
+          ...metadata,
+          ...params.update,
+          ...(restoreTitle ? { title: metadata.title } : {}),
+          ...(restoreContent ? { content: persistedContent } : {})
+        }
+      };
+    }));
+    const lastToolStatuses = new Map<string, unknown>();
+    for (const params of updates) {
+      if (isRecord(params.update) && typeof params.update.toolCallId === "string") {
+        lastToolStatuses.set(params.update.toolCallId, params.update.status);
+      }
+    }
+    for (const [toolCallId, status] of lastToolStatuses) {
+      const completion = persistedToolCompletions.get(toolCallId);
+      if (completion && !terminalStatuses.has(String(status))) {
+        result.push(completion);
+      }
+    }
+  };
+  let anchor: string | undefined;
+  for (const params of baseUpdates) {
     const update = isRecord(params.update) ? params.update : undefined;
+    if ((update?.sessionUpdate === "user_message_chunk" ||
+         update?.sessionUpdate === "agent_message_chunk") &&
+        typeof update.messageId === "string") {
+      appendActivity(anchor);
+      anchor = update.messageId;
+    }
     const toolCallId = typeof update?.toolCallId === "string"
       ? update.toolCallId
       : undefined;
     if (toolCallId) {
+      if (activityToolIds.has(toolCallId)) {
+        continue;
+      }
       const cached = recentTools.get(toolCallId);
       if (cached && !emittedTools.has(toolCallId)) {
         result.push(...cached);
@@ -507,6 +625,24 @@ export function mergePagedHistoryReplayUpdates(
       }
     }
     result.push(params);
+  }
+  appendActivity(anchor);
+  for (const [messageId] of recentActivity) {
+    if (emittedActivity.has(messageId)) {
+      continue;
+    }
+    const message = nativeById.get(messageId);
+    if (message) {
+      result.push({
+        sessionId,
+        update: {
+          sessionUpdate: message.role === "user" ? "user_message_chunk" : "agent_message_chunk",
+          messageId,
+          content: { type: "text", text: "" }
+        }
+      });
+      appendActivity(messageId);
+    }
   }
   for (const updates of recentCommands.values()) {
     result.push(...updates);

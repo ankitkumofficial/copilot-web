@@ -4,6 +4,7 @@ const defaultBrandName = "Copilot Web";
 const defaultBrandInitial = "C";
 const contextStorageKey = "copilot-web-context";
 const activeSessionStorageKey = "copilot-web-active-session";
+const pendingSendsStorageKey = "copilot-web-pending-sends";
 const selectionMessageMetadataStorageKey = "copilot-web-selection-messages";
 const screenWakeLockStorageKey = "copilot-web-keep-awake";
 const messageSelectionHighlightName = "copilot-web-source-selection";
@@ -70,6 +71,156 @@ function clearActiveSessionId() {
   }
 }
 
+function validPendingSend(entry) {
+  return Boolean(entry) && typeof entry.id === "string" && typeof entry.scope === "string" &&
+    (entry.sessionId === null || entry.sessionId === undefined || typeof entry.sessionId === "string") &&
+    (Boolean(entry.sessionId) || (typeof entry.creation?.id === "string" && Boolean(entry.creation.body))) &&
+    typeof entry.text === "string" && typeof entry.displayText === "string" &&
+    Array.isArray(entry.attachments) && Array.isArray(entry.selections);
+}
+
+function readPendingSends() {
+  const raw = window.sessionStorage.getItem(pendingSendsStorageKey);
+  if (raw === null) {
+    return [];
+  }
+  let stored = null;
+  try {
+    stored = JSON.parse(raw);
+  } catch {
+    // Handled below with other unreadable records.
+  }
+  const entries = Array.isArray(stored) ? stored.filter(validPendingSend) : [];
+  if (!Array.isArray(stored) || entries.length !== stored.length) {
+    // Unreadable records cannot be restored; drop them so later sends can still be saved.
+    if (entries.length > 0) {
+      window.sessionStorage.setItem(pendingSendsStorageKey, JSON.stringify(entries));
+    } else {
+      window.sessionStorage.removeItem(pendingSendsStorageKey);
+    }
+    showError(new Error("Some saved pending messages could not be read and were discarded."));
+  }
+  return entries;
+}
+
+function savePendingSend(pending) {
+  const entries = readPendingSends();
+  const index = entries.findIndex((entry) => entry.id === pending.id);
+  if (index >= 0) {
+    entries[index] = pending;
+  } else {
+    entries.push(pending);
+  }
+  window.sessionStorage.setItem(pendingSendsStorageKey, JSON.stringify(entries));
+  renderPendingSendReviews(entries);
+}
+
+function forgetPendingSend(id, conversation = currentComposerConversation()) {
+  try {
+    const entries = readPendingSends().filter((entry) => entry.id !== id);
+    if (entries.length > 0) {
+      window.sessionStorage.setItem(pendingSendsStorageKey, JSON.stringify(entries));
+    } else {
+      window.sessionStorage.removeItem(pendingSendsStorageKey);
+    }
+    renderPendingSendReviews(entries);
+  } catch (error) {
+    showError(new Error(`Unable to clear the saved pending message: ${error.message}`), conversation);
+  }
+}
+
+function submissionHeaders(id, scope) {
+  return {
+    "X-Copilot-Request-Id": id,
+    "X-Copilot-Request-Scope": scope
+  };
+}
+
+function retainPendingSendForReview(pending, conversation = currentComposerConversation()) {
+  try {
+    const latest = readPendingSends().find((candidate) => candidate.id === pending.id);
+    if (typeof latest?.nativeMessageId === "string") {
+      forgetPendingSend(pending.id, conversation);
+    } else {
+      savePendingSend({ ...pending, ...latest, reviewRequired: true });
+    }
+  } catch (error) {
+    showError(new Error(`Unable to keep the unsent message for review: ${error.message}`), conversation);
+  }
+}
+
+function renderPendingSendReviews(entries) {
+  elements.pendingSendReviews.replaceChildren();
+  const reviews = entries.filter((entry) => entry.reviewRequired === true && !entry.nativeMessageId);
+  elements.pendingSendReviews.hidden = reviews.length === 0;
+  for (const pending of reviews) {
+    const row = document.createElement("div");
+    row.className = "pending-send-review";
+    const text = document.createElement("span");
+    const preview = pending.displayText.trim() || pending.attachments.map((attachment) => attachment.name).join(", ");
+    text.textContent = `Delivery unconfirmed. Review history before resending: ${preview.slice(0, 160)}`;
+    row.append(text);
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.className = "secondary-button";
+    restore.textContent = "Restore draft";
+    restore.addEventListener("click", () => {
+      void restoreReviewedDraft(pending).catch((error) => showError(error));
+    });
+    row.append(restore);
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className = "secondary-button";
+    dismiss.textContent = "Dismiss";
+    dismiss.addEventListener("click", () => forgetPendingSend(pending.id));
+    row.append(dismiss);
+    elements.pendingSendReviews.append(row);
+  }
+}
+
+async function restoreReviewedDraft(pending) {
+  const hasDraft = () => elements.input.value.length > 0 ||
+    currentComposerConversation().attachments.length > 0 ||
+    currentComposerConversation().selections.length > 0;
+  if (hasDraft()) {
+    showSelectionNotice("Send or clear your current draft before restoring another message.");
+    return;
+  }
+  let targetConversation;
+  if (state.sessions.some((session) => session.sessionId === pending.sessionId)) {
+    targetConversation = conversationState(pending.sessionId);
+    const loaded = await loadConversation(pending.sessionId);
+    if (!loaded) {
+      return;
+    }
+  } else {
+    await startNewConversation();
+    if (state.activeSessionId) {
+      return;
+    }
+    targetConversation = state.composer;
+  }
+  if (currentComposerConversation() !== targetConversation) {
+    return;
+  }
+  if (hasDraft()) {
+    showSelectionNotice("This conversation already has a draft. Send or clear it before restoring another message.");
+    return;
+  }
+  const conversation = currentComposerConversation();
+  conversation.draft = pending.displayText;
+  conversation.attachments = pending.attachments;
+  conversation.selections = pending.selections;
+  conversation.nextSelectionNumber = Math.max(0,
+    ...pending.selections.map((selection) => selection.number)) + 1;
+  conversation.failedPendingSendId = pending.id;
+  elements.input.value = conversation.draft;
+  resizePromptInput();
+  renderAttachmentList();
+  renderSelectionList();
+  elements.input.focus();
+}
+
 function createConversationState(sessionId = null) {
   return {
     sessionId,
@@ -80,12 +231,17 @@ function createConversationState(sessionId = null) {
     nativeModeKnown: false,
     nativeEventIds: new Set(),
     pendingNativeMessages: [],
+    pendingSessionUpdates: [],
+    renderedSessionUpdates: new Set(),
     attachments: [],
     selections: [],
     nextSelectionNumber: 1,
     draft: "",
+    draftRevision: 0,
     promptQueue: [],
     pendingSubmissions: [],
+    creationRequest: null,
+    failedPendingSendId: null,
     syntheticMessageCounter: 0,
     lastStreamRole: null,
     currentTurnKey: null,
@@ -271,13 +427,17 @@ function writeSelectionMessageMetadata(protectedEntry = null) {
   }
 }
 
-function persistSelectionMessageMetadata(sessionId, promptText, displayText, selections) {
+function persistSelectionMessageMetadata(sessionId, promptText, displayText, selections, clientPromptId = null) {
   const entries = selectionMessageMetadata[sessionId] ?? [];
+  if (clientPromptId && entries.some((entry) => entry.clientPromptId === clientPromptId)) {
+    return true;
+  }
   selectionMessageMetadata[sessionId] = entries;
   const entry = {
     promptText,
     displayText,
     selections: selections.map(copySelectionReference),
+    ...(clientPromptId ? { clientPromptId } : {}),
     createdAt: Date.now()
   };
   entries.push(entry);
@@ -478,6 +638,7 @@ const state = {
   conversations: new Map(),
   composer: createConversationState(),
   activeSessionId: null,
+  requestScope: null,
   capabilities: {
     promptCapabilities: {
       image: false,
@@ -504,6 +665,7 @@ const state = {
   connectionLabel: "Connecting..."
 };
 const conversationCreationPromises = new WeakMap();
+let pendingSendsRestored = false;
 
 function conversationState(sessionId, create = true) {
   if (!sessionId) {
@@ -623,6 +785,7 @@ const elements = {
   emptyState: document.querySelector("#empty-state"),
   loadingState: document.querySelector("#loading-state"),
   composer: document.querySelector("#composer"),
+  pendingSendReviews: document.querySelector("#pending-send-reviews"),
   input: document.querySelector("#prompt-input"),
   attachmentList: document.querySelector("#attachment-list"),
   dropHint: document.querySelector("#drop-hint"),
@@ -1261,9 +1424,11 @@ async function loadContextDefaults(context, resetToCopilotDefaults = false) {
       state.composer === composer
     ) {
       composer.configurationBusy = false;
-      elements.send.disabled = composer.loading ||
-        composer.configurationBusy ||
-        composer.attachmentBusy;
+      if (currentComposerConversation() === composer) {
+        elements.send.disabled = composer.loading ||
+          composer.configurationBusy ||
+          composer.attachmentBusy;
+      }
       renderConfigurationControls();
     }
   }
@@ -1533,6 +1698,9 @@ async function api(path, options = {}) {
   if (!response.ok) {
     const error = new Error(typeof body.error === "string" ? body.error : `Request failed (${response.status})`);
     error.status = response.status;
+    if (typeof body.code === "string") {
+      error.code = body.code;
+    }
     throw error;
   }
   return body;
@@ -2882,6 +3050,7 @@ function nextSyntheticMessageKey(role, conversation = activeConversation() ?? st
 }
 
 function resetStreamTracking(conversation = activeConversation() ?? state.composer) {
+  conversation.renderedSessionUpdates.clear();
   conversation.syntheticMessageCounter = 0;
   conversation.lastStreamRole = null;
   conversation.currentTurnKey = null;
@@ -2984,18 +3153,53 @@ function createToolGroup(toolGroupKey) {
   };
 }
 
+function thinkingTextOverlap(older, newer) {
+  const length = Math.min(older.length, newer.length);
+  if (length === 0) {
+    return 0;
+  }
+  // Match a suffix to a prefix in linear time, including long repeated text.
+  const prefix = newer.slice(0, length);
+  const fallback = new Uint32Array(length);
+  for (let index = 1, matched = 0; index < length; index += 1) {
+    while (matched > 0 && prefix[index] !== prefix[matched]) {
+      matched = fallback[matched - 1];
+    }
+    if (prefix[index] === prefix[matched]) {
+      matched += 1;
+    }
+    fallback[index] = matched;
+  }
+  let matched = 0;
+  for (let index = older.length - length; index < older.length; index += 1) {
+    while (matched > 0 && older[index] !== prefix[matched]) {
+      matched = fallback[matched - 1];
+    }
+    if (older[index] === prefix[matched]) {
+      matched += 1;
+    }
+  }
+  return matched;
+}
+
+function mergeThinkingText(older, newer) {
+  if (!older) {
+    return newer;
+  }
+  if (!newer || older.includes(newer)) {
+    return older;
+  }
+  if (newer.includes(older)) {
+    return newer;
+  }
+  const overlap = thinkingTextOverlap(older, newer);
+  return overlap > 0 ? `${older}${newer.slice(overlap)}` : `${older}\n\n${newer}`;
+}
+
 function mergeToolGroupContents(older, newer, target) {
   const olderThinking = typeof older.thinkingText === "string" ? older.thinkingText : "";
   const newerThinking = typeof newer.thinkingText === "string" ? newer.thinkingText : "";
-  if (!olderThinking) {
-    target.thinkingText = newerThinking;
-  } else if (!newerThinking || olderThinking.includes(newerThinking)) {
-    target.thinkingText = olderThinking;
-  } else if (newerThinking.includes(olderThinking)) {
-    target.thinkingText = newerThinking;
-  } else {
-    target.thinkingText = `${olderThinking}\n\n${newerThinking}`;
-  }
+  target.thinkingText = mergeThinkingText(olderThinking, newerThinking);
 
   const activities = [];
   const activitiesById = new Map();
@@ -3108,16 +3312,29 @@ function upsertThinking(update, conversation = activeConversation() ?? state.com
 }
 
 function upsertToolActivity(update, conversation = activeConversation() ?? state.composer) {
-  const group = ensureToolGroup(conversation);
-
   const toolCallId = typeof update.toolCallId === "string" ||
     typeof update.toolCallId === "number"
     ? String(update.toolCallId)
-    : `anonymous-${group.toolActivities.length + 1}`;
-  let activity = group.toolActivities.find((item) => item.id === toolCallId);
+    : null;
+  let group = null;
+  if (toolCallId !== null) {
+    for (let index = conversation.messages.length - 1; index >= 0; index -= 1) {
+      const message = conversation.messages[index];
+      if (message.role === "user") {
+        break;
+      }
+      if (message.role === "tool" && message.toolActivities.some((item) => item.id === toolCallId)) {
+        group = message;
+        break;
+      }
+    }
+  }
+  group ??= ensureToolGroup(conversation);
+  const activityId = toolCallId ?? `anonymous-${group.toolActivities.length + 1}`;
+  let activity = group.toolActivities.find((item) => item.id === activityId);
   if (!activity) {
     activity = {
-      id: toolCallId,
+      id: activityId,
       title: "Copilot tool",
       status: "pending",
       detail: ""
@@ -4611,7 +4828,6 @@ function setBusy(value, conversation = activeConversation()) {
   if (!conversation) {
     return;
   }
-  touchSessionActivity(conversation.sessionId);
   conversation.busy = value;
   if (!value) {
     conversation.activePromptKey = null;
@@ -4781,6 +4997,9 @@ function setLoading(value, conversation = activeConversation()) {
     elements.cancel.disabled = !promptIsActive(conversation);
     updateAttachmentControls();
     renderConversationControls();
+    if (!value) {
+      pendingMessageUpdates.delete(conversation);
+    }
     renderMessages(conversation);
   }
 }
@@ -4984,11 +5203,19 @@ function upsertNativeReasoning(record, conversation, assistantMessage) {
   let group = conversation.messages[insertionIndex - 1]?.role === "tool"
     ? conversation.messages[insertionIndex - 1]
     : null;
-  // Live updates kept in the server's replay cache already carry this turn's reasoning.
+  applied.add(record.messageId);
+  // Cached thought chunks may be only a tail after replay-cache eviction.
   if (group?.acpThinking) {
+    const cached = group.thinkingText ?? "";
+    const merged = thinkingTextOverlap(reasoningText, cached) > 0
+      ? mergeThinkingText(reasoningText, cached)
+      : mergeThinkingText(cached, reasoningText);
+    if (merged !== group.thinkingText) {
+      group.thinkingText = merged;
+      scheduleMessagesRender(conversation, group);
+    }
     return;
   }
-  applied.add(record.messageId);
 
   let inserted = false;
   if (!group) {
@@ -5023,6 +5250,20 @@ function ingestNativeMessage(record, conversation) {
     return;
   }
   conversation.nativeEventIds.add(record.eventId);
+  if (record.role === "user" && record.completion === "completed" &&
+      typeof record.clientPromptId === "string") {
+    try {
+      const pending = readPendingSends().find((entry) => (
+        entry.id === record.clientPromptId && entry.sessionId === conversation.sessionId
+      ));
+      if (pending && pending.nativeMessageId !== record.messageId) {
+        pending.nativeMessageId = record.messageId;
+        savePendingSend(pending);
+      }
+    } catch (error) {
+      showError(new Error(`Unable to record message acceptance in browser storage: ${error.message}`), conversation);
+    }
+  }
 
   const key = nativeMessageKey(record);
   let index = conversation.messageKeys.get(key);
@@ -5037,6 +5278,7 @@ function ingestNativeMessage(record, conversation) {
   if (
     !message &&
     record.role === "assistant" &&
+    hasNativeContent(record) &&
     typeof record.clientPromptId === "string"
   ) {
     index = conversation.messages.findIndex((candidate) => (
@@ -5176,6 +5418,28 @@ function handleNativeMessage(params) {
     conversation.history = { hasMore: !conversation.loaded, cursor: null, oversized: false };
   }
   if (conversation.loading) {
+    if (Number.isSafeInteger(params.updateSequence)) {
+      const indexes = [];
+      conversation.pendingNativeMessages.forEach((message, index) => {
+        if (message.role === params.role && message.messageId === params.messageId) {
+          indexes.push(index);
+        }
+      });
+      const firstIndex = indexes[0];
+      const latestIndex = indexes.at(-1);
+      const latest = conversation.pendingNativeMessages[latestIndex];
+      if (latest?.completion === "completed" && params.completion !== "completed") {
+        return;
+      }
+      // Keep the first visible position and latest cumulative text, not every growing snapshot.
+      if (indexes.length > 1 || (firstIndex !== undefined &&
+          !hasNativeContent(conversation.pendingNativeMessages[firstIndex]))) {
+        conversation.pendingNativeMessages[latestIndex] = params;
+      } else {
+        conversation.pendingNativeMessages.push(params);
+      }
+      return;
+    }
     const previous = conversation.pendingNativeMessages.findIndex((message) => (
       message.role === params.role && message.messageId === params.messageId
     ));
@@ -5500,6 +5764,9 @@ function replayPagedNativeHistory(replayUpdates, nativeMessages, conversation) {
       continue;
     }
     if (update.sessionUpdate === "agent_thought_chunk") {
+      if (typeof params.afterMessageId === "string") {
+        handleSessionUpdate(params, conversation.sessionId, conversation);
+      }
       continue;
     }
     if (params.nativeCommand === true || params.nativeFallback === true || !role) {
@@ -5539,6 +5806,13 @@ function handleSessionUpdate(params, expectedSessionId = null, targetConversatio
   }
   const conversation = targetConversation ?? conversationState(sessionId);
   const update = params.update;
+  if (!targetConversation && conversation.loading && Number.isSafeInteger(params.updateSequence) && [
+    "user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call",
+    "tool_call_update", "plan"
+  ].includes(update.sessionUpdate)) {
+    conversation.pendingSessionUpdates.push(params);
+    return;
+  }
   if (conversation.newerHistoryHidden && [
     "user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call",
     "tool_call_update", "plan"
@@ -5560,6 +5834,19 @@ function handleSessionUpdate(params, expectedSessionId = null, targetConversatio
   ) {
     streamMessageKey(chatRole, update, conversation);
     return;
+  }
+  const appendsText = update.sessionUpdate === "agent_thought_chunk" ||
+    (chatRole && (!conversation.nativeMessagesActive || acpOnly));
+  const sourceSequence = params.sourceUpdateSequence ?? params.updateSequence;
+  if (appendsText && Number.isSafeInteger(sourceSequence)) {
+    const identity = `${params.updateScope ?? state.requestScope}:${sourceSequence}`;
+    if (conversation.renderedSessionUpdates.has(identity)) {
+      return;
+    }
+    conversation.renderedSessionUpdates.add(identity);
+    if (conversation.renderedSessionUpdates.size > 1000) {
+      conversation.renderedSessionUpdates.delete(conversation.renderedSessionUpdates.values().next().value);
+    }
   }
   switch (update.sessionUpdate) {
     case "user_message_chunk": {
@@ -6015,8 +6302,7 @@ async function refreshSessions() {
       promptId: promptState.promptId,
       lastActivityAt: latestTimestamp(
         previousSession?.lastActivityAt,
-        session.lastActivityAt ?? session.updatedAt,
-        promptState.busy ? new Date().toISOString() : undefined
+        session.lastActivityAt ?? session.updatedAt
       ),
       ...(conversation?.activeSessionTitleOverride
         ? { title: conversation.activeSessionTitleOverride }
@@ -6048,17 +6334,105 @@ async function restoreActiveConversation() {
   if (!sessionId) {
     return;
   }
-  if (!state.sessions.some((session) => session.sessionId === sessionId)) {
-    clearActiveSessionId();
-    return;
-  }
   const conversation = conversationState(sessionId, false);
   if (conversation?.loaded) {
     await reconcileConversationStatus(conversation);
   }
-  const loaded = await loadConversation(sessionId);
-  if (!loaded) {
-    clearActiveSessionId();
+  await loadConversation(sessionId);
+}
+
+async function restorePendingSends(entries, initialComposer = state.composer) {
+  if (pendingSendsRestored) {
+    return;
+  }
+  pendingSendsRestored = true;
+  const sessionsByCreation = new Map(entries.filter((entry) => (
+    entry.sessionId && entry.creation?.id
+  )).map((entry) => [entry.creation.id, entry.sessionId]));
+  const queues = new Map();
+  for (const entry of entries) {
+    const key = entry.sessionId ?? sessionsByCreation.get(entry.creation?.id) ?? entry.creation.id;
+    const queue = queues.get(key) ?? [];
+    queue.push(entry);
+    queues.set(key, queue);
+  }
+  await Promise.all([...queues.values()].map((queue) => (
+    restorePendingSendQueue(queue, initialComposer)
+  )));
+}
+
+async function restorePendingSendQueue(entries, initialComposer) {
+  for (const entry of entries) {
+    const pending = readPendingSends().find((candidate) => candidate.id === entry.id);
+    if (!pending) {
+      continue;
+    }
+    const restarted = pending.scope !== state.requestScope;
+    try {
+      if ((restarted || pending.reviewRequired === true) &&
+          typeof pending.nativeMessageId === "string") {
+        forgetPendingSend(pending.id);
+        continue;
+      }
+      if (pending.reviewRequired === true) {
+        renderPendingSendReviews(readPendingSends());
+        continue;
+      }
+      if (restarted) {
+        throw new Error("The server restarted. Review conversation history before resending the pending message.");
+      }
+      if (!pending.sessionId) {
+        const created = await api("/api/sessions", {
+          method: "POST",
+          headers: submissionHeaders(pending.creation.id, pending.scope),
+          body: JSON.stringify(pending.creation.body)
+        });
+        pending.sessionId = created.session.sessionId;
+        savePendingSend(pending);
+      }
+      conversationState(pending.sessionId);
+      if (pending.selections.length > 0) {
+        const persisted = persistSelectionMessageMetadata(
+          pending.sessionId, pending.text, pending.displayText, pending.selections, pending.id
+        );
+        if (!persisted) {
+          showSelectionNotice("Selected-message formatting could not be restored in browser storage.");
+        }
+      }
+      const completion = api(`/api/sessions/${encodeURIComponent(pending.sessionId)}/messages`, {
+        method: "POST",
+        headers: submissionHeaders(pending.id, pending.scope),
+        body: JSON.stringify(promptRequestBody(pending))
+      }).then(
+        (result) => ({ result }),
+        (error) => ({ error })
+      );
+      await refreshSessions();
+      if (state.composer === initialComposer &&
+          (!state.activeSessionId || state.activeSessionId === pending.sessionId)) {
+        saveActiveSessionId(pending.sessionId);
+        await loadConversation(pending.sessionId, undefined, true);
+      }
+      const outcome = await completion;
+      if (outcome.error) {
+        throw outcome.error;
+      }
+      await refreshSessions();
+      if (state.composer === initialComposer &&
+          (!state.activeSessionId || state.activeSessionId === pending.sessionId)) {
+        const conversation = conversationState(pending.sessionId);
+        await reconcileConversationStatus(conversation);
+        if (!conversation.loaded || !conversation.nativeMessagesActive) {
+          await loadConversation(pending.sessionId, undefined, true);
+        }
+      }
+      forgetPendingSend(pending.id);
+    } catch (error) {
+      if (restarted || error.status) {
+        retainPendingSendForReview(pending);
+      }
+      showError(error, currentComposerConversation());
+    }
   }
 }
 
@@ -6113,7 +6487,10 @@ async function reconcileKnownConversationStatuses(excludeSessionId = null) {
 
 function persistComposerDraft() {
   const conversation = currentComposerConversation();
-  conversation.draft = elements.input.value;
+  if (conversation.draft !== elements.input.value) {
+    conversation.draft = elements.input.value;
+    conversation.draftRevision += 1;
+  }
 }
 
 function saveActiveConversationScroll() {
@@ -6261,41 +6638,40 @@ function createServerConversation(sourceConversation = currentComposerConversati
 
 async function createServerConversationInternal(sourceConversation) {
   const previousConversation = sourceConversation;
-  const hasActiveSession = state.activeSessionId !== null;
-  const pendingDraft = hasActiveSession
-    ? ""
-    : sourceConversation === currentComposerConversation()
-      ? elements.input.value
-      : sourceConversation.draft;
-  const pendingAttachments = hasActiveSession
-    ? []
-    : sourceConversation.attachments.map((attachment) => ({ ...attachment }));
-  const pendingSelections = hasActiveSession
-    ? []
-    : sourceConversation.selections.map(copySelectionReference);
-  const pendingSelectionNumber = hasActiveSession
-    ? 1
-    : sourceConversation.nextSelectionNumber;
-  const configOverrides = hasActiveSession
-    ? {}
-    : selectedNewSessionConfigOverrides(sourceConversation);
+  const promoteComposer = sourceConversation.sessionId === null;
+  const configOverrides = promoteComposer
+    ? selectedNewSessionConfigOverrides(sourceConversation)
+    : {};
   const context = state.selectedContext;
+  // Replacing an existing conversation is a new creation, not a retry of the original one.
+  const creationRequest = promoteComposer ? sourceConversation.creationRequest : null;
   try {
     const result = await api("/api/sessions", {
       method: "POST",
-      body: JSON.stringify({
+      ...(creationRequest ? {
+        headers: submissionHeaders(creationRequest.id, state.requestScope)
+      } : {}),
+      body: JSON.stringify(creationRequest?.body ?? {
         context,
         configOverrides
       })
     });
+    sourceConversation.creationRequest = null;
+    if (currentComposerConversation() === sourceConversation) {
+      persistComposerDraft();
+    }
     const session = result.session;
     upsertSession(session);
-    const conversation = conversationState(session.sessionId);
+    const conversation = promoteComposer ? sourceConversation : conversationState(session.sessionId);
+    conversation.sessionId = session.sessionId;
+    state.conversations.set(session.sessionId, conversation);
     conversation.loaded = true;
-    conversation.draft = pendingDraft;
-    conversation.attachments = pendingAttachments;
-    conversation.selections = pendingSelections;
-    conversation.nextSelectionNumber = pendingSelectionNumber;
+    conversation.draft = sourceConversation.draft;
+    conversation.draftRevision = sourceConversation.draftRevision;
+    conversation.attachments = sourceConversation.attachments;
+    conversation.selections = sourceConversation.selections;
+    conversation.nextSelectionNumber = sourceConversation.nextSelectionNumber;
+    conversation.configurationBusy = false;
     conversation.activeSessionIsNew = true;
     conversation.activeSessionTitleOverride = null;
     conversation.messages = [];
@@ -6306,6 +6682,7 @@ async function createServerConversationInternal(sourceConversation) {
     conversation.nativeModeKnown = true;
     conversation.nativeEventIds.clear();
     conversation.pendingNativeMessages = [];
+    conversation.pendingSessionUpdates = [];
     conversation.promptQueue = [];
     resetRecoveredPrompt(conversation);
     resetStreamTracking(conversation);
@@ -6323,6 +6700,9 @@ async function createServerConversationInternal(sourceConversation) {
     }
     return conversation;
   } catch (error) {
+    if (error.status) {
+      sourceConversation.creationRequest = null;
+    }
     showError(error, previousConversation ?? state.composer);
     return null;
   }
@@ -6338,9 +6718,15 @@ function upsertSession(session) {
   }
   const conversation = conversationState(session.sessionId, false);
   const promptState = serverPromptStates.get(session.sessionId);
+  const previousSession = state.sessions.find((item) => item.sessionId === session.sessionId);
+  const lastActivityAt = latestTimestamp(
+    previousSession?.lastActivityAt,
+    session.lastActivityAt ?? session.updatedAt
+  );
   state.sessions = [
     {
       ...session,
+      ...(lastActivityAt ? { lastActivityAt } : {}),
       ...(promptState ? {
         busy: promptState.busy,
         promptId: promptState.promptId
@@ -6371,6 +6757,8 @@ function applySessionReplacement(result, previousSessionId) {
     conversation.sessionId = session.sessionId;
     conversation.nativeEventIds.clear();
     conversation.pendingNativeMessages = [];
+    conversation.pendingSessionUpdates = [];
+    conversation.renderedSessionUpdates.clear();
     if (typeof result.nativeMessageHistoryAvailable === "boolean") {
       conversation.nativeMessagesActive = result.nativeMessageHistoryAvailable;
       conversation.nativeModeKnown = true;
@@ -6523,6 +6911,9 @@ function applyHistoryPage(page, conversation, replace = false) {
   }
   conversation.history = page.history;
   conversation.historyError = "";
+  if (page.historyWarning) {
+    conversation.historyWarning = page.historyWarning;
+  }
   reindexMessages(conversation);
   if (isActiveConversation(conversation)) {
     if (replace) {
@@ -6643,17 +7034,34 @@ function hasVisibleConversationMessages(conversation) {
   return hasUserMessage || hasAssistantMessage;
 }
 
+function replayBufferedSessionEvents(conversation, snapshotSequence = null) {
+  const updates = [
+    ...conversation.pendingSessionUpdates,
+    ...conversation.pendingNativeMessages
+  ].filter((event) => (
+    !Number.isSafeInteger(snapshotSequence) ||
+    !Number.isSafeInteger(event.updateSequence) ||
+    event.updateSequence > snapshotSequence
+  )).sort((left, right) => (left.updateSequence ?? 0) - (right.updateSequence ?? 0));
+  conversation.pendingSessionUpdates = [];
+  conversation.pendingNativeMessages = [];
+  for (const event of updates) {
+    if (event.update) {
+      handleSessionUpdate(event, conversation.sessionId, conversation);
+    } else if (conversation.nativeMessagesActive) {
+      ingestNativeMessage(event, conversation);
+    }
+  }
+}
+
 // Without a requested context, the server reuses the conversation's last context.
-async function loadConversation(sessionId, requestedContext = undefined, force = false) {
+async function loadConversation(sessionId, requestedContext = undefined, force = false, throwOnError = false) {
   if (state.deletingSessionIds.has(sessionId)) {
     return false;
   }
   const session = state.sessions.find((item) => item.sessionId === sessionId);
-  if (!session) {
-    return false;
-  }
   const conversation = conversationState(sessionId);
-  if (typeof session.customTitle === "string" && session.customTitle.length > 0) {
+  if (typeof session?.customTitle === "string" && session.customTitle.length > 0) {
     conversation.activeSessionTitleOverride = session.customTitle;
     conversation.activeSessionIsNew = false;
   }
@@ -6661,7 +7069,7 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
     activateConversation(sessionId);
     return true;
   }
-  if (conversation.busy || conversation.recoveredPrompt) {
+  if (conversation.loaded && (conversation.busy || conversation.recoveredPrompt)) {
     if (force) {
       return false;
     }
@@ -6687,6 +7095,8 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
     nativeModeKnown: conversation.nativeModeKnown,
     nativeEventIds: new Set(conversation.nativeEventIds),
     pendingNativeMessages: [...conversation.pendingNativeMessages],
+    pendingSessionUpdates: [...conversation.pendingSessionUpdates],
+    renderedSessionUpdates: new Set(conversation.renderedSessionUpdates),
     history: conversation.history,
     historyError: conversation.historyError,
     newerHistoryHidden: conversation.newerHistoryHidden,
@@ -6715,6 +7125,7 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
   conversation.nativeModeKnown = false;
   conversation.nativeEventIds.clear();
   conversation.pendingNativeMessages = [];
+  conversation.pendingSessionUpdates = [];
   conversation.promptQueue = [];
   resetStreamTracking(conversation);
   resetUsage(conversation);
@@ -6734,6 +7145,7 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
       )
     });
     applySessionReplacement(result, sessionId);
+    upsertSession(result.session);
     const promptState = applyServerPromptState(conversation.sessionId, result, request);
     conversation.loaded = true;
     applySessionSetup(result, requestedContext ?? state.selectedContext, conversation);
@@ -6743,7 +7155,7 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
     ) {
       conversation.activeSessionTitleOverride = result.session.customTitle;
       conversation.activeSessionIsNew = false;
-      session.title = result.session.customTitle;
+      result.session.title = result.session.customTitle;
     }
     applySessionUsage(result.usage, conversation, usageRevision);
     const replayUpdates = Array.isArray(result.replayUpdates)
@@ -6762,44 +7174,65 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
     const nativeMessages = Array.isArray(result.nativeMessages)
       ? result.nativeMessages
       : [];
+    const replayMessages = new Map(nativeMessages.map((message) => [nativeMessageKey(message), message]));
+    for (const message of [
+      ...(Array.isArray(result.liveNativeMessages) ? result.liveNativeMessages : []),
+      ...conversation.pendingNativeMessages.filter((message) => (
+        !Number.isSafeInteger(result.updateSequence) ||
+        !Number.isSafeInteger(message.updateSequence) ||
+        message.updateSequence <= result.updateSequence
+      ))
+    ]) {
+      const current = replayMessages.get(nativeMessageKey(message));
+      if (!current || nativeMessageIsNewer(message, {
+        completed: current.completion === "completed",
+        nativeUpdatedAt: current.updatedAt,
+        nativeRevision: current.revision
+      })) {
+        replayMessages.set(nativeMessageKey(message), {
+          ...message,
+          ...(message.reasoningText === undefined && current?.reasoningText !== undefined
+            ? { reasoningText: current.reasoningText } : {})
+        });
+      } else if (message.clientPromptId && !current.clientPromptId) {
+        replayMessages.set(nativeMessageKey(message), { ...current, clientPromptId: message.clientPromptId });
+      }
+    }
+    const replayNativeMessages = [...replayMessages.values()];
     if (result.history?.replayMode === "acp") {
-      replayNativeHistory([...replayUpdates, ...liveReplayUpdates], nativeMessages, conversation);
+      replayNativeHistory([...replayUpdates, ...liveReplayUpdates], replayNativeMessages, conversation);
       const renderedChat = conversation.messages.some((message) => (
         (message.role === "user" || message.role === "assistant") &&
         ((typeof message.text === "string" && message.text.trim().length > 0) ||
           (Array.isArray(message.attachments) && message.attachments.length > 0))
       ));
-      if (!renderedChat && nativeMessages.some(hasNativeContent)) {
+      if (!renderedChat && replayNativeMessages.some(hasNativeContent)) {
         conversation.messages = [];
         conversation.messageKeys.clear();
         conversation.nativeEventIds.clear();
         resetStreamTracking(conversation);
         pendingMessageUpdates.delete(conversation);
-        replayPagedNativeHistory(replayUpdates, nativeMessages, conversation);
+        replayPagedNativeHistory(replayUpdates, replayNativeMessages, conversation);
         for (const params of liveReplayUpdates) {
           handleSessionUpdate(params, conversation.sessionId, conversation);
         }
       }
     } else if (result.history) {
-      replayPagedNativeHistory(replayUpdates, nativeMessages, conversation);
+      replayPagedNativeHistory(replayUpdates, replayNativeMessages, conversation);
       for (const params of liveReplayUpdates) {
         handleSessionUpdate(params, conversation.sessionId, conversation);
       }
     } else {
-      replayNativeHistory([...replayUpdates, ...liveReplayUpdates], nativeMessages, conversation);
+      replayNativeHistory([...replayUpdates, ...liveReplayUpdates], replayNativeMessages, conversation);
     }
     conversation.history = result.history ?? null;
     conversation.historyWarning = result.historyWarning ?? "";
-    const pendingNativeMessages = [
-      ...(Array.isArray(result.liveNativeMessages) ? result.liveNativeMessages : []),
-      ...conversation.pendingNativeMessages
-    ];
-    conversation.pendingNativeMessages = [];
     if (conversation.nativeMessagesActive) {
-      for (const nativeMessage of pendingNativeMessages) {
+      for (const nativeMessage of result.liveNativeMessages ?? []) {
         ingestNativeMessage(nativeMessage, conversation);
       }
     }
+    replayBufferedSessionEvents(conversation, result.updateSequence);
     const pendingCompletion = pendingPromptCompletions.get(conversation.sessionId);
     pendingPromptCompletions.delete(conversation.sessionId);
     let completionHandled = false;
@@ -6816,6 +7249,9 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
       }
     } else {
       resetRecoveredPrompt(conversation);
+      if (conversation.busy) {
+        setBusy(false, conversation);
+      }
     }
     if (
       !conversation.recoveredPrompt &&
@@ -6825,6 +7261,8 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
     }
     return true;
   } catch (error) {
+    const pendingNativeMessages = conversation.pendingNativeMessages;
+    const pendingSessionUpdates = conversation.pendingSessionUpdates;
     if (
       previousLoadState.loaded &&
       conversation.sessionId === previousLoadState.sessionId
@@ -6835,7 +7273,13 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
       conversation.nativeMessagesActive = previousLoadState.nativeMessagesActive;
       conversation.nativeModeKnown = previousLoadState.nativeModeKnown;
       conversation.nativeEventIds = previousLoadState.nativeEventIds;
-      conversation.pendingNativeMessages = previousLoadState.pendingNativeMessages;
+      conversation.pendingNativeMessages = [
+        ...previousLoadState.pendingNativeMessages, ...pendingNativeMessages
+      ];
+      conversation.pendingSessionUpdates = [
+        ...previousLoadState.pendingSessionUpdates, ...pendingSessionUpdates
+      ];
+      conversation.renderedSessionUpdates = previousLoadState.renderedSessionUpdates;
       conversation.history = previousLoadState.history;
       conversation.historyError = previousLoadState.historyError;
       conversation.newerHistoryHidden = previousLoadState.newerHistoryHidden;
@@ -6850,6 +7294,14 @@ async function loadConversation(sessionId, requestedContext = undefined, force =
       conversation.historyLoadPromise = null;
       renderUsage(conversation);
       renderConversationControls();
+    }
+    replayBufferedSessionEvents(conversation);
+    // Other failures keep the saved selection for retry; a missing conversation can never load.
+    if (error.status === 404 && readActiveSessionId() === sessionId) {
+      clearActiveSessionId();
+    }
+    if (throwOnError) {
+      throw error;
     }
     showError(error, conversation);
     return false;
@@ -7036,18 +7488,14 @@ async function drainPromptQueue(conversation = activeConversation()) {
         const result = await api(`/api/sessions/${encodeURIComponent(queuedPrompt.sessionId)}/messages`, {
           method: "POST",
           signal: controller.signal,
-          body: JSON.stringify({
-            text: queuedPrompt.text,
-            clientPromptId: queuedPrompt.messageKey,
-            reconnect: queuedPrompt.reconnect === true,
-            attachments: queuedPrompt.attachments.map(({ name, mimeType, size, data }) => ({
-              name,
-              mimeType,
-              size,
-              data
-            }))
-          })
+          ...(queuedPrompt.pendingSend ? {
+            headers: submissionHeaders(queuedPrompt.pendingSend.id, queuedPrompt.pendingSend.scope)
+          } : {}),
+          body: JSON.stringify(promptRequestBody(queuedPrompt))
         });
+        if (queuedPrompt.pendingSend) {
+          forgetPendingSend(queuedPrompt.pendingSend.id, conversation);
+        }
         if (conversation.promptRunId !== runId) {
           return;
         }
@@ -7061,6 +7509,12 @@ async function drainPromptQueue(conversation = activeConversation()) {
         }
         conversation.cancelRequested = false;
       } catch (error) {
+        if (queuedPrompt.pendingSend && error.code === "server-restarted") {
+          // The restarted server never received it; keep it for explicit review instead.
+          retainPendingSendForReview(queuedPrompt.pendingSend, conversation);
+        } else if (queuedPrompt.pendingSend && error.status) {
+          forgetPendingSend(queuedPrompt.pendingSend.id, conversation);
+        }
         if (conversation.promptRunId !== runId) {
           return;
         }
@@ -7086,6 +7540,17 @@ async function drainPromptQueue(conversation = activeConversation()) {
   } finally {
     conversation.drainPromise = null;
   }
+}
+
+function promptRequestBody(prompt) {
+  return {
+    text: prompt.text,
+    clientPromptId: prompt.messageKey ?? prompt.id,
+    reconnect: prompt.reconnect === true,
+    attachments: prompt.attachments.map(({ name, mimeType, size, data }) => ({
+      name, mimeType, size, data
+    }))
+  };
 }
 
 async function sendPrompt(event) {
@@ -7128,6 +7593,7 @@ function samePendingSubmission(left, right) {
 
 async function submitPrompt() {
   let conversation = currentComposerConversation();
+  persistComposerDraft();
   const text = elements.input.value;
   const selectionReferences = [...conversation.selections];
   const attachmentReferences = [...conversation.attachments];
@@ -7153,10 +7619,15 @@ async function submitPrompt() {
     setStatus("Attachments are not supported", conversation);
     return;
   }
+  if (!state.requestScope) {
+    showError(new Error("Copilot is still connecting. Wait for the connection before sending."), conversation);
+    return;
+  }
 
   const submissionConversation = conversation;
   const submission = {
     text,
+    draftRevision: conversation.draftRevision,
     attachments: attachmentReferences,
     selections: selectionReferences
   };
@@ -7166,25 +7637,78 @@ async function submitPrompt() {
     return;
   }
   submissionConversation.pendingSubmissions.push(submission);
+  let pendingSend = null;
+  let pendingSendWarning = null;
   try {
-    if (!state.activeSessionId) {
-      conversation = await createServerConversation(submissionConversation) ?? activeConversation();
+    if (!conversation.sessionId) {
+      conversation.creationRequest ??= {
+        id: crypto.randomUUID(),
+        body: {
+          context: state.selectedContext,
+          configOverrides: selectedNewSessionConfigOverrides(conversation)
+        }
+      };
+    }
+    pendingSend = {
+      id: crypto.randomUUID(),
+      scope: state.requestScope,
+      creation: conversation.creationRequest,
+      sessionId: conversation.sessionId,
+      text: promptText,
+      displayText,
+      attachments,
+      selections
+    };
+    try {
+      savePendingSend(pendingSend);
+      if (conversation.failedPendingSendId) {
+        forgetPendingSend(conversation.failedPendingSendId);
+        conversation.failedPendingSendId = null;
+      }
+    } catch (error) {
+      pendingSendWarning = new Error(
+        `Unable to preserve this message across a refresh. Keep this page open until sending finishes: ${error.message}`
+      );
+      showError(pendingSendWarning, conversation);
+      pendingSend = null;
+    }
+    if (!conversation.sessionId) {
+      conversation = await createServerConversation(submissionConversation);
     }
     if (!conversation?.sessionId) {
+      if (pendingSend) {
+        // A refresh can abort the response after the server accepted creation.
+        submissionConversation.failedPendingSendId = pendingSend.id;
+      }
       return;
     }
     if (conversation.newerHistoryHidden) {
-      const loaded = await loadConversation(conversation.sessionId, undefined, true);
+      const loaded = await loadConversation(conversation.sessionId, undefined, true, true);
       if (!loaded || currentComposerConversation() !== conversation) {
+        if (pendingSend) {
+          forgetPendingSend(pendingSend.id, submissionConversation);
+        }
         return;
       }
     }
-    if (conversation.activeSessionIsNew && conversation.messages.length === 0 &&
+    if (currentComposerConversation() === conversation &&
+        conversation.activeSessionIsNew && conversation.messages.length === 0 &&
         conversation.sessionContext !== state.selectedContext) {
-      conversation = await createServerConversation(conversation) ?? activeConversation();
+      conversation = await createServerConversation(conversation);
     }
     if (!conversation?.sessionId) {
+      if (pendingSend) {
+        submissionConversation.failedPendingSendId = pendingSend.id;
+      }
       return;
+    }
+    if (pendingSend) {
+      pendingSend.sessionId = conversation.sessionId;
+      savePendingSend(pendingSend);
+    } else if (pendingSendWarning && !conversation.messages.some((message) => (
+      message.role === "system" && message.text === pendingSendWarning.message
+    ))) {
+      showError(pendingSendWarning, conversation);
     }
 
     if (selections.length > 0) {
@@ -7192,7 +7716,8 @@ async function submitPrompt() {
         conversation.sessionId,
         promptText,
         displayText,
-        selections
+        selections,
+        pendingSend?.id
       );
       if (!persisted) {
         showSelectionNotice(
@@ -7200,15 +7725,36 @@ async function submitPrompt() {
         );
       }
     }
-    elements.input.value = "";
-    conversation.draft = "";
-    resizePromptInput();
-    conversation.attachments = [];
-    conversation.selections = [];
-    conversation.nextSelectionNumber = 1;
-    renderAttachmentList();
-    renderSelectionList();
-    enqueuePrompt(conversation, promptText, attachments, false, displayText, selections);
+    if (currentComposerConversation() === conversation) {
+      persistComposerDraft();
+    }
+    if (conversation.draftRevision === submission.draftRevision && conversation.draft === text) {
+      conversation.draft = "";
+      conversation.draftRevision += 1;
+    }
+    const sentAttachmentIds = new Set(attachmentReferences.map((attachment) => attachment.id));
+    const sentSelectionIds = new Set(selectionReferences.map((selection) => selection.id));
+    conversation.attachments = conversation.attachments.filter((attachment) => !sentAttachmentIds.has(attachment.id));
+    conversation.selections = conversation.selections.filter((selection) => !sentSelectionIds.has(selection.id));
+    if (conversation.selections.length === 0) {
+      conversation.nextSelectionNumber = 1;
+    }
+    if (currentComposerConversation() === conversation) {
+      elements.input.value = conversation.draft;
+      resizePromptInput();
+      renderAttachmentList();
+      renderSelectionList();
+    }
+    enqueuePrompt(conversation, promptText, attachments, false, displayText, selections, pendingSend);
+  } catch (error) {
+    if (pendingSend) {
+      if (error.status) {
+        forgetPendingSend(pendingSend.id, submissionConversation);
+      } else {
+        (conversation ?? submissionConversation).failedPendingSendId = pendingSend.id;
+      }
+    }
+    showError(error, conversation ?? submissionConversation);
   } finally {
     const submissionIndex = submissionConversation.pendingSubmissions.indexOf(submission);
     if (submissionIndex >= 0) {
@@ -7223,17 +7769,20 @@ function enqueuePrompt(
   attachments,
   reconnect = false,
   displayText = text,
-  selections = []
+  selections = [],
+  pendingSend = null
 ) {
-  const messageKey = nextSyntheticMessageKey("local-user", conversation);
+  const messageKey = pendingSend?.id ?? nextSyntheticMessageKey("local-user", conversation);
   const queuedPrompt = {
     sessionId: conversation.sessionId,
     text,
     displayText,
     attachments,
     messageKey,
-    reconnect
+    reconnect,
+    pendingSend
   };
+  touchSessionActivity(conversation.sessionId);
   addMessage("user", displayText, messageKey, attachments, conversation, selections);
   const messageIndex = conversation.messageKeys.get(messageKey);
   const optimisticMessage = Number.isInteger(messageIndex)
@@ -7359,6 +7908,15 @@ async function reconnectEvents() {
 }
 
 function connectEvents() {
+  const initialComposer = state.composer;
+  let pendingSends = [];
+  if (!pendingSendsRestored) {
+    try {
+      pendingSends = readPendingSends();
+    } catch (error) {
+      showError(new Error(`Unable to restore pending messages: ${error.message}`));
+    }
+  }
   const source = new EventSource("/api/events");
   eventSource = source;
   source.addEventListener("ready", (event) => {
@@ -7367,6 +7925,7 @@ function connectEvents() {
     }
     eventReconnectDelayMs = eventReconnectInitialDelayMs;
     const data = JSON.parse(event.data);
+    state.requestScope = data.requestScope;
     applyBranding(data.brandName, data.brandInitial);
     state.capabilities = data.capabilities ?? state.capabilities;
     state.projectsDirectory = data.projectsDirectory ?? "";
@@ -7383,6 +7942,7 @@ function connectEvents() {
         await refreshSessions();
         await reconcileKnownConversationStatuses(state.activeSessionId);
         await restoreActiveConversation();
+        await restorePendingSends(pendingSends, initialComposer);
       } catch (error) {
         showError(error);
       }
@@ -7693,6 +8253,7 @@ elements.voiceInput.addEventListener("click", () => {
 elements.input.addEventListener("input", () => {
   const conversation = currentComposerConversation();
   conversation.draft = elements.input.value;
+  conversation.draftRevision += 1;
   const session = voiceInputState.session;
   if (session?.conversation === conversation && !updateVoiceInputRangeAfterEdit(session, elements.input.value)) {
     void stopVoiceInput(session, {

@@ -148,6 +148,8 @@ function emitNativePrompt(request, sessionId, reply) {
   const promptText = prompt.find((block) => block.type === "text")?.text ?? "";
   const reasoningText = promptText === "stream-progress"
     ? "Live reasoning: checking the request."
+    : promptText === "evicted-thinking"
+      ? "First preserved reasoning. Last reasoning fragment."
     : undefined;
   const userMessageId = require("node:crypto").randomUUID();
   const assistantMessageId = require("node:crypto").randomUUID();
@@ -264,7 +266,8 @@ input.on("line", (line) => {
       };
       sessions.set(sessionId, session);
       commands(sessionId);
-      respond({ sessionId, configOptions: configOptions(session) });
+      setTimeout(() => respond({ sessionId, configOptions: configOptions(session) }),
+        Number(process.env.TEST_CREATION_DELAY_MS ?? 0));
       break;
     }
     case "session/load":
@@ -380,12 +383,27 @@ input.on("line", (line) => {
       }
       const reply = reload
         ? "MCP configuration reloaded and servers restarted."
+        : request.params.prompt[0]?.text === "acp-only-reply" ? "OKOK"
         : "Done.";
       // Like the CLI, commands such as /mcp reload record and emit no native messages.
       const nativeEvents = nativeMessages && !reload
         ? emitNativePrompt(request, request.params.sessionId, reply)
         : null;
-      if (request.params.prompt[0]?.text === "stream-progress") {
+      if (request.params.prompt[0]?.text === "evicted-thinking") {
+        update(request.params.sessionId, {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: "First preserved reasoning. " }
+        });
+        update(request.params.sessionId, {
+          sessionUpdate: "tool_call", toolCallId: "eviction-tool",
+          title: "Large tool result", status: "completed",
+          content: { type: "text", text: "x".repeat(600_000) }
+        });
+        update(request.params.sessionId, {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: "Last reasoning fragment." }
+        });
+      } else if (request.params.prompt[0]?.text === "stream-progress") {
         const thought = (text) => {
           if (streamThoughts) {
             update(request.params.sessionId, {
@@ -421,7 +439,12 @@ input.on("line", (line) => {
           });
           thought("Second round reasoning.");
         }, 500);
-      } else if (request.params.prompt[0]?.text === "interleaved-rounds") {
+      } else if (request.params.prompt[0]?.text === "interleaved-rounds" ||
+          request.params.prompt[0]?.text === "crossed-tool-update" ||
+          request.params.prompt[0]?.text === "streaming-crossed-tool-update") {
+        const crossedToolUpdate = request.params.prompt[0].text !== "interleaved-rounds";
+        const streamingIntermediate = request.params.prompt[0].text === "streaming-crossed-tool-update";
+        let secondRoundStarted = false;
         const thought = (text) => {
           if (streamThoughts) {
             update(request.params.sessionId, {
@@ -440,9 +463,26 @@ input.on("line", (line) => {
         thought("Round one: ");
         thought("inspect the code.");
         tool("round-one-tool", "Inspect code", "in_progress");
-        setTimeout(() => {
-          tool("round-one-tool", "Inspect code", "completed");
+        const startSecondRound = () => {
+          if (fs.existsSync(path.join(process.cwd(), "hold-tool-round"))) {
+            setTimeout(startSecondRound, 20);
+            return;
+          }
+          secondRoundStarted = true;
+          if (!crossedToolUpdate) {
+            tool("round-one-tool", "Inspect code", "completed");
+          }
           if (nativeMessages) {
+            if (streamingIntermediate) {
+              emitNativeEvent(request.params.sessionId, createNativeEvent(
+                "assistant.message_start", "intermediate-assistant", {}, 120
+              ));
+              for (const [index, character] of [..."Intermediate update."].entries()) {
+                emitNativeEvent(request.params.sessionId, createNativeEvent(
+                  "assistant.message_delta", "intermediate-assistant", { deltaContent: character }, 125 + index
+                ));
+              }
+            }
             emitNativeEvent(request.params.sessionId, createNativeEvent(
               "assistant.message",
               "intermediate-assistant",
@@ -459,14 +499,32 @@ input.on("line", (line) => {
             content: { type: "text", text: "Intermediate update." }
           });
           thought("Round two: run the tests.");
+          if (crossedToolUpdate) {
+            tool("round-one-tool", "Inspect code", "completed");
+          }
           tool("round-two-tool", "Run tests", "in_progress");
-        }, 300);
-        setTimeout(() => tool("round-two-tool", "Run tests", "completed"), 700);
+        };
+        setTimeout(startSecondRound, 300);
+        const completeSecondTool = () => {
+          if (!secondRoundStarted || fs.existsSync(path.join(process.cwd(), "hold-tool-round")) ||
+              fs.existsSync(path.join(process.cwd(), "hold-tool-completion"))) {
+            setTimeout(completeSecondTool, 20);
+            return;
+          }
+          tool("round-two-tool", "Run tests", "completed");
+        };
+        setTimeout(completeSecondTool, 700);
       }
       const delay = reload
         ? Number(process.env.TEST_MCP_RELOAD_DELAY_MS ?? 200)
         : Number(process.env.TEST_PROMPT_DELAY_MS ?? 20);
-      const timer = setTimeout(() => {
+      const finishPrompt = () => {
+        if (fs.existsSync(path.join(process.cwd(), "hold-prompt-completion"))) {
+          const deferred = setTimeout(finishPrompt, 20);
+          const pending = pendingNativePrompts.get(request.params.sessionId);
+          if (pending) pending.timer = deferred;
+          return;
+        }
         pendingNativePrompts.delete(request.params.sessionId);
         const emitAicUsage = (totalNanoAiu) => emitNativeEvent(request.params.sessionId, {
           id: require("node:crypto").randomUUID(),
@@ -481,17 +539,27 @@ input.on("line", (line) => {
         if (process.env.TEST_AIC_NOOP_USAGE_EVENT === "true") {
           emitAicUsage(0);
         }
-        if (nativeEvents) {
+        if (nativeEvents && request.params.prompt[0]?.text !== "acp-only-reply") {
           emitNativeEvent(request.params.sessionId, nativeEvents.delta);
           // A repeated final event must stay idempotent.
           emitNativeEvent(request.params.sessionId, nativeEvents.final, true, true);
         }
-        update(request.params.sessionId, {
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: reply }
-        });
-        respond({ stopReason: "end_turn" });
-      }, delay);
+        for (const text of request.params.prompt[0]?.text === "acp-only-reply" ? ["OK", "OK"] : [reply]) {
+          update(request.params.sessionId, {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text }
+          });
+        }
+        const respondWhenReady = () => {
+          if (fs.existsSync(path.join(process.cwd(), "hold-prompt-response"))) {
+            setTimeout(respondWhenReady, 20);
+            return;
+          }
+          respond({ stopReason: "end_turn" });
+        };
+        respondWhenReady();
+      };
+      const timer = setTimeout(finishPrompt, delay);
       if (nativeEvents) {
         pendingNativePrompts.set(request.params.sessionId, {
           timer,
@@ -557,7 +625,8 @@ input.on("line", (line) => {
           .map((name) => {
             const session = JSON.parse(fs.readFileSync(path.join(process.cwd(), name), "utf8"));
             return { sessionId: session.sessionId, cwd: process.cwd(), title: "Profile conversation" };
-          }) });
+          })
+          .filter((session) => !fs.existsSync(path.join(process.cwd(), "unlisted-" + session.sessionId))) });
         break;
       }
       if (nativeMessages) {
@@ -751,6 +820,7 @@ async function startTestServer(t: TestContext, options: {
   failReload?: boolean;
   existingSession?: boolean;
   commandDelayMs?: number;
+  creationDelayMs?: number;
   missingCommandMetadata?: boolean;
   loadDelayMs?: number;
   failRecoveryLoads?: boolean;
@@ -763,6 +833,7 @@ async function startTestServer(t: TestContext, options: {
   quotaCommand?: "success" | "failure" | "missing";
   aicUsageEvents?: number;
   aicNoopUsageEvent?: boolean;
+  sessionActivity?: Record<string, string>;
   nativeMessages?: boolean;
   nativeReplay?: boolean;
   nativeHistory?: {
@@ -787,6 +858,11 @@ async function startTestServer(t: TestContext, options: {
   await mkdir(home);
   await mkdir(projects);
   await mkdir(copilotHome);
+  if (options.sessionActivity) {
+    await mkdir(path.join(home, ".copilot-web"));
+    await writeFile(path.join(home, ".copilot-web", "session-activity.json"),
+      JSON.stringify(options.sessionActivity));
+  }
   await writeFile(fakeCommand, fakeCopilot);
   await chmod(fakeCommand, 0o700);
   await writeFile(fakeGitHubCommand, fakeGitHubCli);
@@ -821,6 +897,7 @@ async function startTestServer(t: TestContext, options: {
       TEST_MCP_COMMAND: String(options.advertiseMcp ?? true),
       TEST_MCP_RELOAD_ERROR: String(options.failReload ?? false),
       TEST_COMMAND_DELAY_MS: String(options.commandDelayMs ?? 0),
+      TEST_CREATION_DELAY_MS: String(options.creationDelayMs ?? 0),
       TEST_COMMAND_METADATA: options.missingCommandMetadata ? "missing" : "available",
       TEST_LOAD_DELAY_MS: String(options.loadDelayMs ?? 0),
       TEST_FAIL_RECOVERY_LOADS: String(options.failRecoveryLoads ?? false),
@@ -899,6 +976,46 @@ async function startTestServer(t: TestContext, options: {
     createSession,
     session: (id: string) => readFile(path.join(projects, `profile-session-${id}.json`), "utf8")
       .then((content) => JSON.parse(content) as unknown),
+    sessionListed: async (id: string, listed: boolean) => {
+      const marker = path.join(projects, `unlisted-${id}`);
+      if (listed) {
+        await rm(marker, { force: true });
+      } else {
+        await writeFile(marker, "");
+      }
+    },
+    pausePromptCompletion: async (paused: boolean) => {
+      const marker = path.join(projects, "hold-prompt-completion");
+      if (paused) {
+        await writeFile(marker, "");
+      } else {
+        await rm(marker, { force: true });
+      }
+    },
+    pauseToolRound: async (paused: boolean) => {
+      const marker = path.join(projects, "hold-tool-round");
+      if (paused) {
+        await writeFile(marker, "");
+      } else {
+        await rm(marker, { force: true });
+      }
+    },
+    pauseToolCompletion: async (paused: boolean) => {
+      const marker = path.join(projects, "hold-tool-completion");
+      if (paused) {
+        await writeFile(marker, "");
+      } else {
+        await rm(marker, { force: true });
+      }
+    },
+    pausePromptResponse: async (paused: boolean) => {
+      const marker = path.join(projects, "hold-prompt-response");
+      if (paused) {
+        await writeFile(marker, "");
+      } else {
+        await rm(marker, { force: true });
+      }
+    },
     copilotSettings: (settings: JsonObject) => writeFile(
       path.join(copilotHome, "settings.json"),
       JSON.stringify(settings)
@@ -1384,6 +1501,73 @@ test("preserves prompt text and attachments", async (t) => {
   );
 });
 
+test("retries conversation creation and prompts without repeating accepted work", async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true, promptDelayMs: 200, failReload: true
+  });
+  const stream = openEventStream(server.baseUrl, server.headers);
+  t.after(() => stream.close());
+  const deadline = Date.now() + 5_000;
+  while (!stream.events.some((event) => event.event === "ready")) {
+    assert.ok(Date.now() < deadline, "Event stream did not become ready");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const ready = stream.events.find((event) => event.event === "ready")?.data;
+  assert.ok(isRecord(ready) && typeof ready.requestScope === "string");
+  const post = (route: string, id: string, body: JsonObject, scope = ready.requestScope) => fetch(
+    `${server.baseUrl}${route}`, {
+      method: "POST",
+      headers: {
+        ...server.headers,
+        "X-Copilot-Request-Id": id,
+        "X-Copilot-Request-Scope": String(scope)
+      },
+      body: JSON.stringify(body)
+    }
+  );
+  const creationsBefore = (await server.requests())
+    .filter((request) => request.method === "session/new").length;
+  const creations = await Promise.all([
+    post("/api/sessions", "create-once", { context: "default" }),
+    post("/api/sessions", "create-once", { context: "default" })
+  ]);
+  assert.deepEqual(creations.map((response) => response.status), [201, 201]);
+  const created: unknown = await creations[0]?.json();
+  assert.ok(isRecord(created) && isRecord(created.session));
+  assert.deepEqual(await creations[1]?.json(), created);
+  assert.equal((await server.requests()).filter((request) => request.method === "session/new").length,
+    creationsBefore + 1);
+  const route = `/api/sessions/${String(created.session.sessionId)}/messages`;
+  const body = { text: "Send only once", clientPromptId: "prompt-once" };
+  const first = post(route, "prompt-once", body);
+  await server.waitForPrompt(body.text);
+  const duplicate = post(route, "prompt-once", body);
+  assert.equal((await post(route, "prompt-once", { ...body, text: "Different message" })).status, 409);
+  const replies = await Promise.all([first, duplicate]);
+  assert.deepEqual(replies.map((response) => response.status), [200, 200]);
+  assert.deepEqual(await replies[0]?.json(), await replies[1]?.json());
+  assert.equal((await post(route, "prompt-once", body)).status, 200);
+  assert.equal((await server.requests()).filter((request) => request.text === body.text).length, 1);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    assert.equal((await post(route, "failed-once", {
+      text: "/mcp reload", reconnect: true
+    })).status, 500);
+  }
+  assert.equal((await server.requests()).filter((request) => request.text === "/mcp reload").length, 1);
+  const stale = await post("/api/sessions", "stale-request", {}, "previous-server");
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json() as JsonObject).code, "server-restarted");
+  assert.equal((await post("/api/sessions", "invalid:identifier", {})).status, 400);
+  const invalid = { text: "Rejected", reconnect: "invalid" };
+  assert.equal((await post(route, "evicted-later", invalid)).status, 400);
+  assert.equal((await post(route, "evicted-later", { ...invalid, text: "Changed" })).status, 409);
+  for (let index = 0; index < 256; index += 1) {
+    assert.equal((await post(route, `newer-${index}`, invalid)).status, 400);
+  }
+  // The oldest settled result was evicted, so its identifier is no longer bound to the first body.
+  assert.equal((await post(route, "evicted-later", { ...invalid, text: "Changed" })).status, 400);
+});
+
 test("returns errors when the compose MCP reload fails", async (t) => {
   const server = await startTestServer(t, { failReload: true });
   const response = await server.post("messages", { text: "/mcp reload", reconnect: true });
@@ -1570,6 +1754,57 @@ test("does not read a persisted journal for an empty unprompted conversation", a
     0
   );
 });
+
+for (const oversized of [false, true]) {
+  test(`refreshes a new active conversation ${
+    oversized ? "without treating a bounded tail as complete" : "before its journal can be read"
+  }`, async (t) => {
+    const server = await startTestServer(t, {
+      nativeMessages: true,
+      nativeHistory: { readError: true },
+      promptDelayMs: 1_000
+    });
+    const stream = openEventStream(server.baseUrl, server.headers);
+    t.after(() => stream.close());
+    const deadline = Date.now() + 5_000;
+    while (!stream.events.some((event) => event.event === "ready")) {
+      assert.ok(Date.now() < deadline, "Event stream was not ready");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const text = "New live conversation";
+    const prompt = server.post("messages", {
+      text,
+      clientPromptId: "first-live-prompt",
+      ...(oversized ? { attachments: [{
+        name: "large.png", mimeType: "image/png", data: Buffer.alloc(160 * 1024, 1).toString("base64")
+      }] } : {})
+    });
+    await server.waitForPrompt(text);
+    while (!stream.events.some((event) => event.event === "native-message" &&
+      isRecord(event.data) && event.data.role === "user")) {
+      assert.ok(Date.now() < deadline, "Native user message was not received");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const response = await server.post("load", { historyPaging: true });
+    assert.equal(response.status, oversized ? 503 : 200);
+    const loaded: unknown = await response.json();
+    assert.ok(isRecord(loaded));
+    if (!oversized) {
+      assert.equal(loaded.busy, true);
+      assert.equal(loaded.nativeMessagesActive, true);
+      assert.ok(isRecord(loaded.history));
+      assert.equal(loaded.history.hasMore, false);
+      assert.ok(Array.isArray(loaded.nativeMessages));
+      assert.equal(loaded.nativeMessages.filter(isRecord)
+        .find((message) => message.role === "user")?.content, text);
+      assert.equal((await server.historyReads()).filter((request) =>
+        isRecord(request) && request.sessionId === server.sessionId).length, 0);
+    }
+    assert.equal((await prompt).status, 200);
+    assert.equal((await server.requests()).filter((request) => request.method === "session/prompt").length, 1);
+    assert.equal((await server.requests()).filter((request) => request.method === "session/load").length, 0);
+  });
+}
 
 function openEventStream(baseUrl: string, headers: Record<string, string>) {
   const controller = new AbortController();
@@ -2076,6 +2311,9 @@ async function startTestBrowser(t: TestContext, baseUrl: string, preloadScript?:
       if (Date.now() >= deadline) {
         const details = await evaluate(`({
           transcript: document.querySelector("#messages")?.textContent.slice(0, 2000),
+          cancelDisabled: document.querySelector("#cancel-prompt")?.disabled,
+          pending: JSON.parse(sessionStorage.getItem("copilot-web-pending-sends") ?? "[]")
+            .map(({ id, reviewRequired, nativeMessageId }) => ({ id, reviewRequired, nativeMessageId })),
           errors: window.testBrowserErrors
         })`);
         assert.fail(`Browser condition not met: ${expression}\n${JSON.stringify(details)}`);
@@ -3326,6 +3564,41 @@ const conversationLayout = `
   })
 `;
 
+test("keeps the active composer disabled when startup defaults finish during history loading", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      const response = await nativeFetch(resource, init);
+      if (resource.startsWith("/api/config") && !window.defaultsHeld) {
+        window.defaultsHeld = true;
+        await new Promise((resolve) => { window.releaseDefaults = resolve; });
+      } else if (resource.endsWith("/load") && init?.method === "POST") {
+        window.historyHeld = true;
+        await new Promise((resolve) => { window.releaseHistory = resolve; });
+      }
+      return response;
+    };
+  `);
+  await waitFor(`window.defaultsHeld === true &&
+    Boolean(document.querySelector('[data-session-id="${server.sessionId}"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="${server.sessionId}"]').click()`);
+  await waitFor(`window.historyHeld === true`);
+  await evaluate(`window.releaseDefaults();
+    new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+  assert.equal(await evaluate(`document.querySelector("#send-prompt").disabled`), true);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").disabled`), true);
+  await evaluate(`window.releaseHistory()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+    document.querySelector("#send-prompt").disabled === false &&
+    document.querySelector("#prompt-input").disabled === false`);
+  assert.equal((await server.requests()).some((entry) => entry.method === "session/prompt"), false);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
 test("streams reasoning and activities in real time, grouped between visible messages", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 60_000
@@ -3335,7 +3608,13 @@ test("streams reasoning and activities in real time, grouped between visible mes
       const server = await startTestServer(t, {
         nativeMessages,
         ...(nativeMessages ? { nativeHistory: { events: [] } } : {}),
-        promptDelayMs: 1_500
+        promptDelayMs: 20
+      });
+      await server.pauseToolRound(true);
+      await server.pausePromptCompletion(true);
+      registerResourceCleanup(t, async () => {
+        await server.pauseToolRound(false);
+        await server.pausePromptCompletion(false);
       });
       const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
       await waitFor(`Boolean(document.querySelector(
@@ -3344,7 +3623,9 @@ test("streams reasoning and activities in real time, grouped between visible mes
       await evaluate(`document.querySelector(
         'button.session-item[data-session-id="${server.sessionId}"]'
       ).click()`);
-      await waitFor(`!document.querySelector("#send-prompt").disabled`);
+      await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+        document.querySelector("#prompt-input").disabled === false &&
+        !document.querySelector("#send-prompt").disabled`);
       await evaluate(`
         (() => {
           const input = document.querySelector("#prompt-input");
@@ -3359,6 +3640,7 @@ test("streams reasoning and activities in real time, grouped between visible mes
         ["user", "interleaved-rounds"],
         ["tool", "Round one: inspect the code.", ["Inspect code:Running"]]
       ])`);
+      await server.pauseToolRound(false);
 
       // A visible response closes the first Thinking panel; later reasoning starts a new one.
       await waitFor(`JSON.stringify(${conversationLayout}) === JSON.stringify([
@@ -3367,6 +3649,7 @@ test("streams reasoning and activities in real time, grouped between visible mes
         ["assistant", "Intermediate update."],
         ["tool", "Round two: run the tests.", ["Run tests:Completed"]]
       ])`);
+      await server.pausePromptCompletion(false);
 
       const expected = [
         ["user", "interleaved-rounds"],
@@ -3387,6 +3670,467 @@ test("streams reasoning and activities in real time, grouped between visible mes
     });
   }
 });
+
+for (const duringHydration of [false, true]) {
+  test(`preserves active Thinking panels across refresh ${duringHydration ? "while activity arrives during hydration" : "in a paged existing conversation"
+    }`, {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 20_000
+  }, async (t) => {
+    const server = await startTestServer(t, {
+      existingSession: true,
+      nativeMessages: true,
+      nativeHistory: { events: longConversationEvents(60), readDelayMs: duringHydration ? 800 : 0 },
+      promptDelayMs: 20
+    });
+    await server.pausePromptCompletion(true);
+    const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+    await command("Emulation.setDeviceMetricsOverride", {
+      width: 1280, height: 1200, deviceScaleFactor: 1, mobile: false
+    }, sessionId);
+    await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+    await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+    await waitFor(`document.querySelector("#messages").textContent.includes("Stored message 59") &&
+    document.querySelector("#send-prompt").disabled === false`);
+    await evaluate(`
+    document.querySelector("#prompt-input").value = "interleaved-rounds";
+    document.querySelector("#composer").requestSubmit();
+  `);
+    const activeLayout = [
+      ["user", "interleaved-rounds"],
+      ["tool", "Round one: inspect the code.", ["Inspect code:Completed"]],
+      ["assistant", "Intermediate update."],
+      ["tool", "Round two: run the tests.", ["Run tests:Completed"]]
+    ];
+    const beforeRefresh = duringHydration ? [
+      ["user", "interleaved-rounds"],
+      ["tool", "Round one: inspect the code.", ["Inspect code:Running"]]
+    ] : activeLayout;
+    await waitFor(`JSON.stringify(${conversationLayout}) === ${JSON.stringify(JSON.stringify(beforeRefresh))}`);
+    for (let reload = 0; reload < 2; reload += 1) {
+      await evaluate(`window.beforeThinkingRefresh = true`);
+      await command("Page.reload", {}, sessionId);
+      await waitFor(`!window.beforeThinkingRefresh &&
+      document.querySelector("#messages")?.getAttribute("aria-busy") === "false" &&
+      document.querySelector("#messages").textContent.includes("Intermediate update.")`);
+      assert.deepEqual(await evaluate(conversationLayout), activeLayout);
+      assert.equal(await evaluate(`document.querySelector("#cancel-prompt").disabled`), false);
+    }
+    await server.pausePromptCompletion(false);
+    await waitFor(`document.querySelector("#cancel-prompt").disabled === true &&
+      sessionStorage.getItem("copilot-web-pending-sends") === null &&
+      document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+      document.querySelector("#messages").textContent.includes("Done.")`);
+    const completedLayout = [...activeLayout, ["assistant", "Done."]];
+    assert.deepEqual(await evaluate(conversationLayout), completedLayout);
+    await evaluate(`window.beforeCompletedRefresh = true`);
+    await command("Page.reload", {}, sessionId);
+    await waitFor(`!window.beforeCompletedRefresh &&
+    document.querySelector("#messages")?.getAttribute("aria-busy") === "false" &&
+    document.querySelector("#messages").textContent.includes("Done.")`);
+    assert.deepEqual(await evaluate(conversationLayout), completedLayout);
+    assert.equal((await server.requests()).filter((request) => request.method === "session/prompt").length, 1);
+    assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+  });
+}
+
+test("restores complete persisted reasoning after its initial cached chunks are evicted", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true, nativeMessages: true,
+    nativeHistory: { events: longConversationEvents(60) }, promptDelayMs: 200
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+    document.querySelector("#messages").textContent.includes("Stored message 59")`);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "evicted-thinking";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`document.querySelector("#messages").textContent.includes("First preserved reasoning.") &&
+    document.querySelector("#messages").textContent.includes("Done.") &&
+    document.querySelector("#cancel-prompt").disabled === true`);
+  const persisted = await server.nativeHistory();
+  assert.ok(JSON.stringify(persisted).includes("First preserved reasoning. Last reasoning fragment."));
+  for (let reload = 0; reload < 2; reload += 1) {
+    await evaluate(`window.beforeCacheRefresh = true`);
+    await command("Page.reload", {}, sessionId);
+    await waitFor(`!window.beforeCacheRefresh &&
+      document.querySelector("#messages")?.getAttribute("aria-busy") === "false" &&
+      document.querySelector("#messages").textContent.includes("evicted-thinking")`);
+    assert.deepEqual(await evaluate(`[...document.querySelectorAll(".thinking-content-text")]
+      .map((node) => node.textContent).filter((text) => text.includes("reasoning"))`),
+      ["First preserved reasoning. Last reasoning fragment."]);
+    assert.equal(await evaluate(`document.querySelectorAll(".message.assistant").length`), 10);
+  }
+  assert.equal((await server.requests()).filter((entry) => entry.text === "evicted-thinking").length, 1);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+for (const scenario of [
+  {
+    name: "cached suffix",
+    cached: "Last reasoning fragment.",
+    expected: "First preserved reasoning. Last reasoning fragment."
+  },
+  {
+    name: "cached prefix",
+    cached: "First preserved reasoning.",
+    expected: "First preserved reasoning. Last reasoning fragment."
+  },
+  {
+    name: "complete cached text and later thoughts",
+    cached: "First preserved reasoning. Last reasoning fragment. Additional live thought.",
+    expected: "First preserved reasoning. Last reasoning fragment. Additional live thought."
+  },
+  {
+    name: "overlapping cached tail and later thoughts",
+    cached: "Last reasoning fragment. Additional live thought.",
+    expected: "First preserved reasoning. Last reasoning fragment. Additional live thought."
+  },
+  {
+    name: "overlapping cached prefix and earlier thoughts",
+    cached: "Earlier reasoning. First preserved reasoning.",
+    expected: "Earlier reasoning. First preserved reasoning. Last reasoning fragment."
+  },
+  {
+    name: "long repeated overlap",
+    complete: `BEGIN ${"a".repeat(12_000)}`,
+    cached: `${"a".repeat(6_000)} END`,
+    expected: `BEGIN ${"a".repeat(12_000)} END`
+  },
+  {
+    name: "a Unicode overlap",
+    complete: "First \u03b1\u03b2\u03b3",
+    cached: "\u03b1\u03b2\u03b3 next",
+    expected: "First \u03b1\u03b2\u03b3 next"
+  }
+]) {
+  test(`merges complete saved reasoning with ${scenario.name}`, {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 20_000
+  }, async (t) => {
+    const completeReasoning = scenario.complete ?? "First preserved reasoning. Last reasoning fragment.";
+    const server = await startTestServer(t, {
+      existingSession: true, nativeMessages: true,
+      nativeHistory: { events: [
+        ...longConversationEvents(40),
+        nativeTranscriptEvent("user.message", "review-user", "Question", 42),
+        nativeTranscriptEvent("assistant.message", "review-assistant", "Answer", 43, {
+          reasoningText: completeReasoning
+        })
+      ] }
+    });
+    const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = async (resource, init) => {
+        const response = await nativeFetch(resource, init);
+        if (resource.endsWith("/load") && init?.method === "POST") {
+          const payload = await response.json();
+          const index = payload.replayUpdates.findIndex((entry) => entry.update?.messageId === "review-assistant");
+          payload.replayUpdates.splice(index, 0, {
+            sessionId: "session-1", afterMessageId: "review-user",
+            update: { sessionUpdate: "agent_thought_chunk",
+              content: { type: "text", text: ${JSON.stringify(scenario.cached)} } }
+          });
+          return new Response(JSON.stringify(payload), { status: 200, headers: response.headers });
+        }
+        return response;
+      };
+    `);
+    await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+    await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+    await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+      document.querySelector("#messages").textContent.includes("Answer")`);
+    assert.deepEqual(await evaluate(`[...document.querySelectorAll(".thinking-content-text")]
+      .map((node) => node.textContent)`), [
+      scenario.expected
+    ]);
+  });
+}
+
+for (const duringHydration of [false, true]) {
+  test(`restores one activity when its completion follows another reply${
+    duringHydration ? " during hydration" : ""
+  }`, {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 20_000
+  }, async (t) => {
+    const server = await startTestServer(t, {
+      existingSession: true, nativeMessages: true,
+      nativeHistory: { events: longConversationEvents(60), readDelayMs: duringHydration ? 500 : 0 },
+      promptDelayMs: 20
+    });
+    await server.pausePromptCompletion(true);
+    const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+    await command("Emulation.setDeviceMetricsOverride", {
+      width: 1280, height: 1200, deviceScaleFactor: 1, mobile: false
+    }, sessionId);
+    await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+    await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+    await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+      document.querySelector("#messages").textContent.includes("Stored message 59")`);
+    await evaluate(`
+      document.querySelector("#prompt-input").value = "crossed-tool-update";
+      document.querySelector("#composer").requestSubmit();
+    `);
+    const active = [
+      ["user", "crossed-tool-update"],
+      ["tool", "Round one: inspect the code.", ["Inspect code:Completed"]],
+      ["assistant", "Intermediate update."],
+      ["tool", "Round two: run the tests.", ["Run tests:Completed"]]
+    ];
+    await waitFor(duringHydration
+      ? `document.querySelector(".tool-activity-status")?.textContent === "Running"`
+      : `JSON.stringify(${conversationLayout}) === ${JSON.stringify(JSON.stringify(active))}`);
+    await evaluate(`window.beforeToolRefresh = true`);
+    await command("Page.reload", {}, sessionId);
+    await waitFor(`!window.beforeToolRefresh &&
+      document.querySelector("#messages")?.getAttribute("aria-busy") === "false" &&
+      document.querySelector("#messages").textContent.includes("Intermediate update.")`);
+    await waitFor(`JSON.stringify(${conversationLayout}) === ${JSON.stringify(JSON.stringify(active))}`);
+    await server.pausePromptCompletion(false);
+    await waitFor(`document.querySelector("#messages").textContent.includes("Done.") &&
+      document.querySelector("#cancel-prompt").disabled === true &&
+      sessionStorage.getItem("copilot-web-pending-sends") === null`);
+    const completed = [...active, ["assistant", "Done."]];
+    assert.deepEqual(await evaluate(conversationLayout), completed);
+    await evaluate(`window.beforeCompletedToolRefresh = true`);
+    await command("Page.reload", {}, sessionId);
+    await waitFor(`!window.beforeCompletedToolRefresh &&
+      document.querySelector("#messages")?.getAttribute("aria-busy") === "false" &&
+      document.querySelector("#messages").textContent.includes("Done.")`);
+    assert.deepEqual(await evaluate(conversationLayout), completed);
+    assert.equal((await server.requests()).filter((entry) => entry.text === "crossed-tool-update").length, 1);
+    assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+  });
+}
+
+test("keeps persisted reasoning when a newer live message snapshot omits it", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: { events: [
+      nativeTranscriptEvent("user.message", "reasoning-user", "A historical question", 0),
+      nativeTranscriptEvent("assistant.message", "reasoning-assistant", "A historical answer", 1, {
+        reasoningText: "Persisted reasoning must survive."
+      })
+    ] }
+  });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      const response = await nativeFetch(resource, init);
+      if (resource.endsWith("/load") && init?.method === "POST") {
+        const payload = await response.json();
+        const assistant = payload.nativeMessages.find((message) => message.role === "assistant");
+        payload.liveNativeMessages = [{
+          ...assistant, revision: assistant.revision + 1, reasoningText: undefined
+        }];
+        return new Response(JSON.stringify(payload), { status: response.status, headers: response.headers });
+      }
+      return response;
+    };
+  `);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+    document.querySelector("#messages").textContent.includes("A historical answer")`);
+  assert.equal(await evaluate(`document.querySelector(".thinking-content-text")?.textContent`),
+    "Persisted reasoning must survive.");
+  assert.equal(await evaluate(`document.querySelectorAll(".message.assistant").length`), 1);
+});
+
+for (const timing of ["completion", "new round", "streaming native round", "failed snapshot"]) {
+  test(`retains post-snapshot native messages and activity: ${timing}`, {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 25_000
+  }, async (t) => {
+    const server = await startTestServer(t, {
+      existingSession: true, nativeMessages: true,
+      nativeHistory: { events: longConversationEvents(60) }, promptDelayMs: 20
+    });
+    await server.pausePromptCompletion(true);
+    await server.pauseToolCompletion(true);
+    await server.pauseToolRound(timing !== "completion");
+    const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = async (resource, init) => {
+        const response = await nativeFetch(resource, init);
+        if (resource.endsWith("/load") && init?.method === "POST" &&
+            sessionStorage.getItem("hold-snapshot")) {
+          sessionStorage.removeItem("hold-snapshot");
+          const text = await response.text();
+          window.snapshotSequence = JSON.parse(text).updateSequence;
+          window.snapshotHeld = true;
+          await new Promise((resolve) => { window.releaseSnapshot = resolve; });
+          return new Response(${JSON.stringify(timing)} === "failed snapshot"
+            ? JSON.stringify({ error: "Snapshot response unavailable" }) : text,
+            { status: ${timing === "failed snapshot" ? 503 : 200},
+              headers: response.headers });
+        }
+        return response;
+      };
+      const NativeEventSource = window.EventSource;
+      window.EventSource = class extends NativeEventSource {
+        constructor(...args) {
+          super(...args);
+          this.addEventListener("session-update", (event) => {
+            const value = JSON.parse(event.data);
+            if (value.update?.toolCallId === "round-two-tool" && value.update.status === "completed") {
+              window.completedToolSequence = value.updateSequence;
+            }
+          });
+        }
+      };
+    `);
+    try {
+      await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+      await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+      await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+        document.querySelector("#messages").textContent.includes("Stored message 59")`);
+      const text = timing === "streaming native round" ? "streaming-crossed-tool-update" : "crossed-tool-update";
+      const prompt = server.post("messages", {
+        text, clientPromptId: `snapshot-${timing.replaceAll(" ", "-")}`
+      });
+      await waitFor(`[...document.querySelectorAll(".tool-activity-item")].some((item) =>
+        item.querySelector(".tool-activity-title")?.textContent === ${
+          JSON.stringify(timing === "completion" ? "Run tests" : "Inspect code")
+        } && item.querySelector(".tool-activity-status")?.textContent === "Running")`);
+      await evaluate(`sessionStorage.setItem("hold-snapshot", "true")`);
+      await command("Page.reload", {}, sessionId);
+      await waitFor(`window.snapshotHeld === true`);
+      await server.pauseToolRound(false);
+      await server.pauseToolCompletion(false);
+      await waitFor(`Number.isSafeInteger(window.completedToolSequence) &&
+        window.completedToolSequence > window.snapshotSequence`);
+      await evaluate(`window.releaseSnapshot()`);
+      await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+        document.querySelector("#messages").textContent.includes("Intermediate update.")`);
+      assert.equal(await evaluate(`[...document.querySelectorAll(".tool-activity-item")]
+        .find((item) => item.querySelector(".tool-activity-title")?.textContent === "Run tests")
+        ?.querySelector(".tool-activity-status")?.textContent`), "Completed");
+      if (timing === "failed snapshot") {
+        assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes(
+          "Snapshot response unavailable")`), true);
+        await evaluate(`window.beforeRetry = true`);
+        await command("Page.reload", {}, sessionId);
+        await waitFor(`!window.beforeRetry &&
+          document.querySelector("#messages")?.getAttribute("aria-busy") === "false" &&
+          document.querySelector("#messages").textContent.includes("Intermediate update.")`);
+      }
+      const activeLayout = [
+        ["user", text],
+        ["tool", "Round one: inspect the code.", ["Inspect code:Completed"]],
+        ["assistant", "Intermediate update."],
+        ["tool", "Round two: run the tests.", ["Run tests:Completed"]]
+      ];
+      assert.deepEqual(await evaluate(conversationLayout), activeLayout);
+      await server.pausePromptCompletion(false);
+      assert.equal((await prompt).status, 200);
+      await waitFor(`document.querySelector("#messages").textContent.includes("Done.") &&
+        document.querySelector("#cancel-prompt").disabled === true`);
+      assert.deepEqual(await evaluate(conversationLayout), [...activeLayout, ["assistant", "Done."]]);
+      assert.equal((await server.requests()).filter((entry) => entry.method === "session/prompt").length, 1);
+      assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+    } finally {
+      await server.pausePromptCompletion(false);
+      await server.pauseToolRound(false);
+      await server.pauseToolCompletion(false);
+    }
+  });
+}
+
+for (const input of ["/mcp reload", "acp-only-reply"]) {
+  for (const paged of [false, true]) {
+    test(`restores ${input === "/mcp reload" ? "an active command" : "an unpersisted assistant"} reply once across snapshot and completion fallback${paged ? " with paged history" : ""
+      }`, {
+      skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+      timeout: 20_000
+    }, async (t) => {
+      const server = await startTestServer(t, {
+        existingSession: true, nativeMessages: true,
+        nativeHistory: { events: paged ? longConversationEvents(60) : nativeHistoryEvents() }, reloadDelayMs: 20
+      });
+      await server.pausePromptResponse(true);
+      const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const NativeEventSource = window.EventSource;
+    window.EventSource = class extends NativeEventSource {
+      constructor(...args) {
+        super(...args);
+        window.commandOutputEvents = [];
+        this.addEventListener("session-update", (event) => {
+          const value = JSON.parse(event.data);
+          if (JSON.stringify(value.update).includes(${JSON.stringify(input === "/mcp reload" ? "MCP configuration reloaded" : "OK")})) {
+            window.commandOutputReceived = true;
+            window.commandOutputEvents.push(value);
+          }
+        });
+      }
+    };
+  `);
+      try {
+        await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+        await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+        await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+      document.querySelector("#messages").textContent.includes(${JSON.stringify(paged ? "Stored message 59" : "Native historical reply")
+          })`);
+        if (input === "/mcp reload") {
+          await evaluate(`document.querySelector("#reconnect-tools").click()`);
+        } else {
+          await evaluate(`
+        document.querySelector("#prompt-input").value = ${JSON.stringify(input)};
+        document.querySelector("#composer").requestSubmit();
+      `);
+        }
+        await waitFor(`window.commandOutputReceived === true`);
+        await evaluate(`window.beforeCommandRefresh = true`);
+        await command("Page.reload", {}, sessionId);
+        await waitFor(`!window.beforeCommandRefresh &&
+      document.querySelector("#messages")?.getAttribute("aria-busy") === "false" &&
+      document.querySelector("#cancel-prompt").disabled === false`);
+        const reply = input === "/mcp reload" ? "MCP configuration reloaded and servers restarted." : "OKOK";
+        if (!paged && input === "/mcp reload") {
+          await waitFor(`document.querySelector("#messages").textContent.includes(${JSON.stringify(reply)})`);
+        }
+        await server.pausePromptResponse(false);
+        await waitFor(`document.querySelector("#cancel-prompt").disabled === true &&
+      document.querySelector("#messages").textContent.includes(${JSON.stringify(reply)})`);
+        await evaluate(`new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+        assert.deepEqual(await evaluate(`[...document.querySelectorAll(".message.assistant .message-body")]
+      .filter((node) => node.textContent.includes(${JSON.stringify(reply)}))
+      .map((node) => node.textContent)`), [reply]);
+        assert.deepEqual(await evaluate(`window.commandOutputEvents.map((value) => [
+      Number.isSafeInteger(value.sourceUpdateSequence),
+      value.updateSequence > value.sourceUpdateSequence,
+      value.${input === "/mcp reload" ? "nativeCommand" : "nativeFallback"}
+    ])`), Array.from({ length: input === "/mcp reload" ? 1 : 2 }, () => [true, true, true]));
+        assert.equal(await evaluate(`[...document.querySelectorAll(".message.user .message-body")]
+      .filter((node) => node.textContent === ${JSON.stringify(input)}).length`), 1);
+        assert.equal((await server.requests()).filter((entry) => entry.text === input).length, 1);
+        await evaluate(`window.beforeCompletedReplyRefresh = true`);
+        await command("Page.reload", {}, sessionId);
+        await waitFor(`!window.beforeCompletedReplyRefresh &&
+      document.querySelector("#messages")?.getAttribute("aria-busy") === "false" &&
+      document.querySelector("#messages").textContent.includes(${JSON.stringify(reply)})`);
+        await evaluate(`new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+        assert.deepEqual(await evaluate(`[...document.querySelectorAll(".message.assistant .message-body")]
+      .filter((node) => node.textContent.includes(${JSON.stringify(reply)}))
+      .map((node) => node.textContent)`), [reply]);
+        assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+      } finally {
+        await server.pausePromptResponse(false);
+      }
+    });
+  }
+}
 
 test("groups persisted reasoning from consecutive tool rounds into one Thinking panel", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
@@ -4954,6 +5698,1214 @@ function composerHelpers(command: Awaited<ReturnType<typeof startTestBrowser>>["
   return { type, press, shift: 8, meta: process.platform === "darwin" ? 4 : 2 };
 }
 
+test("keeps conversation times and ordering unchanged when selecting and restoring history", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const originalActivity = "2026-10-01T10:00:00.000Z";
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: { events: nativeHistoryEvents() },
+    sessionActivity: { "session-1": originalActivity }
+  });
+  const createdResponse = await fetch(`${server.baseUrl}/api/sessions`, {
+    method: "POST", headers: server.headers, body: "{}"
+  });
+  assert.equal(createdResponse.status, 201);
+  const created: unknown = await createdResponse.json();
+  assert.ok(isRecord(created) && isRecord(created.session));
+  const newerId = String(created.session.sessionId);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`document.querySelectorAll(".session-item").length === 2`);
+  const order = `[...document.querySelectorAll(".session-item")].map((item) => item.dataset.sessionId)`;
+  const oldTime = `document.querySelector('[data-session-id="session-1"] .session-meta')?.textContent`;
+  assert.deepEqual(await evaluate(order), [newerId, "session-1"]);
+  const originalLabel = await evaluate(oldTime);
+  assert.notEqual(originalLabel, "just now");
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages")?.textContent.includes("Native historical reply") &&
+    document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  assert.deepEqual(await evaluate(order), [newerId, "session-1"]);
+  assert.equal(await evaluate(oldTime), originalLabel);
+  const persistedActivity = await server.metadata("session-activity.json");
+  assert.ok(isRecord(persistedActivity));
+  assert.equal(persistedActivity["session-1"], originalActivity);
+  await evaluate(`window.beforeRefresh = true`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeRefresh &&
+    document.querySelector("#messages")?.textContent.includes("Native historical reply") &&
+    document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  assert.deepEqual(await evaluate(order), [newerId, "session-1"]);
+  assert.equal(await evaluate(oldTime), originalLabel);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "A genuine new activity";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`document.querySelector(".session-item")?.dataset.sessionId === "session-1" &&
+    document.querySelector('[data-session-id="session-1"] .session-meta')?.textContent === "just now" &&
+    document.querySelector("#messages")?.textContent.includes("Done.")`);
+  await server.waitForPrompt("A genuine new activity");
+});
+
+test("keeps historical usage replay read-only while accepting genuine new usage", async (t) => {
+  const originalActivity = "2026-10-01T10:00:00.000Z";
+  const history: JsonObject[] = [
+    ...nativeHistoryEvents(),
+    { type: "assistant.usage", id: "old-usage", timestamp: originalActivity,
+      data: { copilotUsage: { totalNanoAiu: 2_000_000_000 } } },
+    { type: "session.usage_checkpoint", id: "old-checkpoint", timestamp: originalActivity,
+      data: { totalNanoAiu: 9_000_000_000 } },
+    { type: "session.session_limits_changed", id: "old-limit", timestamp: originalActivity,
+      data: { sessionLimits: { maxAiCredits: 100 } } }
+  ];
+  const server = await startTestServer(t, {
+    existingSession: true, nativeMessages: true, nativeReplay: true,
+    sessionActivity: { "session-1": originalActivity },
+    nativeHistory: { events: history }, aicUsageEvents: 1
+  });
+  const stream = openEventStream(server.baseUrl, server.headers);
+  t.after(() => stream.close());
+  const deadline = Date.now() + 5_000;
+  while (!stream.events.some((event) => event.event === "ready")) {
+    assert.ok(Date.now() < deadline, "Event stream was not ready");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const response = await server.post("load", { historyPaging: true });
+  assert.equal(response.status, 200);
+  const loaded: unknown = await response.json();
+  assert.ok(isRecord(loaded) && isRecord(loaded.session));
+  assert.equal(loaded.session.lastActivityAt, originalActivity);
+  assert.equal(loaded.usage, null);
+  assert.equal(stream.events.some((event) => event.event === "session-activity"), false);
+  assert.equal(stream.events.some((event) => {
+    const data = event.data;
+    return event.event === "session-event" && isRecord(data) &&
+      history.some((old) => old.type === data.type);
+  }), false);
+  const listingResponse = await fetch(`${server.baseUrl}/api/sessions`, { headers: server.headers });
+  const listing: unknown = await listingResponse.json();
+  assert.ok(isRecord(listing) && Array.isArray(listing.sessions));
+  assert.equal(listing.sessions.find((session) => isRecord(session) &&
+    session.sessionId === server.sessionId)?.lastActivityAt, originalActivity);
+  assert.equal((await server.post("messages", { text: "Genuine new activity" })).status, 200);
+  const liveResponse = await server.post("load", { historyPaging: true });
+  assert.equal(liveResponse.status, 200);
+  const liveSnapshot: unknown = await liveResponse.json();
+  assert.ok(isRecord(liveSnapshot) && isRecord(liveSnapshot.usage) && isRecord(liveSnapshot.session));
+  assert.equal(liveSnapshot.usage.aicNano, 1_000_000_000);
+  assert.notEqual(liveSnapshot.session.lastActivityAt, originalActivity);
+  const switched = await server.post("load", { historyPaging: true, context: "long_context" });
+  assert.equal(switched.status, 200);
+  const afterReplay: unknown = await switched.json();
+  assert.ok(isRecord(afterReplay) && isRecord(afterReplay.session));
+  assert.equal(afterReplay.session.lastActivityAt, liveSnapshot.session.lastActivityAt);
+  assert.deepEqual(afterReplay.usage, { aicNano: 1_000_000_000, aicLimit: null });
+  assert.equal((await server.requests()).filter((request) => request.method === "session/prompt").length, 1);
+});
+
+test("preserves newer activity when a delayed history response arrives", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: { events: nativeHistoryEvents() },
+    sessionActivity: { "session-1": "2026-10-01T10:00:00.000Z" },
+    promptDelayMs: 1_500
+  });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      const response = await nativeFetch(resource, init);
+      if (resource.endsWith("/load") && init?.method === "POST") {
+        const body = await response.text();
+        window.historyResponseHeld = true;
+        await new Promise((resolve) => { window.releaseHistory = resolve; });
+        return new Response(body, { status: response.status, headers: response.headers });
+      }
+      return response;
+    };
+  `);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`window.historyResponseHeld === true`);
+  const remote = server.post("messages", { text: "New activity after the history snapshot" });
+  await server.waitForPrompt("New activity after the history snapshot");
+  await waitFor(`document.querySelector('[data-session-id="session-1"] .session-meta').textContent === "just now"`);
+  await evaluate(`window.releaseHistory()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  const label = await evaluate(`document.querySelector('[data-session-id="session-1"] .session-meta').textContent`);
+  assert.equal((await remote).status, 200);
+  assert.equal(label, "just now");
+});
+
+test("respects opening a new conversation while pending-send recovery waits for the session list", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true,
+    nativeMessages: true,
+    nativeHistory: {},
+    promptDelayMs: 2_500
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      if (resource.endsWith("/messages") && init?.method === "POST" &&
+          sessionStorage.getItem("hold-recovery-list")) {
+        window.recoveryPosted = true;
+      }
+      const response = await nativeFetch(resource, init);
+      if (resource === "/api/sessions" && (init?.method ?? "GET") === "GET" &&
+          window.recoveryPosted && sessionStorage.getItem("hold-recovery-list")) {
+        sessionStorage.removeItem("hold-recovery-list");
+        const body = await response.text();
+        window.recoveryListHeld = true;
+        await new Promise((resolve) => { window.releaseRecoveryList = resolve; });
+        return new Response(body, { status: response.status, headers: response.headers });
+      }
+      return response;
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Recover in the background";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await server.waitForPrompt("Recover in the background");
+  await evaluate(`sessionStorage.setItem("hold-recovery-list", "true")`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`window.recoveryListHeld === true`);
+  await evaluate(`
+    document.querySelector("#new-chat").click();
+    document.querySelector("#prompt-input").value = "My new unsent draft";
+    document.querySelector("#prompt-input").dispatchEvent(new Event("input", { bubbles: true }));
+    window.releaseRecoveryList();
+  `);
+  await waitFor(`sessionStorage.getItem("copilot-web-pending-sends") === null`);
+  assert.equal(await evaluate(`localStorage.getItem("copilot-web-active-session")`), null);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "My new unsent draft");
+});
+
+for (const edit of ["later text", "same text retyped", "programmatic edit", "queued follow-up"]) {
+  test(`keeps the original send and later composer edits distinct: ${edit}`, {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 20_000
+  }, async (t) => {
+    const server = await startTestServer(t, {
+      profileSessions: true, nativeMessages: true, nativeHistory: {}
+    });
+    const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = async (resource, init) => {
+        const response = await nativeFetch(resource, init);
+        if (resource === "/api/sessions" && init?.method === "POST") {
+          window.creationHeldForTyping = true;
+          await new Promise((resolve) => { window.releaseCreationForTyping = resolve; });
+        }
+        return response;
+      };
+    `);
+    await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+    await evaluate(`
+      document.querySelector("#prompt-input").value = "Original prompt";
+      document.querySelector("#prompt-input").dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector("#composer").requestSubmit();
+    `);
+    await waitFor(`window.creationHeldForTyping === true`);
+    if (edit === "queued follow-up") {
+      await evaluate(`
+        document.querySelector("#prompt-input").value = "Queued prompt";
+        document.querySelector("#prompt-input").dispatchEvent(new Event("input", { bubbles: true }));
+        document.querySelector("#composer").requestSubmit();
+      `);
+    }
+    if (edit === "same text retyped") {
+      await evaluate(`
+        document.querySelector("#prompt-input").value = "Temporary edit";
+        document.querySelector("#prompt-input").dispatchEvent(new Event("input", { bubbles: true }));
+      `);
+    }
+    const expectedDraft = edit === "same text retyped" ? "Original prompt" : "My next unsent prompt";
+    await evaluate(`
+      document.querySelector("#prompt-input").value = ${JSON.stringify(expectedDraft)};
+      ${edit === "programmatic edit" ? "" :
+        'document.querySelector("#prompt-input").dispatchEvent(new Event("input", { bubbles: true }));'}
+      window.releaseCreationForTyping();
+    `);
+    await waitFor(`sessionStorage.getItem("copilot-web-pending-sends") === null &&
+      document.querySelector("#messages").textContent.includes("Done.") &&
+      document.querySelector("#cancel-prompt").disabled === true`);
+    assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), expectedDraft);
+    const prompts = (await server.requests()).filter((entry) => entry.method === "session/prompt");
+    assert.deepEqual(prompts.map((entry) => entry.text), edit === "queued follow-up"
+      ? ["Original prompt", "Queued prompt"] : ["Original prompt"]);
+    const id = await evaluate(`localStorage.getItem("copilot-web-active-session")`);
+    await evaluate(`document.querySelector("#new-chat").click()`);
+    await evaluate(`document.querySelector('[data-session-id="${String(id)}"]').click()`);
+    await waitFor(`localStorage.getItem("copilot-web-active-session") === ${JSON.stringify(id)}`);
+    assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), expectedDraft);
+    assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+  });
+}
+
+for (const failure of ["transport", "server rejection"]) {
+  test(`does not reroute a background send after ${failure}`, {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 20_000
+  }, async (t) => {
+    const server = await startTestServer(t, {
+      profileSessions: true, nativeMessages: true, nativeHistory: {}
+    });
+    const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = async (resource, init) => {
+        if (resource === "/api/sessions" && init?.method === "POST") {
+          if (${JSON.stringify(failure)} === "server rejection") {
+            const body = JSON.parse(init.body);
+            body.configOverrides = { unsupported: "value" };
+            init = { ...init, body: JSON.stringify(body) };
+          }
+          const response = await nativeFetch(resource, init);
+          window.creationWillFail = true;
+          await new Promise((resolve) => { window.failCreation = resolve; });
+          window.creationFailureDelivered = true;
+          if (${JSON.stringify(failure)} === "transport") {
+            throw new TypeError("Creation response lost");
+          }
+          return response;
+        }
+        return nativeFetch(resource, init);
+      };
+    `);
+    await waitFor(`document.querySelector("#model-select")?.disabled === false &&
+      Boolean(document.querySelector('[data-session-id="${server.sessionId}"]'))`);
+    await evaluate(`
+      document.querySelector("#prompt-input").value = "For the original conversation only";
+      document.querySelector("#composer").requestSubmit();
+    `);
+    await waitFor(`window.creationWillFail === true`);
+    await evaluate(`document.querySelector('[data-session-id="${server.sessionId}"]').click()`);
+    await waitFor(`localStorage.getItem("copilot-web-active-session") === "${server.sessionId}" &&
+      document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+      document.querySelector("#send-prompt").disabled === false`);
+    await evaluate(`
+      document.querySelector("#prompt-input").value = "Keep this other conversation draft";
+      document.querySelector("#prompt-input").dispatchEvent(new Event("input", { bubbles: true }));
+      window.failCreation();
+    `);
+    await waitFor(`window.creationFailureDelivered === true`);
+    await evaluate(`new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+    assert.deepEqual((await server.requests()).filter((entry) => entry.method === "session/prompt"), []);
+    assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "Keep this other conversation draft");
+    assert.equal(await evaluate(`localStorage.getItem("copilot-web-active-session")`), server.sessionId);
+    assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+  });
+}
+
+for (const delayedRead of [false, true]) {
+  test(`retains follow-up attachments added during conversation creation${delayedRead ? " with a delayed read" : ""}`, {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 20_000
+  }, async (t) => {
+    const server = await startTestServer(t, { profileSessions: true });
+    const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = async (resource, init) => {
+        const response = await nativeFetch(resource, init);
+        if (resource === "/api/sessions" && init?.method === "POST") {
+          window.creationHeldForFiles = true;
+          await new Promise((resolve) => { window.releaseFileCreation = resolve; });
+        }
+        return response;
+      };
+      const nativeRead = FileReader.prototype.readAsDataURL;
+      FileReader.prototype.readAsDataURL = function(file) {
+        if (file.name === "future.txt" && ${delayedRead}) {
+          window.futureReadHeld = true;
+          window.releaseFutureRead = () => nativeRead.call(this, file);
+        } else {
+          nativeRead.call(this, file);
+        }
+      };
+    `);
+    await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+    const attach = (name: string) => evaluate(`
+      (() => {
+        const files = new DataTransfer();
+        files.items.add(new File([${JSON.stringify(name)}], ${JSON.stringify(name)}, { type: "text/plain" }));
+        document.querySelector("#file-input").files = files.files;
+        document.querySelector("#file-input").dispatchEvent(new Event("change"));
+      })()
+    `);
+    await attach("sent.txt");
+    await waitFor(`document.querySelector("#attachment-list").textContent.includes("sent.txt") &&
+      document.querySelector("#send-prompt").disabled === false`);
+    await evaluate(`
+      document.querySelector("#prompt-input").value = "Send the first file";
+      document.querySelector("#composer").requestSubmit();
+    `);
+    await waitFor(`window.creationHeldForFiles === true`);
+    await attach("future.txt");
+    await waitFor(delayedRead ? `window.futureReadHeld === true` :
+      `document.querySelector("#attachment-list").textContent.includes("future.txt")`);
+    await evaluate(`window.releaseFileCreation()`);
+    await server.waitForPrompt("Send the first file");
+    if (delayedRead) {
+      await evaluate(`window.releaseFutureRead()`);
+    }
+    await waitFor(`document.querySelector("#attachment-list").textContent.includes("future.txt") &&
+      document.querySelector("#send-prompt").disabled === false`);
+    assert.equal(await evaluate(`document.querySelector("#attachment-list").textContent.includes("sent.txt")`), false);
+    const prompt = (await server.requests()).find((entry) => entry.method === "session/prompt");
+    assert.ok(prompt && Array.isArray(prompt.prompt));
+    assert.equal(prompt.prompt.length, 2);
+    assert.ok(JSON.stringify(prompt.prompt).includes(Buffer.from("sent.txt").toString("base64")));
+    assert.equal(JSON.stringify(prompt.prompt).includes(Buffer.from("future.txt").toString("base64")), false);
+    assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "");
+    assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+  });
+}
+
+for (const target of ["new", "existing"]) {
+  test(`preserves the ${target} conversation draft while another creation finishes`, {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 20_000
+  }, async (t) => {
+    const server = await startTestServer(t, {
+      profileSessions: true, nativeMessages: true, nativeHistory: {}
+    });
+    const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = async (resource, init) => {
+        const response = await nativeFetch(resource, init);
+        if (resource === "/api/sessions" && init?.method === "POST") {
+          window.creationHeld = true;
+          await new Promise((resolve) => { window.releaseCreation = resolve; });
+        }
+        return response;
+      };
+    `);
+    await waitFor(`document.querySelector("#model-select")?.disabled === false &&
+      Boolean(document.querySelector('[data-session-id="${server.sessionId}"]'))`);
+    await evaluate(`
+      document.querySelector("#prompt-input").value = "Send in the original conversation";
+      document.querySelector("#composer").requestSubmit();
+    `);
+    await waitFor(`window.creationHeld === true`);
+    await evaluate(target === "new"
+      ? `document.querySelector("#new-chat").click()`
+      : `document.querySelector('[data-session-id="${server.sessionId}"]').click()`);
+    await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+      document.querySelector("#model-select").disabled === false &&
+      document.querySelector("#send-prompt").disabled === false`);
+    await evaluate(`
+      document.querySelector("#prompt-input").value = "Do not erase this unsent draft";
+      document.querySelector("#prompt-input").dispatchEvent(new Event("input", { bubbles: true }));
+      window.releaseCreation();
+    `);
+    await server.waitForPrompt("Send in the original conversation");
+    await waitFor(`sessionStorage.getItem("copilot-web-pending-sends") === null`);
+    assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "Do not erase this unsent draft");
+    assert.equal(await evaluate(`localStorage.getItem("copilot-web-active-session")`),
+      target === "new" ? null : server.sessionId);
+    assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+  });
+}
+
+test("recovers independent conversations concurrently but keeps each conversation queue ordered", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true, nativeMessages: true, nativeHistory: {}
+  });
+  await server.pausePromptCompletion(true);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      const response = await nativeFetch(resource, init);
+      if (resource === "/api/sessions" && init?.method === "POST" && window.holdCreationResponse) {
+        window.holdCreationResponse = false;
+        window.independentCreationHeld = true;
+        return new Promise(() => {});
+      }
+      return response;
+    };
+  `);
+  try {
+    await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+    await evaluate(`
+      document.querySelector("#prompt-input").value = "Long-running first conversation";
+      document.querySelector("#composer").requestSubmit();
+    `);
+    await server.waitForPrompt("Long-running first conversation");
+    await evaluate(`document.querySelector("#new-chat").click()`);
+    await waitFor(`document.querySelector("#model-select").disabled === false &&
+      document.querySelector("#send-prompt").disabled === false`);
+    await evaluate(`
+      window.holdCreationResponse = true;
+      document.querySelector("#prompt-input").value = "Independent second conversation";
+      document.querySelector("#composer").requestSubmit();
+    `);
+    await waitFor(`window.independentCreationHeld === true`);
+    await evaluate(`
+      document.querySelector("#prompt-input").value = "Follow-up in second conversation";
+      document.querySelector("#composer").requestSubmit();
+    `);
+    await waitFor(`JSON.parse(sessionStorage.getItem("copilot-web-pending-sends")).length === 3`);
+    await command("Page.reload", {}, sessionId);
+    await server.waitForPrompt("Independent second conversation");
+    const activeRequests = await server.requests();
+    assert.equal(activeRequests.filter((entry) => entry.text === "Long-running first conversation").length, 1);
+    assert.equal(activeRequests.filter((entry) => entry.text === "Independent second conversation").length, 1);
+    assert.equal(activeRequests.some((entry) => entry.text === "Follow-up in second conversation"), false);
+    await server.pausePromptCompletion(false);
+    await server.waitForPrompt("Follow-up in second conversation");
+    await waitFor(`sessionStorage.getItem("copilot-web-pending-sends") === null`);
+    const requests = (await server.requests()).filter((entry) => entry.method === "session/prompt");
+    assert.equal(requests.length, 3);
+    const second = requests.find((entry) => entry.text === "Independent second conversation");
+    const followup = requests.find((entry) => entry.text === "Follow-up in second conversation");
+    assert.ok(second && followup);
+    assert.equal(second.sessionId, followup.sessionId);
+    assert.ok(requests.indexOf(second) < requests.indexOf(followup));
+    assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+  } finally {
+    await server.pausePromptCompletion(false);
+  }
+});
+
+test("keeps a send when reloading aborts the actual in-flight creation request", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true, nativeMessages: true, nativeHistory: {}, creationDelayMs: 400
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  const creationsBeforeSend = (await server.requests())
+    .filter((request) => request.method === "session/new").length;
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Preserve the send when its request is aborted";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  const deadline = Date.now() + 5_000;
+  while ((await server.requests()).filter((request) => request.method === "session/new").length ===
+    creationsBeforeSend) {
+    assert.ok(Date.now() < deadline, "Conversation creation did not start");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`document.querySelector("#messages")?.textContent.includes(
+    "Preserve the send when its request is aborted") &&
+    document.querySelector(".message.assistant")?.textContent.includes("Done.")`);
+  assert.equal((await server.requests()).filter((request) => request.method === "session/new").length,
+    creationsBeforeSend + 1);
+  assert.equal((await server.requests()).filter((request) =>
+    request.text === "Preserve the send when its request is aborted").length, 1);
+  assert.equal(await evaluate(`document.querySelectorAll(".message.user").length`), 1);
+  await waitFor(`sessionStorage.getItem("copilot-web-pending-sends") === null`);
+  assert.equal(await evaluate(`document.querySelectorAll(".message.system").length`), 0);
+});
+
+for (const working of [false, true]) {
+  test(`restores a new ${working ? "working" : "completed"} conversation before the CLI lists it`, {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 20_000
+  }, async (t) => {
+    const server = await startTestServer(t, {
+      profileSessions: true,
+      nativeMessages: true,
+      nativeHistory: {},
+      promptDelayMs: working ? 2_500 : 20
+    });
+    const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+    await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+    const text = `New ${working ? "working" : "completed"} conversation with delayed listing`;
+    await evaluate(`
+      document.querySelector("#prompt-input").value = ${JSON.stringify(text)};
+      document.querySelector("#composer").requestSubmit();
+    `);
+    await server.waitForPrompt(text);
+    const id = String(await evaluate(`localStorage.getItem("copilot-web-active-session")`));
+    if (!working) {
+      await waitFor(`sessionStorage.getItem("copilot-web-pending-sends") === null`);
+    }
+    await server.sessionListed(id, false);
+    await evaluate(`window.beforeRefresh = true`);
+    await command("Page.reload", {}, sessionId);
+    await waitFor(`!window.beforeRefresh &&
+      document.querySelector(".session-item.active")?.dataset.sessionId === ${JSON.stringify(id)} &&
+      document.querySelector("#messages")?.textContent.includes(${JSON.stringify(text)})`);
+    assert.equal(await evaluate(`localStorage.getItem("copilot-web-active-session")`), id);
+    assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes("Conversation not found")`),
+      false);
+    await server.sessionListed(id, true);
+    await evaluate(`window.beforeSecondRefresh = true`);
+    await command("Page.reload", {}, sessionId);
+    await waitFor(`!window.beforeSecondRefresh &&
+      document.querySelector(".session-item.active")?.dataset.sessionId === ${JSON.stringify(id)} &&
+      document.querySelector("#messages")?.textContent.includes(${JSON.stringify(text)})`);
+    await waitFor(`sessionStorage.getItem("copilot-web-pending-sends") === null`);
+    assert.equal((await server.requests()).filter((request) => request.text === text).length, 1);
+    assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+  });
+}
+
+test("restores the selected conversation from its ID when the first list snapshot is stale", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true, nativeMessages: true, nativeHistory: {}
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+  const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      const response = await nativeFetch(resource, init);
+      if (resource === "/api/sessions" && (init?.method ?? "GET") === "GET") {
+        const hidden = sessionStorage.getItem("hide-from-list");
+        if (hidden) {
+          const payload = await response.json();
+          payload.sessions = payload.sessions.filter((session) => session.sessionId !== hidden);
+          return new Response(JSON.stringify(payload), { status: 200 });
+        }
+      }
+      return response;
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Restore directly by session ID";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`sessionStorage.getItem("copilot-web-pending-sends") === null &&
+    document.querySelector("#messages").textContent.includes("Done.")`);
+  const id = String(await evaluate(`localStorage.getItem("copilot-web-active-session")`));
+  const creationsBeforeRefresh = (await server.requests())
+    .filter((request) => request.method === "session/new").length;
+  await evaluate(`
+    sessionStorage.setItem("hide-from-list", ${JSON.stringify(id)});
+    window.beforeRefresh = true;
+  `);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeRefresh &&
+    document.querySelector(".session-item.active")?.dataset.sessionId === ${JSON.stringify(id)} &&
+    document.querySelector("#messages")?.textContent.includes("Restore directly by session ID")`);
+  const requests = await server.requests();
+  assert.equal(requests.filter((request) => request.text === "Restore directly by session ID").length, 1);
+  assert.equal(requests.filter((request) => request.method === "session/new").length, creationsBeforeRefresh);
+  assert.equal(await evaluate(`document.querySelectorAll(".message.user").length`), 1);
+  assert.equal(await evaluate(`document.querySelectorAll(".message.system").length`), 0);
+});
+
+test("keeps the saved selection when restoring its transcript temporarily fails", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true, nativeMessages: true, nativeHistory: {}
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (resource, init) => {
+      if (resource.endsWith("/load") && init?.method === "POST" &&
+          sessionStorage.getItem("fail-next-load")) {
+        sessionStorage.removeItem("fail-next-load");
+        return Promise.resolve(new Response(JSON.stringify({ error: "History temporarily unavailable" }),
+          { status: 503 }));
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Keep the selected session after a load error";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`sessionStorage.getItem("copilot-web-pending-sends") === null &&
+    document.querySelector("#messages").textContent.includes("Done.")`);
+  const id = String(await evaluate(`localStorage.getItem("copilot-web-active-session")`));
+  await evaluate(`
+    sessionStorage.setItem("fail-next-load", "true");
+    window.beforeRefresh = true;
+  `);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeRefresh &&
+    document.querySelector("#messages")?.textContent.includes("History temporarily unavailable")`);
+  assert.equal(await evaluate(`localStorage.getItem("copilot-web-active-session")`), id);
+  await evaluate(`window.beforeRetry = true`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeRetry &&
+    document.querySelector(".session-item.active")?.dataset.sessionId === ${JSON.stringify(id)} &&
+    document.querySelector("#messages")?.textContent.includes("Keep the selected session after a load error")`);
+});
+
+test("forgets a saved selection whose conversation no longer exists", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`
+    localStorage.setItem("copilot-web-active-session", "missing-conversation");
+    window.beforeRefresh = true;
+  `);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeRefresh &&
+    document.querySelector("#messages")?.textContent.includes("Conversation not found")`);
+  assert.equal(await evaluate(`localStorage.getItem("copilot-web-active-session")`), null);
+});
+
+test("discards unreadable pending sends and keeps saving new ones", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (resource, init) => {
+      if (resource.endsWith("/messages") && init?.method === "POST") {
+        window.messageRequestHeld = true;
+        return new Promise(() => {});
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`
+    sessionStorage.setItem("copilot-web-pending-sends", JSON.stringify([{ id: 1 }]));
+    window.beforeRefresh = true;
+  `);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeRefresh &&
+    document.querySelector("#messages")?.textContent.includes("could not be read and were discarded") &&
+    document.querySelector("#model-select")?.disabled === false`);
+  assert.equal(await evaluate(`sessionStorage.getItem("copilot-web-pending-sends")`), null);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Save after discarding unreadable records";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`window.messageRequestHeld === true`);
+  assert.deepEqual(await evaluate(`JSON.parse(sessionStorage.getItem("copilot-web-pending-sends"))
+    .map((entry) => entry.displayText)`), ["Save after discarding unreadable records"]);
+  assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes(
+    "Unable to preserve this message")`), false);
+});
+
+test("keeps a queued send for review when the server restarted before delivery", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (resource, init) => {
+      if (resource.endsWith("/messages") && init?.method === "POST") {
+        const headers = new Headers(init.headers);
+        headers.set("X-Copilot-Request-Scope", "previous-server");
+        return nativeFetch(resource, { ...init, headers });
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Keep this for review after a restart";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`document.querySelector("#messages")?.textContent.includes("The server restarted") &&
+    document.querySelector("#pending-send-reviews button")?.textContent === "Restore draft"`);
+  assert.deepEqual(await evaluate(`JSON.parse(sessionStorage.getItem("copilot-web-pending-sends"))
+    .map((entry) => [entry.displayText, entry.reviewRequired])`),
+  [["Keep this for review after a restart", true]]);
+  assert.equal((await server.requests()).filter((request) => request.method === "session/prompt").length, 0);
+});
+
+test("creates the conversation in a context selected while the first creation is pending", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      if (resource === "/api/sessions" && init?.method === "POST" && !window.creationHeld) {
+        window.creationHeld = true;
+        await new Promise((resolve) => { window.releaseCreation = resolve; });
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  const prompt = "Use the context selected during creation";
+  await evaluate(`
+    document.querySelector("#prompt-input").value = ${JSON.stringify(prompt)};
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`typeof window.releaseCreation === "function"`);
+  await evaluate(`
+    const context = document.querySelector("#context-select");
+    context.value = "long_context";
+    context.dispatchEvent(new Event("change"));
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`window.releaseCreation()`);
+  await waitFor(`document.querySelector("#messages")?.textContent.includes("Done.")`);
+  const sent = (await server.requests())
+    .find((request) => request.method === "session/prompt" && request.text === prompt);
+  assert.ok(sent && typeof sent.sessionId === "string");
+  const saved = await server.session(sent.sessionId);
+  assert.ok(isRecord(saved));
+  assert.equal(saved.context, "long_context");
+});
+
+for (const phase of ["before creation", "after creation", "during reply", "after reply"]) {
+  test(`keeps the first message when refreshed ${phase}`, {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 20_000
+  }, async (t) => {
+    const server = await startTestServer(t, {
+      profileSessions: true,
+      promptDelayMs: phase === "during reply" ? 1_500 : 20,
+      ...(phase === "during reply" ? { nativeMessages: true, nativeHistory: {} } : {})
+    });
+    const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      const phase = ${JSON.stringify(phase)};
+      const match = init?.method === "POST" && (phase.includes("creation")
+        ? resource === "/api/sessions"
+        : resource.endsWith("/messages"));
+      if (match && !sessionStorage.getItem("send-race-held")) {
+        sessionStorage.setItem("send-race-held", "true");
+        if (phase === "after creation" || phase === "after reply") {
+          await nativeFetch(resource, init);
+        } else if (phase === "during reply") {
+          nativeFetch(resource, init).catch((error) => { window.promptFetchError = String(error); });
+        }
+        window.sendRaceHeld = true;
+        return new Promise(() => {});
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+    await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+    const prompt = "Keep my first message through an immediate refresh.";
+    await evaluate(`
+    const input = document.querySelector("#prompt-input");
+    input.value = ${JSON.stringify(prompt)};
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    document.querySelector("#composer").requestSubmit();
+  `);
+    await waitFor(`window.sendRaceHeld === true`);
+    assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem("copilot-web-pending-sends")).length`), 1);
+    if (phase.includes("reply")) {
+      await server.waitForPrompt(prompt);
+    }
+    const creationsBeforeRefresh = (await server.requests())
+      .filter((request) => request.method === "session/new").length;
+    assert.equal((await server.requests()).some((request) => request.text === prompt),
+      phase.includes("reply"));
+    await command("Page.reload", {}, sessionId);
+    if (phase === "during reply") {
+      await waitFor(`!window.sendRaceHeld &&
+      document.querySelector("#messages")?.textContent.includes(${JSON.stringify(prompt)}) &&
+      document.querySelector("#cancel-prompt")?.disabled === false`);
+      await command("Page.reload", {}, sessionId);
+    }
+    await waitFor(`!window.sendRaceHeld &&
+    document.querySelector("#messages")?.textContent.includes(${JSON.stringify(prompt)}) &&
+    document.querySelector("#cancel-prompt")?.disabled === true &&
+    sessionStorage.getItem("copilot-web-pending-sends") === null`);
+    const requests = await server.requests();
+    assert.equal(requests.filter((request) => request.method === "session/new").length,
+      creationsBeforeRefresh + (phase === "before creation" ? 1 : 0));
+    assert.deepEqual(requests.filter((request) => request.method === "session/prompt")
+      .map((request) => request.text), [prompt]);
+    assert.equal(await evaluate(`document.querySelectorAll(".message.user").length`), 1);
+    await waitFor(`sessionStorage.getItem("copilot-web-pending-sends") === null`);
+    assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+  });
+}
+
+test("recovers a pending message and attachment in an existing conversation", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (resource, init) => {
+      if (resource.endsWith("/messages") && init?.method === "POST" &&
+          !sessionStorage.getItem("message-request-held")) {
+        sessionStorage.setItem("message-request-held", "true");
+        window.messageRequestHeld = true;
+        return new Promise(() => {});
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="${server.sessionId}"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="${server.sessionId}"]').click()`);
+  await waitFor(`document.querySelector("#attach-files").disabled === false`);
+  await evaluate(`
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(["Keep this attachment"], "notes.txt", { type: "text/plain" }));
+    document.querySelector("#file-input").files = transfer.files;
+    document.querySelector("#file-input").dispatchEvent(new Event("change"));
+  `);
+  await waitFor(`document.querySelector("#attachment-list").textContent.includes("notes.txt") &&
+    document.querySelector("#send-prompt").disabled === false`);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Keep this existing conversation";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`window.messageRequestHeld === true`);
+  const creationsBeforeRefresh = (await server.requests())
+    .filter((request) => request.method === "session/new").length;
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.messageRequestHeld &&
+    document.querySelector("#messages")?.textContent.includes("Keep this existing conversation") &&
+    sessionStorage.getItem("copilot-web-pending-sends") === null`);
+  const requests = await server.requests();
+  assert.equal(requests.filter((request) => request.method === "session/new").length,
+    creationsBeforeRefresh);
+  const prompts = requests.filter((request) => request.method === "session/prompt");
+  assert.equal(prompts.length, 1);
+  assert.equal(prompts[0]?.sessionId, server.sessionId);
+  assert.deepEqual(prompts[0]?.prompt, [
+    { type: "text", text: "Keep this existing conversation" },
+    { type: "resource", resource: {
+      uri: "urn:copilot-web:attachment:0:notes.txt",
+      blob: Buffer.from("Keep this attachment").toString("base64"),
+      mimeType: "text/plain"
+    } }
+  ]);
+});
+
+test("warns when pending sends cannot be stored without blocking message delivery", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeSetItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function(key, value) {
+      if (key === "copilot-web-pending-sends") {
+        throw new DOMException("Storage is full", "QuotaExceededError");
+      }
+      return nativeSetItem.call(this, key, value);
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Send even when storage is full";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`document.querySelector("#messages")?.textContent.includes("Done.")`);
+  assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes(
+    "Unable to preserve this message across a refresh. Keep this page open until sending finishes"
+  )`), true);
+  assert.equal((await server.requests()).filter((request) =>
+    request.text === "Send even when storage is full").length, 1);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("keeps the selected conversation while recovering a background send", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const selectedId = await server.createSession();
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (resource, init) => {
+      if (resource.endsWith("/messages") && init?.method === "POST" &&
+          !sessionStorage.getItem("background-send-held")) {
+        sessionStorage.setItem("background-send-held", "true");
+        window.backgroundSendHeld = true;
+        return new Promise(() => {});
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+  const select = async (id: string) => {
+    await waitFor(`Boolean(document.querySelector('[data-session-id="${id}"]'))`);
+    await evaluate(`document.querySelector('[data-session-id="${id}"]').click()`);
+    await waitFor(`localStorage.getItem("copilot-web-active-session") === "${id}" &&
+      document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+      document.querySelector("#model-select").disabled === false &&
+      document.querySelector("#send-prompt").disabled === false`);
+  };
+  await select(server.sessionId);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Recover this in the background";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`window.backgroundSendHeld === true`);
+  await select(selectedId);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.backgroundSendHeld &&
+    document.querySelector(".session-item.active")?.dataset.sessionId === "${selectedId}" &&
+    sessionStorage.getItem("copilot-web-pending-sends") === null`);
+  assert.equal((await server.requests()).filter((request) =>
+    request.text === "Recover this in the background").length, 1);
+  assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes(
+    "Recover this in the background")`), false);
+});
+
+test("requires explicit restoration of an uncertain send from an earlier server", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (resource, init) => {
+      if (resource === "/api/sessions" && init?.method === "POST" &&
+          !sessionStorage.getItem("old-server-send-held")) {
+        sessionStorage.setItem("old-server-send-held", "true");
+        window.oldServerSendHeld = true;
+        return new Promise(() => {});
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Review before resending";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`window.oldServerSendHeld === true`);
+  await evaluate(`
+    const entries = JSON.parse(sessionStorage.getItem("copilot-web-pending-sends"));
+    entries[0].scope = "previous-server";
+    sessionStorage.setItem("copilot-web-pending-sends", JSON.stringify(entries));
+  `);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.oldServerSendHeld &&
+    document.querySelector("#messages")?.textContent.includes("The server restarted") &&
+    document.querySelector("#pending-send-reviews button")?.textContent === "Restore draft"`);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "");
+  assert.equal((await server.requests()).filter((request) => request.method === "session/prompt").length, 0);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Keep my current draft";
+    document.querySelector("#pending-send-reviews button").click();
+  `);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "Keep my current draft");
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "";
+    document.querySelector("#pending-send-reviews button").click();
+  `);
+  await waitFor(`document.querySelector("#prompt-input").value === "Review before resending" &&
+    document.querySelector("#send-prompt").disabled === false`);
+  await evaluate(`document.querySelector("#composer").requestSubmit()`);
+  await waitFor(`document.querySelector("#messages")?.textContent.includes("Done.") &&
+    sessionStorage.getItem("copilot-web-pending-sends") === null`);
+  assert.equal((await server.requests()).filter((request) => request.method === "session/prompt").length, 1);
+});
+
+test("recovers a new send despite an older restart entry and shows its warning only once", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true, nativeMessages: true, nativeHistory: {}
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (resource, init) => {
+      if (resource.endsWith("/messages") && init?.method === "POST" &&
+          sessionStorage.getItem("hold-next-send")) {
+        sessionStorage.removeItem("hold-next-send");
+        window.newSendHeld = true;
+        return new Promise(() => {});
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Original conversation";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`sessionStorage.getItem("copilot-web-pending-sends") === null &&
+    document.querySelector("#messages")?.textContent.includes("Done.")`);
+  await evaluate(`
+    sessionStorage.setItem("copilot-web-pending-sends", JSON.stringify([{
+      id: "uncertain-old-send", scope: "previous-server",
+      creation: { id: "old-creation", body: { context: "default" } },
+      text: "Keep this uncertain draft", displayText: "Keep this uncertain draft",
+      attachments: [], selections: []
+    }]));
+    sessionStorage.setItem("hold-next-send", "true");
+    document.querySelector("#prompt-input").value = "hi";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`window.newSendHeld === true`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.newSendHeld &&
+    [...document.querySelectorAll(".message.user .message-body")].some((body) => body.textContent === "hi") &&
+    JSON.parse(sessionStorage.getItem("copilot-web-pending-sends") ?? "[]").length === 1`);
+  assert.equal((await server.requests()).filter((request) => request.text === "hi").length, 1);
+  assert.equal((await server.requests()).filter((request) => request.text === "Keep this uncertain draft").length, 0);
+  await evaluate(`window.beforeRefresh = true`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeRefresh &&
+    [...document.querySelectorAll(".message.user .message-body")].some((body) => body.textContent === "hi") &&
+    document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes("The server restarted")`), false);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "");
+  assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem("copilot-web-pending-sends"))[0].displayText`),
+    "Keep this uncertain draft");
+  await evaluate(`document.querySelectorAll("#pending-send-reviews button")[1].click()`);
+  assert.equal(await evaluate(`sessionStorage.getItem("copilot-web-pending-sends")`), null);
+  await evaluate(`window.beforeDismissRefresh = true`);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.beforeDismissRefresh &&
+    document.querySelector("#messages")?.textContent.includes("Original conversation") &&
+    document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  assert.equal(await evaluate(`document.querySelector("#pending-send-reviews").hidden`), true);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "");
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("does not warn or resend a natively accepted prompt after the server changes", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true, nativeMessages: true, nativeHistory: {}
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      const response = await nativeFetch(resource, init);
+      if (resource.endsWith("/messages") && init?.method === "POST" &&
+          !sessionStorage.getItem("accepted-response-held")) {
+        sessionStorage.setItem("accepted-response-held", "true");
+        window.acceptedResponseHeld = true;
+        return new Promise(() => {});
+      }
+      return response;
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`
+    document.querySelector("#prompt-input").value = "Already accepted before restart";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`window.acceptedResponseHeld === true &&
+    document.querySelector(".message.user time") !== null`);
+  await evaluate(`
+    const entries = JSON.parse(sessionStorage.getItem("copilot-web-pending-sends"));
+    entries[0].scope = "previous-server";
+    sessionStorage.setItem("copilot-web-pending-sends", JSON.stringify(entries));
+  `);
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`!window.acceptedResponseHeld &&
+    document.querySelector("#messages")?.textContent.includes("Already accepted before restart") &&
+    sessionStorage.getItem("copilot-web-pending-sends") === null`);
+  assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes("The server restarted")`), false);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "");
+  assert.equal((await server.requests()).filter((request) => request.text === "Already accepted before restart").length, 1);
+});
+
+test("refreshes during Thinking without repeating a reviewed restart warning or the active prompt", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    profileSessions: true, nativeMessages: true, nativeHistory: {}, promptDelayMs: 2_500
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`
+    sessionStorage.setItem("copilot-web-pending-sends", JSON.stringify([{
+      id: "reviewed-old-send", scope: "previous-server", reviewRequired: true,
+      creation: { id: "old-creation", body: { context: "default" } },
+      text: "Draft retained for review", displayText: "Draft retained for review",
+      attachments: [], selections: []
+    }]));
+    document.querySelector("#prompt-input").value = "stream-progress";
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`document.querySelector(".thinking-content-text")?.textContent.includes(
+    "Live reasoning: checking the request.") &&
+    document.querySelector("#cancel-prompt").disabled === false`);
+  for (let reload = 0; reload < 2; reload += 1) {
+    await evaluate(`window.beforeThinkingRefresh = true`);
+    await command("Page.reload", {}, sessionId);
+    await waitFor(`!window.beforeThinkingRefresh &&
+      document.querySelector(".thinking-content-text")?.textContent.includes(
+        "Live reasoning: checking the request.") &&
+      document.querySelector("#cancel-prompt").disabled === false &&
+      document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+    assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes("The server restarted")`),
+      false);
+    assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "");
+  }
+  await waitFor(`document.querySelector(".message.assistant")?.textContent.includes("Done.") &&
+    document.querySelector("#cancel-prompt").disabled === true`);
+  assert.equal((await server.requests()).filter((request) => request.text === "stream-progress").length, 1);
+  assert.equal(await evaluate(`document.querySelectorAll(".message.user").length`), 1);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+for (const failure of ["lost response", "failed request", "server rejection"]) {
+  test(`retries conversation creation safely after ${failure}`, {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 20_000
+  }, async (t) => {
+    const server = await startTestServer(t, { profileSessions: true });
+    const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+      const nativeFetch = window.fetch.bind(window);
+      window.creationRequestIds = [];
+      window.fetch = async (resource, init) => {
+        if (resource === "/api/sessions" && init?.method === "POST") {
+          window.creationRequestIds.push(new Headers(init.headers).get("X-Copilot-Request-Id"));
+          if (window.creationRequestIds.length === 1) {
+            if (${JSON.stringify(failure)} === "server rejection") {
+              return new Response(JSON.stringify({ error: "Creation rejected" }), { status: 400 });
+            }
+            if (${JSON.stringify(failure)} === "lost response") {
+              await nativeFetch(resource, init);
+            }
+            throw new TypeError("Failed to fetch");
+          }
+        }
+        return nativeFetch(resource, init);
+      };
+    `);
+    await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+    const before = (await server.requests()).filter((entry) => entry.method === "session/new").length;
+    await evaluate(`
+      document.querySelector("#prompt-input").value = "Retry after creation failed";
+      document.querySelector("#composer").requestSubmit();
+    `);
+    await waitFor(`document.querySelector("#messages").textContent.includes(
+      ${JSON.stringify(failure === "server rejection" ? "Creation rejected" : "Failed to fetch")})`);
+    await evaluate(`document.querySelector("#composer").requestSubmit()`);
+    await waitFor(`document.querySelector("#messages").textContent.includes("Done.") &&
+      sessionStorage.getItem("copilot-web-pending-sends") === null`);
+    const ids = await evaluate(`window.creationRequestIds`);
+    assert.ok(Array.isArray(ids));
+    assert.equal(ids.length, 2);
+    assert.equal(ids[0] === ids[1], failure !== "server rejection");
+    const requests = await server.requests();
+    assert.equal(requests.filter((entry) => entry.method === "session/new").length - before, 1);
+    assert.equal(requests.filter((entry) => entry.method === "session/prompt").length, 1);
+    assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+  });
+}
+
 test("deduplicates repeated submits, shares session creation, and normalizes generated titles", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
@@ -6117,13 +8069,20 @@ test("loads older messages on upward scroll and preserves the full transcript an
     window.oldestVisibleTop = window.oldestVisibleArticle?.getBoundingClientRect().top;
   })()`);
   await waitFor(`document.querySelectorAll("#messages > .message").length > 20`);
-  assert.equal(await evaluate(`(() => {
+  const preservedAnchor = await evaluate(`(() => {
     const article = [...document.querySelectorAll("#messages > .message")]
       .find((item) => item.dataset.messageKey === window.oldestVisibleKey);
-    return Boolean(article) &&
-      article === window.oldestVisibleArticle &&
-      Math.abs(article.getBoundingClientRect().top - window.oldestVisibleTop) < 3;
-  })()`), true, "Prepending a page must retain the visible message and its pixel position");
+    return {
+      sameArticle: article === window.oldestVisibleArticle,
+      delta: article ? article.getBoundingClientRect().top - window.oldestVisibleTop : null,
+      scrollTop: document.querySelector("#messages").scrollTop,
+      loading: Boolean(document.querySelector("#history-loading"))
+    };
+  })()`);
+  assert.ok(isRecord(preservedAnchor));
+  assert.equal(preservedAnchor.sameArticle, true, JSON.stringify(preservedAnchor));
+  assert.ok(typeof preservedAnchor.delta === "number" && Math.abs(preservedAnchor.delta) < 3,
+    `Prepending must retain the visible message's pixel position: ${JSON.stringify(preservedAnchor)}`);
   for (let index = 0; index < 8; index += 1) {
     await scrollUpAndWaitForHistory(evaluate, waitFor);
     assert.equal(await evaluate(`document.querySelector("#messages .transcript-spacer") === null`), true);
@@ -6297,6 +8256,79 @@ test("fetches an unloaded selected passage by stable ID and leaves AI context un
   assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
 });
 
+for (const abortLoad of [false, true]) {
+  test(abortLoad
+    ? "recovers a source-page send when refresh aborts its history preparation"
+    : "does not replay a failed source-page send after its explicit retry succeeds", {
+    skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+    timeout: 20_000
+  }, async (t) => {
+    const events = longConversationEvents(60);
+    const source = "Stored message 4";
+    const prompt = `Explain this\n\nSelected passages from the conversation:\nSelection 1:\n> ${source}`;
+    events[58] = nativeTranscriptEvent("user.message", "paged-58", prompt, 58);
+    const server = await startTestServer(t, {
+      existingSession: true, nativeMessages: true,
+      nativeHistory: { events, readDelayMs: abortLoad ? 400 : 0 }
+    });
+    const stored = {
+      [server.sessionId]: [{
+        promptText: prompt, displayText: "Explain this", messageId: "paged-58",
+        selections: [{
+          id: "selection-1", number: 1, text: source, sessionId: server.sessionId,
+          sourceMessageId: "paged-4", messageIndex: 4,
+          startPath: [], endPath: [], startOffset: 0, endOffset: 0
+        }],
+        createdAt: Date.now()
+      }]
+    };
+    const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    localStorage.setItem("copilot-web-selection-messages", ${JSON.stringify(JSON.stringify(stored))});
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (resource, init) => {
+      if (resource.endsWith("/load") && init?.method === "POST" && window.failNextLoad) {
+        window.failNextLoad = false;
+        return Promise.resolve(new Response(JSON.stringify({ error: "History temporarily unavailable" }),
+          { status: 503 }));
+      }
+      if (resource.endsWith("/load") && init?.method === "POST" && window.trackNextLoad) {
+        window.latestLoadStarted = true;
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+    await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+    await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+    await waitFor(`Boolean(document.querySelector(".message-selection-summary"))`);
+    await evaluate(`document.querySelector(".message-selection-summary").click()`);
+    await waitFor(`Boolean(document.querySelector("#load-latest-messages"))`);
+    await evaluate(`
+    window.failNextLoad = ${!abortLoad};
+    window.trackNextLoad = ${abortLoad};
+    document.querySelector("#prompt-input").value = "Run this action once";
+    document.querySelector("#composer").requestSubmit();
+  `);
+    if (abortLoad) {
+      await waitFor(`window.latestLoadStarted === true`);
+      await command("Page.reload", {}, sessionId);
+    } else {
+      await waitFor(`document.querySelector("#messages").textContent.includes("History temporarily unavailable") &&
+      document.querySelector("#send-prompt").disabled === false`);
+      assert.equal(await evaluate(`sessionStorage.getItem("copilot-web-pending-sends")`), null);
+      await evaluate(`document.querySelector("#composer").requestSubmit()`);
+    }
+    await waitFor(`document.querySelector("#messages")?.textContent.includes("Done.") &&
+    sessionStorage.getItem("copilot-web-pending-sends") === null`);
+    await evaluate(`window.beforeRetryRefresh = true`);
+    await command("Page.reload", {}, sessionId);
+    await waitFor(`!window.beforeRetryRefresh &&
+    document.querySelector("#messages")?.textContent.includes("Run this action once") &&
+    document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+    assert.equal((await server.requests()).filter((request) => request.text === "Run this action once").length, 1);
+    assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+  });
+}
+
 test("retains every loaded history page beyond the former transcript byte limit", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 30_000
@@ -6374,10 +8406,11 @@ test("merges live output received while a paged history snapshot is loading", as
     ["user", text, "completed", "during-page"],
     ["assistant", "Done.", "completed", "during-page"]
   ]);
-  assert.ok(loaded.liveReplayUpdates.some((entry) =>
+  const replayUpdates = [...loaded.replayUpdates, ...loaded.liveReplayUpdates];
+  assert.ok(replayUpdates.some((entry) =>
     isRecord(entry) && isRecord(entry.update) &&
     entry.update.sessionUpdate === "agent_thought_chunk"));
-  assert.ok(loaded.liveReplayUpdates.some((entry) =>
+  assert.ok(replayUpdates.some((entry) =>
     isRecord(entry) && isRecord(entry.update) &&
     entry.update.toolCallId === "live-history-inspection" &&
     entry.update.status === "completed"));
