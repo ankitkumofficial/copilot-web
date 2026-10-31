@@ -2677,12 +2677,14 @@ function renderSessionList() {
       const deleteButton = document.createElement("button");
       deleteButton.type = "button";
       deleteButton.className = "session-action session-delete";
-      deleteButton.title = `Delete ${title}`;
+      deleteButton.disabled = conversationDeletionBlocked(session.sessionId);
+      deleteButton.title = deleteButton.disabled && working
+        ? "Can't delete while the conversation is in progress"
+        : `Delete ${title}`;
       deleteButton.setAttribute(
         "aria-label",
         `Delete ${title}`
       );
-      deleteButton.disabled = state.deletingSessionId !== null;
       deleteButton.innerHTML = deleteSessionIconMarkup;
       deleteButton.addEventListener("click", (event) => {
         event.stopPropagation();
@@ -4765,6 +4767,7 @@ function setLoading(value, conversation = activeConversation()) {
     return;
   }
   conversation.loading = value;
+  renderSessionList();
   if (isActiveConversation(conversation)) {
     renderConnectionStatus();
     elements.input.disabled = value;
@@ -4783,6 +4786,7 @@ function setConfigurationBusy(value, conversation = activeConversation()) {
     return;
   }
   conversation.configurationBusy = value;
+  renderSessionList();
   if (isActiveConversation(conversation)) {
     elements.send.disabled = value ||
       conversation.loading ||
@@ -5911,17 +5915,25 @@ function confirmDeleteConversation(session) {
   });
 }
 
-async function deleteConversation(sessionId) {
+function conversationDeletionBlocked(sessionId) {
   const conversation = conversationState(sessionId, false);
-  if (
+  const session = state.sessions.find((item) => item.sessionId === sessionId);
+  return Boolean(
     state.deletingSessionId ||
     state.renamingSessionId ||
+    session?.busy ||
     conversation?.busy ||
+    conversation?.recoveredPrompt ||
     conversation?.loading ||
     conversation?.configurationBusy
-  ) {
+  );
+}
+
+async function deleteConversation(sessionId) {
+  if (conversationDeletionBlocked(sessionId)) {
     return;
   }
+  const conversation = conversationState(sessionId, false);
   const session = state.sessions.find((item) => item.sessionId === sessionId);
   if (!session || elements.deleteDialog.open || !(await confirmDeleteConversation(session))) {
     return;

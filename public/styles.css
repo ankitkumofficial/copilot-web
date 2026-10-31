@@ -378,10 +378,14 @@ button:disabled {
   pointer-events: auto;
 }
 
-.session-item-row:hover .session-action:disabled,
 .session-action:disabled {
   opacity: 0;
   pointer-events: none;
+}
+
+.session-item-row:hover .session-action:disabled {
+  opacity: 0.45;
+  pointer-events: auto;
 }
 
 .session-item {
@@ -392,13 +396,13 @@ button:disabled {
   padding-right: 72px;
 }
 
-.session-rename:hover {
+.session-rename:hover:not(:disabled) {
   border-color: rgba(139, 124, 255, 0.35);
   background: rgba(139, 124, 255, 0.1);
   color: var(--accent-strong);
 }
 
-.session-delete:hover {
+.session-delete:hover:not(:disabled) {
   border-color: rgba(242, 120, 139, 0.35);
   background: rgba(242, 120, 139, 0.1);
   color: var(--danger);
