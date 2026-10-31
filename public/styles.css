@@ -1323,6 +1323,50 @@ button:disabled {
   font-size: 0.84rem;
 }
 
+.message.plan .message-body {
+  white-space: normal;
+}
+
+.plan-summary {
+  margin-bottom: 6px;
+}
+
+.plan-entries {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.plan-entry {
+  display: grid;
+  grid-template-columns: 1.2em minmax(0, 1fr);
+  gap: 6px;
+  align-items: baseline;
+}
+
+.plan-entry-marker {
+  text-align: center;
+}
+
+.plan-status-in_progress {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.plan-status-in_progress .plan-entry-marker {
+  color: var(--accent);
+}
+
+.plan-status-completed .plan-entry-marker {
+  color: var(--tool-label);
+}
+
+.plan-status-completed .plan-entry-content {
+  text-decoration: line-through;
+}
+
 .composer {
   position: relative;
   grid-area: 2 / 1;
