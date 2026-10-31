@@ -76,8 +76,11 @@ export function inlineMarkdownToHtml(text, {
       const link = rest.match(/^\[((?:\\.|[^\]\\\n])+)\]\(([^()\s]+)\)/);
       if (link) {
         const href = text[index - 1] !== "!" && resolveLink(link[2]);
+        const attributes = href && typeof linkAttributes === "function"
+          ? linkAttributes(href)
+          : linkAttributes;
         html += href
-          ? `<a href="${escapeHtml(href)}"${linkAttributes}>${inlineMarkdownToHtml(link[1], {
+          ? `<a href="${escapeHtml(href)}"${attributes}>${inlineMarkdownToHtml(link[1], {
             resolveLink, linkAttributes, preserveDelimiters, strikeTag
           })}</a>`
           : escapeHtml(link[0]);

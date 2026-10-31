@@ -6,7 +6,7 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test, { type TestContext } from "node:test";
 
 import { isRecord, type JsonObject } from "./acp.js";
@@ -840,6 +840,7 @@ async function startTestServer(t: TestContext, options: {
   reloadDelayMs?: number;
   historyText?: string;
   context?: "default" | "long_context";
+  allowAll?: boolean;
   nativeSessionDelete?: boolean;
   quotaCommand?: "success" | "failure" | "missing";
   aicUsageEvents?: number;
@@ -900,7 +901,7 @@ async function startTestServer(t: TestContext, options: {
       GH_BIN: options.quotaCommand === "missing"
         ? path.join(directory, "gh-not-installed")
         : fakeGitHubCommand,
-      COPILOT_ALLOW_ALL: "false",
+      COPILOT_ALLOW_ALL: String(options.allowAll ?? false),
       COPILOT_SDK_PATH: options.nativeHistory
         ? path.join(copilotSdk, "index.js")
         : "",
@@ -983,6 +984,7 @@ async function startTestServer(t: TestContext, options: {
   return {
     baseUrl,
     headers,
+    projectsDirectory: projects,
     sessionId,
     createSession,
     session: (id: string) => readFile(path.join(projects, `profile-session-${id}.json`), "utf8")
@@ -1630,6 +1632,59 @@ test("restores stored non-image attachment contents from persisted CLI reference
       .find((message) => message.messageId === "native-user-1");
     assert.deepEqual(user?.attachments, [restored], JSON.stringify(body));
   }
+});
+
+test("previews local project files and denies paths outside the projects directory", async (t) => {
+  const server = await startTestServer(t);
+  const filePath = path.join(server.projectsDirectory, "src", "example.ts");
+  const text = "export const previewValue = 42;\n";
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, text);
+
+  const endpoint = (reference: string) => (
+    `${server.baseUrl}/api/file-preview?${new URLSearchParams({ path: reference })}`
+  );
+  const relativeResponse = await fetch(endpoint("src/example.ts#L1"), {
+    headers: server.headers
+  });
+  assert.equal(relativeResponse.status, 200);
+  assert.deepEqual(await relativeResponse.json(), {
+    name: "example.ts",
+    mimeType: "text/plain",
+    text
+  });
+
+  const absoluteResponse = await fetch(endpoint(pathToFileURL(filePath).href), {
+    headers: server.headers
+  });
+  assert.equal(absoluteResponse.status, 200);
+  assert.deepEqual(await absoluteResponse.json(), {
+    name: "example.ts",
+    mimeType: "text/plain",
+    text
+  });
+
+  const outsidePath = path.join(path.dirname(server.projectsDirectory), "outside.txt");
+  await writeFile(outsidePath, "must not be exposed");
+  const outsideResponse = await fetch(endpoint(outsidePath), { headers: server.headers });
+  assert.equal(outsideResponse.status, 403);
+
+  const unauthorizedResponse = await fetch(endpoint("src/example.ts"));
+  assert.equal(unauthorizedResponse.status, 401);
+
+  const allowAllServer = await startTestServer(t, { allowAll: true });
+  const allowedOutsidePath = path.join(path.dirname(allowAllServer.projectsDirectory), "outside.txt");
+  await writeFile(allowedOutsidePath, "preview allowed");
+  const allowedOutsideResponse = await fetch(
+    `${allowAllServer.baseUrl}/api/file-preview?${new URLSearchParams({ path: allowedOutsidePath })}`,
+    { headers: allowAllServer.headers }
+  );
+  assert.equal(allowedOutsideResponse.status, 200);
+  assert.deepEqual(await allowedOutsideResponse.json(), {
+    name: "outside.txt",
+    mimeType: "text/plain",
+    text: "preview allowed"
+  });
 });
 
 test("retries conversation creation and prompts without repeating accepted work", async (t) => {
@@ -3148,6 +3203,70 @@ test("uses untimed ACP replay when native history is unavailable", {
     await evaluate(`document.querySelector(".message.tool") !== null`),
     true
   );
+});
+
+test("opens local file links from messages in a preview dialog", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: {
+      events: [
+        {
+          id: "persisted-user-event",
+          type: "user.message",
+          timestamp: "2026-10-13T12:00:00.000Z",
+          parentId: null,
+          data: { messageId: "native-user-1", content: "Inspect the source file." }
+        },
+        {
+          id: "persisted-assistant-event",
+          type: "assistant.message",
+          timestamp: "2026-10-13T12:00:05.000Z",
+          parentId: "persisted-user-event",
+          data: {
+            messageId: "native-assistant-1",
+            content: "Open [src/example.ts](src/example.ts#L1) and [docs](https://example.com)"
+          }
+        }
+      ]
+    }
+  });
+  const filePath = path.join(server.projectsDirectory, "src", "example.ts");
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, "const previewValue = 42;\n");
+
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`Boolean(document.querySelector(
+    ".message.assistant a[data-local-file-preview]"
+  ))`);
+  assert.equal(await evaluate(`
+    (() => {
+      const link = document.querySelector(".message.assistant a[data-local-file-preview]");
+      const external = document.querySelector('.message.assistant a[href="https://example.com/"]');
+      return link?.hasAttribute("target") === false &&
+        new URL(link.href).pathname === "/api/file-preview" &&
+        external?.target === "_blank" &&
+        external.rel.includes("noopener");
+    })()
+  `), true);
+
+  const pageUrl = await evaluate("location.href");
+  await evaluate(`document.querySelector(
+    ".message.assistant a[data-local-file-preview]"
+  ).click()`);
+  await waitFor(`document.querySelector("#image-preview-dialog").open &&
+    document.querySelector(".file-preview-text")?.textContent === "const previewValue = 42;\\n"`);
+  assert.equal(await evaluate("location.href"), pageUrl);
+  assert.equal(await evaluate(`document.querySelector("#file-preview-title").textContent`), "example.ts");
 });
 
 test("renders native completion times outside message content through refresh", {
