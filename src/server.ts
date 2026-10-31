@@ -44,6 +44,7 @@ import {
   mergePagedHistoryReplayUpdates,
   mergeNativeMessages,
   nativeMessagesFromEvents,
+  thoughtChunkText,
   type HistoryPage,
   type NativeMessage,
   type NativeMessageCollection
@@ -1255,6 +1256,37 @@ async function main(): Promise<void> {
     }
   };
 
+  // Thoughts stream almost per token; caching each fragment would evict the turn's earlier activity.
+  const appendReplayUpdate = (replay: JsonObject[], params: JsonObject): void => {
+    const previous = replay.at(-1);
+    const previousText = thoughtChunkText(previous);
+    const text = thoughtChunkText(params);
+    if (
+      !previous || previousText === undefined || text === undefined ||
+      !isRecord(previous.update) || !isRecord(params.update) ||
+      previous.sessionId !== params.sessionId ||
+      previous.afterMessageId !== params.afterMessageId ||
+      previous.clientPromptId !== params.clientPromptId ||
+      previous.updateScope !== params.updateScope ||
+      previous.update.messageId !== params.update.messageId
+    ) {
+      replay.push(params);
+      return;
+    }
+    // Published updates may be buffered by identity, so the cached entry is replaced rather than mutated.
+    const merged = {
+      ...params,
+      update: { ...params.update, content: { type: "text", text: previousText + text } }
+    };
+    replay[replay.length - 1] = merged;
+    const measured = replaySizes.get(replay);
+    if (measured && measured.sizes.length === replay.length) {
+      const size = Buffer.byteLength(JSON.stringify(merged));
+      measured.bytes += size - (measured.sizes.at(-1) ?? 0);
+      measured.sizes[measured.sizes.length - 1] = size;
+    }
+  };
+
   const trimNativeState = (sessionId: string): void => {
     const state = nativeMessageStates.get(sessionId);
     if (!state) {
@@ -1331,9 +1363,27 @@ async function main(): Promise<void> {
       typeof params.update.toolCallId === "string"
         ? [params.update.toolCallId] : []
     )));
+    // Cached thoughts are coalesced, so live fragments are matched by sequence instead of identity.
+    const includedThoughtSequences = new Map<string, number>();
+    const thoughtAnchor = (params: JsonObject): string => (
+      typeof params.afterMessageId === "string" ? params.afterMessageId : ""
+    );
+    for (const params of replayUpdates) {
+      if (isRecord(params.update) && params.update.sessionUpdate === "agent_thought_chunk" &&
+          typeof params.updateSequence === "number") {
+        includedThoughtSequences.set(thoughtAnchor(params), Math.max(
+          includedThoughtSequences.get(thoughtAnchor(params)) ?? 0, params.updateSequence
+        ));
+      }
+    }
     const liveReplayUpdates = liveReplay.filter((params) => !included.has(params) && !(
       typeof params.afterMessageId === "string" && isRecord(params.update) &&
       includedTools.has(String(params.update.toolCallId))
+    ) && !(
+      isRecord(params.update) &&
+      params.update.sessionUpdate === "agent_thought_chunk" &&
+      typeof params.updateSequence === "number" &&
+      params.updateSequence <= (includedThoughtSequences.get(thoughtAnchor(params)) ?? 0)
     ));
     return {
       nativeMessages,
@@ -1743,7 +1793,7 @@ async function main(): Promise<void> {
     };
     if (sessionId) {
       const replay = replayingSessions.get(sessionId) ?? sessionReplayCache.get(sessionId) ?? [];
-      replay.push(updateParams);
+      appendReplayUpdate(replay, updateParams);
       retainReplay(sessionId, replay, !replaying);
     }
     if (

@@ -821,6 +821,101 @@ test("keeps reasoning and tool progress when cached tool output exceeds the acti
     String(cached[1].update.content.text).length, historyPageMaximumBytes);
 });
 
+test("restores a busy turn's activity above a page that starts after its prompt", () => {
+  const output = "menu ".repeat(4_000);
+  const events: JsonObject[] = [
+    { type: "assistant.message", id: "late-event", timestamp: "2026-10-30T10:36:45.000Z", data: {
+      messageId: "late", content: "", toolRequests: [{ toolCallId: "late-tool", name: "bash" }]
+    } },
+    { type: "tool.execution_start", id: "late-start", timestamp: "2026-10-30T10:36:45.100Z", data: {
+      toolCallId: "late-tool", toolName: "bash"
+    } }
+  ];
+  const prompt: NativeMessage = {
+    messageId: "prompt", role: "user", content: "Vegetarian options?", attachments: [],
+    completion: "completed", eventId: "prompt-event", revision: 1,
+    timestamp: "2026-10-30T10:36:03.000Z", updatedAt: "2026-10-30T10:36:03.000Z"
+  };
+  const cached: JsonObject[] = [
+    { afterMessageId: "prompt", update: {
+      sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Fetch the menu." }
+    } },
+    ...["fetch", "view", "late-tool"].flatMap((toolCallId) => [
+      { afterMessageId: "prompt", update: {
+        sessionUpdate: "tool_call", toolCallId, title: `Run ${toolCallId}`, status: "in_progress",
+        rawInput: { command: toolCallId }
+      } },
+      ...(toolCallId === "late-tool" ? [] : [{ afterMessageId: "prompt", update: {
+        sessionUpdate: "tool_call_update", toolCallId, status: "completed",
+        content: [{ type: "content", content: { type: "text", text: output } }],
+        rawOutput: { content: output, detailedContent: output.repeat(3) }
+      } }])
+    ])
+  ];
+  let truncated = false;
+  const replay = mergePagedHistoryReplayUpdates("s", events,
+    [...nativeMessagesFromEvents(events), prompt], cached, [], () => { truncated = true; });
+  const serialized = JSON.stringify(replay);
+  assert.equal(truncated, false);
+  assert.equal(serialized.includes("rawOutput"), false);
+  assert.equal(serialized.includes("rawInput"), false);
+  assert.ok(serialized.includes(output));
+  assert.deepEqual(replay.map((params) => {
+    assert.ok(isRecord(params.update));
+    return [params.update.sessionUpdate, params.update.messageId ?? params.update.toolCallId];
+  }), [
+    ["user_message_chunk", "prompt"],
+    ["agent_thought_chunk", undefined],
+    ["tool_call", "fetch"],
+    ["tool_call_update", "fetch"],
+    ["tool_call", "view"],
+    ["tool_call_update", "view"],
+    ["tool_call", "late-tool"],
+    ["agent_message_chunk", "late"]
+  ]);
+  assert.ok(isRecord(cached[2]?.update) && isRecord(cached[2].update.rawOutput),
+    "Merging must not mutate the source replay");
+});
+
+test("coalesces streamed reasoning fragments so a long turn fits the activity budget", () => {
+  const events: JsonObject[] = [{
+    type: "user.message", id: "user-event", data: { messageId: "user", content: "Question" }
+  }];
+  let updateSequence = 0;
+  const thoughts = (prefix: string): JsonObject[] => Array.from({ length: 1_500 }, (_, index) => ({
+    sessionId: "session-1", updateScope: "scope", updateSequence: ++updateSequence,
+    clientPromptId: "prompt", afterMessageId: "user",
+    update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `${prefix}${index} ` } }
+  }));
+  const cached: JsonObject[] = [
+    ...thoughts("a"),
+    { afterMessageId: "user", updateSequence: ++updateSequence, update: {
+      sessionUpdate: "tool_call", toolCallId: "tool", title: "Read menu", status: "completed"
+    } },
+    ...thoughts("b")
+  ];
+  assert.ok(Buffer.byteLength(JSON.stringify(cached)) > historyPageMaximumBytes * 2);
+  let truncated = false;
+  const replay = mergePagedHistoryReplayUpdates("session-1", events, nativeMessagesFromEvents(events),
+    cached, [], () => { truncated = true; });
+  assert.equal(truncated, false);
+  assert.deepEqual(replay.map((params) => {
+    assert.ok(isRecord(params.update));
+    return [params.update.sessionUpdate, params.updateSequence];
+  }), [
+    ["user_message_chunk", undefined],
+    ["agent_thought_chunk", 1_500],
+    ["tool_call", 1_501],
+    ["agent_thought_chunk", 3_001]
+  ]);
+  const text = (params: JsonObject | undefined): unknown => (
+    isRecord(params?.update) && isRecord(params.update.content) ? params.update.content.text : undefined
+  );
+  assert.equal(text(replay[1]), Array.from({ length: 1_500 }, (_, index) => `a${index} `).join(""));
+  assert.equal(text(replay[3]), Array.from({ length: 1_500 }, (_, index) => `b${index} `).join(""));
+  assert.equal(text(cached[0]), "a0 ", "Merging must not mutate the source replay");
+});
+
 test("anchors cached activity after a native reply that is still streaming", () => {
   const events: JsonObject[] = [
     { type: "user.message", id: "user-event", data: { messageId: "user", content: "Question" } },
