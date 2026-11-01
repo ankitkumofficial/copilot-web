@@ -75,6 +75,14 @@ keeps the model, tools, authentication, and workspace local.
   briefly highlight the selected text; sent-message formatting is restored
   after a browser refresh. This formatting is stored in browser storage, capped
   to recent entries, and pruned when a conversation no longer exists.
+- Next to **Ask Copilot**, choose the **EN** or **DE** speaker to read the
+  selected text aloud in English or German. Click the same speaker again to
+  stop; choosing the other one switches language. Playback uses the browser's
+  built-in speech synthesis with a local system voice for that language
+  (preferring en-US and de-DE); it never falls back to another language or to
+  a remote/cloud voice. If no matching local voice is installed, the speaker
+  is shown as unavailable and explains why. Reading stops when you switch or
+  start a conversation, start voice input, or hide the tab.
 - Dictate into the message composer with the microphone button; interim speech
   appears as text while recording, and the cross button stops recording while
   keeping the draft. This requires browser speech-recognition support and

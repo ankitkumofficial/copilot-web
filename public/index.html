@@ -101,20 +101,53 @@
           </svg>
         </button>
 
-        <button
-          id="ask-selection"
-          class="ask-selection"
-          type="button"
-          aria-label="Ask Copilot about selected text"
-          title="Start a follow-up using the selected text"
-          hidden
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="m12 3 1.7 6.3L20 11l-6.3 1.7L12 19l-1.7-6.3L4 11l6.3-1.7L12 3Z"></path>
-            <path d="m19 16 .6 2.4L22 19l-2.4.6L19 22l-.6-2.4L16 19l2.4-.6L19 16Z"></path>
-          </svg>
-          <span>Ask Copilot</span>
-        </button>
+        <div id="selection-actions" class="selection-actions" role="group" aria-label="Selected text actions" hidden>
+          <button
+            id="ask-selection"
+            class="ask-selection selection-action"
+            type="button"
+            aria-label="Ask Copilot about selected text"
+            title="Start a follow-up using the selected text"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m12 3 1.7 6.3L20 11l-6.3 1.7L12 19l-1.7-6.3L4 11l6.3-1.7L12 3Z"></path>
+              <path d="m19 16 .6 2.4L22 19l-2.4.6L19 22l-.6-2.4L16 19l2.4-.6L19 16Z"></path>
+            </svg>
+            <span>Ask Copilot</span>
+          </button>
+          <button
+            id="speak-selection-en"
+            class="speak-selection selection-action"
+            type="button"
+            data-speech-language="en"
+            data-state="idle"
+          >
+            <svg class="speak-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"></path>
+              <path d="M15.5 9a4 4 0 0 1 0 6m2.5-8.5a7.5 7.5 0 0 1 0 11"></path>
+            </svg>
+            <svg class="stop-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="7" y="7" width="10" height="10" rx="1.5"></rect>
+            </svg>
+            <span class="speak-language" aria-hidden="true">EN</span>
+          </button>
+          <button
+            id="speak-selection-de"
+            class="speak-selection selection-action"
+            type="button"
+            data-speech-language="de"
+            data-state="idle"
+          >
+            <svg class="speak-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"></path>
+              <path d="M15.5 9a4 4 0 0 1 0 6m2.5-8.5a7.5 7.5 0 0 1 0 11"></path>
+            </svg>
+            <svg class="stop-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="7" y="7" width="10" height="10" rx="1.5"></rect>
+            </svg>
+            <span class="speak-language" aria-hidden="true">DE</span>
+          </button>
+        </div>
 
         <form id="composer" class="composer">
           <div id="pending-send-reviews" class="pending-send-reviews" aria-label="Messages awaiting review" hidden></div>

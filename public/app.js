@@ -785,7 +785,9 @@ const elements = {
   usageQuotaWarning: document.querySelector("#usage-quota-warning"),
   messages: document.querySelector("#messages"),
   scrollToBottom: document.querySelector("#scroll-to-bottom"),
+  selectionActions: document.querySelector("#selection-actions"),
   askSelection: document.querySelector("#ask-selection"),
+  speakSelectionButtons: Array.from(document.querySelectorAll("#selection-actions .speak-selection")),
   selectionList: document.querySelector("#selection-list"),
   selectionStatus: document.querySelector("#selection-status"),
   emptyState: document.querySelector("#empty-state"),
@@ -835,6 +837,35 @@ const voiceInputState = {
   notice: null
 };
 let pendingVoiceSubmit = null;
+
+const selectionSpeechLanguages = {
+  en: { name: "English", locale: "en-US" },
+  de: { name: "German", locale: "de-DE" }
+};
+// macOS novelty, legacy MacInTalk, and Eloquence voices are poor defaults for reading text aloud.
+const noveltySpeechVoiceNames = new Set([
+  "Albert", "Bad News", "Bahh", "Bells", "Boing", "Bubbles", "Cellos", "Deranged", "Fred",
+  "Good News", "Hysterical", "Jester", "Junior", "Kathy", "Organ", "Pipe Organ", "Princess",
+  "Ralph", "Superstar", "Trinoids", "Whisper", "Wobble", "Zarvox"
+]);
+const eloquenceSpeechVoiceNames = new Set([
+  "Eddy", "Flo", "Grandma", "Grandpa", "Reed", "Rocko", "Sandy", "Shelley"
+]);
+const speechSynthesisApi = window.speechSynthesis &&
+  typeof window.speechSynthesis.speak === "function" &&
+  typeof window.SpeechSynthesisUtterance === "function"
+  ? window.speechSynthesis
+  : null;
+const speechVoiceLoadTimeoutMs = 3000;
+const speechStartTimeoutMs = 5000;
+const selectionSpeech = {
+  generation: 0,
+  language: null,
+  status: "idle",
+  utterance: null,
+  startTimer: null,
+  voicesSettled: false
+};
 
 const screenWakeLock = {
   enabled: typeof navigator.wakeLock?.request === "function" && readScreenWakeLockPreference(),
@@ -2120,6 +2151,7 @@ function startVoiceInput() {
   if (conversation.loading) {
     return;
   }
+  stopSelectionSpeech();
 
   let recognition;
   try {
@@ -4020,10 +4052,10 @@ function restoreMessagePanelScroll(article, message, positions) {
 
 function hideAskSelection() {
   pendingMessageSelection = null;
-  elements.askSelection.hidden = true;
-  elements.askSelection.style.removeProperty("left");
-  elements.askSelection.style.removeProperty("top");
-  elements.askSelection.style.removeProperty("visibility");
+  elements.selectionActions.hidden = true;
+  elements.selectionActions.style.removeProperty("left");
+  elements.selectionActions.style.removeProperty("top");
+  elements.selectionActions.style.removeProperty("visibility");
 }
 
 function selectionMatchesRange(selection, range) {
@@ -4084,18 +4116,29 @@ function selectableMessageArticles() {
   return Array.from(elements.messages.querySelectorAll(".message.user, .message.assistant"));
 }
 
+function selectionRangeWithinBody(range, body, text) {
+  if (body.contains(range.endContainer)) {
+    return range;
+  }
+  // A triple-click selects the trailing line break, ending the range at the start of the next block.
+  const clamped = range.cloneRange();
+  clamped.setEnd(body, body.childNodes.length);
+  return compactSelectionText(clamped.toString()) === compactSelectionText(text) ? clamped : null;
+}
+
 function messageSelectionReference(selection) {
   if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
     return null;
   }
   const text = selection.toString().trim();
-  const range = selection.getRangeAt(0);
-  const body = messageBodyForSelectionNode(range.startContainer);
+  const selectedRange = selection.getRangeAt(0);
+  const body = messageBodyForSelectionNode(selectedRange.startContainer);
+  const range = body ? selectionRangeWithinBody(selectedRange, body, text) : null;
   const message = body?.closest(".message");
   if (
     !text ||
     !body ||
-    body !== messageBodyForSelectionNode(range.endContainer) ||
+    !range ||
     !elements.messages.contains(body) ||
     !message ||
     (!message.classList.contains("user") && !message.classList.contains("assistant"))
@@ -4164,9 +4207,9 @@ function updateAskSelection() {
   }
 
   pendingMessageSelection = selected.reference;
-  elements.askSelection.hidden = false;
-  elements.askSelection.style.visibility = "hidden";
-  const actionBounds = elements.askSelection.getBoundingClientRect();
+  elements.selectionActions.hidden = false;
+  elements.selectionActions.style.visibility = "hidden";
+  const actionBounds = elements.selectionActions.getBoundingClientRect();
   const edge = 8;
   const gap = 9;
   const maxLeft = Math.max(edge, window.innerWidth - actionBounds.width - edge);
@@ -4180,9 +4223,9 @@ function updateAskSelection() {
   }
   const maxTop = Math.max(edge, window.innerHeight - actionBounds.height - edge);
   top = Math.min(Math.max(top, edge), maxTop);
-  elements.askSelection.style.left = `${Math.round(left)}px`;
-  elements.askSelection.style.top = `${Math.round(top)}px`;
-  elements.askSelection.style.visibility = "";
+  elements.selectionActions.style.left = `${Math.round(left)}px`;
+  elements.selectionActions.style.top = `${Math.round(top)}px`;
+  elements.selectionActions.style.visibility = "";
 }
 
 function attachSelectedText() {
@@ -4340,6 +4383,233 @@ function showSelectionNotice(message) {
     elements.selectionStatus.hidden = true;
     elements.selectionStatus.textContent = "";
   }, selectionNoticeDurationMs);
+}
+
+function canonicalSpeechLocale(tag) {
+  if (typeof tag !== "string" || !tag.trim()) {
+    return null;
+  }
+  try {
+    return Intl.getCanonicalLocales(tag.trim().replaceAll("_", "-"))[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function speechVoiceQualityRank(voice) {
+  const name = voice.name ?? "";
+  const baseName = name.replace(/\s*\(.*\)\s*$/, "");
+  if (/\bpremium\b/i.test(name)) {
+    return 0;
+  }
+  if (/\benhanced\b/i.test(name)) {
+    return 1;
+  }
+  if (noveltySpeechVoiceNames.has(baseName)) {
+    return 4;
+  }
+  return eloquenceSpeechVoiceNames.has(baseName) ? 3 : 2;
+}
+
+function selectionSpeechVoice(languageKey) {
+  const language = selectionSpeechLanguages[languageKey];
+  if (!speechSynthesisApi || !language) {
+    return null;
+  }
+  const candidates = [];
+  speechSynthesisApi.getVoices().forEach((voice, index) => {
+    const locale = canonicalSpeechLocale(voice.lang);
+    if (!voice.localService || !locale || locale.split("-")[0].toLowerCase() !== languageKey) {
+      return;
+    }
+    candidates.push({
+      voice,
+      locale,
+      key: [
+        locale === language.locale ? 0 : 1,
+        speechVoiceQualityRank(voice),
+        voice.default ? 0 : 1,
+        index
+      ]
+    });
+  });
+  candidates.sort((left, right) => {
+    for (let index = 0; index < left.key.length; index += 1) {
+      if (left.key[index] !== right.key[index]) {
+        return left.key[index] - right.key[index];
+      }
+    }
+    return 0;
+  });
+  return candidates[0] ?? null;
+}
+
+function renderSelectionSpeechControls() {
+  for (const button of elements.speakSelectionButtons) {
+    const languageKey = button.dataset.speechLanguage;
+    const language = selectionSpeechLanguages[languageKey];
+    const active = selectionSpeech.language === languageKey && selectionSpeech.status !== "idle";
+    let state = active ? selectionSpeech.status : "idle";
+    let label = `Read selected text aloud in ${language.name}`;
+    let title = label;
+    if (active) {
+      label = `Stop reading aloud in ${language.name}`;
+      title = label;
+    } else if (!speechSynthesisApi) {
+      state = "unavailable";
+      title = "Reading aloud is not supported by this browser.";
+      label = `${label} (unavailable)`;
+    } else {
+      const selected = selectionSpeechVoice(languageKey);
+      if (selected) {
+        title = `${label} (${selected.voice.name}, ${selected.locale})`;
+      } else if (selectionSpeech.voicesSettled) {
+        state = "unavailable";
+        title = `No local ${language.name} voice is available on this device.`;
+        label = `${label} (unavailable)`;
+      }
+    }
+    button.dataset.state = state;
+    button.setAttribute("aria-label", label);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+    button.title = title;
+  }
+}
+
+function clearSelectionSpeechStartTimer() {
+  if (selectionSpeech.startTimer !== null) {
+    window.clearTimeout(selectionSpeech.startTimer);
+    selectionSpeech.startTimer = null;
+  }
+}
+
+function resetSelectionSpeech() {
+  clearSelectionSpeechStartTimer();
+  selectionSpeech.generation += 1;
+  selectionSpeech.language = null;
+  selectionSpeech.status = "idle";
+  selectionSpeech.utterance = null;
+  renderSelectionSpeechControls();
+}
+
+function stopSelectionSpeech() {
+  if (selectionSpeech.status === "idle") {
+    return;
+  }
+  resetSelectionSpeech();
+  speechSynthesisApi?.cancel();
+}
+
+function selectionSpeechErrorMessage(error, language) {
+  switch (error) {
+    case "not-allowed":
+      return "The browser blocked reading aloud. Click the speaker again to retry.";
+    case "language-unavailable":
+    case "voice-unavailable":
+      return `The ${language.name} voice is unavailable. Install a ${language.name} system voice and try again.`;
+    case "text-too-long":
+      return "The selected text is too long to read aloud. Select a shorter passage.";
+    case "audio-busy":
+    case "audio-hardware":
+      return "Audio output is unavailable. Check your audio device and try again.";
+    default:
+      return "Reading aloud failed. Click the speaker to retry.";
+  }
+}
+
+function speakSelectedText(languageKey) {
+  const language = selectionSpeechLanguages[languageKey];
+  if (!language) {
+    return;
+  }
+  if (selectionSpeech.language === languageKey && selectionSpeech.status !== "idle") {
+    stopSelectionSpeech();
+    return;
+  }
+  const text = pendingMessageSelection?.text;
+  if (!text) {
+    return;
+  }
+  if (!speechSynthesisApi) {
+    showSelectionNotice("Reading aloud is not supported by this browser.");
+    return;
+  }
+  if (voiceInputState.session) {
+    void stopVoiceInput(voiceInputState.session, {
+      notice: "Voice input stopped so it does not record speech. Click the speaker again to listen."
+    });
+    return;
+  }
+  const selected = selectionSpeechVoice(languageKey);
+  if (!selected) {
+    showSelectionNotice(
+      selectionSpeech.voicesSettled || speechSynthesisApi.getVoices().length > 0
+        ? `No local ${language.name} voice is available. Install a ${language.name} system voice and try again.`
+        : "Loading voices. Click the speaker again when ready."
+    );
+    renderSelectionSpeechControls();
+    return;
+  }
+
+  stopSelectionSpeech();
+  const generation = selectionSpeech.generation;
+  const isCurrent = () => selectionSpeech.generation === generation;
+  const utterance = new window.SpeechSynthesisUtterance(text);
+  utterance.voice = selected.voice;
+  utterance.lang = selected.locale;
+  utterance.onstart = () => {
+    if (!isCurrent()) {
+      return;
+    }
+    clearSelectionSpeechStartTimer();
+    selectionSpeech.status = "speaking";
+    renderSelectionSpeechControls();
+  };
+  utterance.onend = () => {
+    if (isCurrent()) {
+      resetSelectionSpeech();
+    }
+  };
+  utterance.onerror = (event) => {
+    if (!isCurrent()) {
+      return;
+    }
+    resetSelectionSpeech();
+    if (event.error !== "canceled" && event.error !== "interrupted") {
+      showSelectionNotice(selectionSpeechErrorMessage(event.error, language));
+    }
+  };
+  selectionSpeech.language = languageKey;
+  selectionSpeech.status = "starting";
+  // Chrome may garbage-collect an unreferenced utterance and never fire its end/error events.
+  selectionSpeech.utterance = utterance;
+  renderSelectionSpeechControls();
+  selectionSpeech.startTimer = window.setTimeout(() => {
+    if (isCurrent() && selectionSpeech.status === "starting") {
+      stopSelectionSpeech();
+      showSelectionNotice("Reading aloud could not start. Click the speaker to retry.");
+    }
+  }, speechStartTimeoutMs);
+  try {
+    speechSynthesisApi.cancel();
+    speechSynthesisApi.speak(utterance);
+  } catch (error) {
+    console.error("Unable to read selected text aloud", error);
+    stopSelectionSpeech();
+    showSelectionNotice("Reading aloud could not start. Click the speaker to retry.");
+  }
+}
+
+function initializeSelectionSpeech() {
+  if (speechSynthesisApi) {
+    const settleVoices = () => {
+      selectionSpeech.voicesSettled = true;
+      renderSelectionSpeechControls();
+    };
+    speechSynthesisApi.addEventListener?.("voiceschanged", settleVoices);
+    window.setTimeout(settleVoices, speechVoiceLoadTimeoutMs);
+  }
+  renderSelectionSpeechControls();
 }
 
 function paintMessageSelectionHighlight(body, range) {
@@ -4520,13 +4790,13 @@ function preserveMessageTextSelection(conversation) {
   }
   return {
     reference: selected.reference,
-    askVisible: !elements.askSelection.hidden
+    askVisible: !elements.selectionActions.hidden
   };
 }
 
 function restoreMessageTextSelection(preserved) {
   if (!preserved) {
-    if (!elements.askSelection.hidden) {
+    if (!elements.selectionActions.hidden) {
       updateAskSelection();
     }
     return;
@@ -6778,6 +7048,7 @@ function activateConversation(sessionId) {
   saveActiveConversationScroll();
   persistComposerDraft();
   void stopVoiceInput();
+  stopSelectionSpeech();
   const conversation = conversationState(sessionId);
   state.activeSessionId = sessionId;
   saveActiveSessionId(sessionId);
@@ -6805,6 +7076,7 @@ function activateConversation(sessionId) {
 
 function activateComposerConversation(conversation = state.composer) {
   saveActiveConversationScroll();
+  stopSelectionSpeech();
   state.activeSessionId = null;
   clearActiveSessionId();
   elements.input.value = conversation.draft;
@@ -8409,10 +8681,13 @@ elements.messages.addEventListener("keydown", handleMessageSelectionKeydown);
 elements.messages.addEventListener("scroll", updateAskSelection, { passive: true });
 elements.messages.addEventListener("load", updateScrollToBottomButton, true);
 elements.messages.addEventListener("toggle", updateScrollToBottomButton, true);
-elements.askSelection.addEventListener("mousedown", (event) => {
+elements.selectionActions.addEventListener("mousedown", (event) => {
   event.preventDefault();
 });
 elements.askSelection.addEventListener("click", attachSelectedText);
+for (const button of elements.speakSelectionButtons) {
+  button.addEventListener("click", () => speakSelectedText(button.dataset.speechLanguage));
+}
 document.addEventListener("pointerdown", (event) => {
   keyboardSelectionInProgress = false;
   for (const row of elements.messages.querySelectorAll(".message-selection-row")) {
@@ -8422,7 +8697,7 @@ document.addEventListener("pointerdown", (event) => {
       row.querySelector(".message-selection-summary").setAttribute("aria-expanded", "false");
     }
   }
-  if (elements.askSelection.contains(event.target)) {
+  if (elements.selectionActions.contains(event.target)) {
     return;
   }
   if (elements.messages.contains(event.target)) {
@@ -8625,8 +8900,10 @@ elements.keepAwake.addEventListener("click", () => {
   void updateScreenWakeLock();
 });
 renderVoiceInputControl();
+initializeSelectionSpeech();
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
+    stopSelectionSpeech();
     void stopVoiceInput(voiceInputState.session, {
       notice: "Voice input stopped because this tab was hidden."
     });
@@ -8635,6 +8912,7 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("pagehide", () => {
   void stopVoiceInput();
+  stopSelectionSpeech();
   screenWakeLock.pageActive = false;
   void updateScreenWakeLock();
 });
