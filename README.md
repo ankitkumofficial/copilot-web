@@ -175,8 +175,8 @@ keeps the model, tools, authentication, and workspace local.
   **Ask Copilot** (inserts a reference into the message without sending),
   **Attach diff**, copy actions, a wrap toggle, and a full-file view. The
   repository is the one containing the conversation's newest successful `edit` or
-  `create`. When the panel opens, that is found by replaying the conversation's
-  history; while it is open, it follows Copilot's edits. Without such an edit, it is
+  `create`. That is found by replaying the conversation's history once, then followed
+  live as Copilot edits files, whether the panel is open or closed. Without such an edit, it is
   the conversation's working directory when that is inside a git repository; otherwise a picker lists the repositories under `COPILOT_PROJECTS_DIR`
   as a collapsible folder tree. Folders start collapsed and expand on click or
   with the arrow keys. Repositories up to three levels deep are listed; folders

@@ -1351,10 +1351,10 @@ test("session repository resolves the conversation's working-tree root once it i
   const readRepository = async () => (await fetch(repositoryUrl, { headers: server.headers })).json();
 
   // The fixture conversation runs in the projects directory, which is not a repository yet.
-  assert.deepEqual(await readRepository(), { root: null, name: null });
+  assert.deepEqual(await readRepository(), { root: null, name: null, editedRoot: null });
   testGit(server.projectsDirectory, "init", "-q");
   const root = await realpath(server.projectsDirectory);
-  assert.deepEqual(await readRepository(), { root, name: path.basename(root) });
+  assert.deepEqual(await readRepository(), { root, name: path.basename(root), editedRoot: null });
   const status = await fetch(`${server.baseUrl}/api/git/status?repo=${encodeURIComponent(root)}`, { headers: server.headers });
   assert.equal(status.status, 200);
   assert.equal((await status.json() as JsonObject).hasCommits, false);
@@ -1395,7 +1395,7 @@ test("session repository follows the newest successful edit inside a repository 
   });
 
   // The newest successful edit inside a repository wins; the failed edit and the scratch file outside repositories are skipped.
-  const response = await fetch(`${server.baseUrl}/api/sessions/session-1/repository?edits=1`, { headers: server.headers });
+  const response = await fetch(`${server.baseUrl}/api/sessions/session-1/repository`, { headers: server.headers });
   assert.deepEqual(await response.json(), { root: null, name: null, editedRoot: other });
   const status = await fetch(`${server.baseUrl}/api/git/status?repo=${encodeURIComponent(other)}`, { headers: server.headers });
   assert.equal(status.status, 200);
@@ -1406,7 +1406,7 @@ test("session repository follows live edits made while the conversation runs", {
 }, async (t) => {
   const server = await startTestServer(t, { existingSession: true, nativeMessages: true, nativeHistory: { events: [] } });
   const repo = await createTestRepository(path.join(server.projectsDirectory, "live-app"), { "a.txt": "a\n" });
-  const repositoryUrl = `${server.baseUrl}/api/sessions/session-1/repository?edits=1`;
+  const repositoryUrl = `${server.baseUrl}/api/sessions/session-1/repository`;
   const readRepository = async () => (await fetch(repositoryUrl, { headers: server.headers })).json();
 
   assert.equal((await readRepository()).editedRoot, null);
@@ -3551,11 +3551,11 @@ test("opens local file links from messages in a preview dialog", {
       text: "function first() {}\r\nfunction second() {}\rfunction third() {}\n"
     },
     {
-      path: "src/chunked-lines.custom",
+      path: "src/many-lines.custom",
       language: "generic",
       tokenType: "keyword",
       tokenText: "function",
-      text: `function chunkedPreview() {}\n${"\n".repeat(4095)}`
+      text: `function manyLinesPreview() {}\n${"\n".repeat(4095)}`
     }
   ];
   const server = await startTestServer(t, {
@@ -3622,7 +3622,7 @@ test("opens local file links from messages in a preview dialog", {
       Boolean(document.querySelector(".file-preview-text"))`);
     assert.equal(
       await evaluate(`document.querySelector(".file-preview-code").textContent`),
-      file.text
+      file.text.replace(/\r\n?/g, "\n")
     );
     assert.equal(
       await evaluate(`document.querySelector(".file-preview-line-numbers").textContent`),
