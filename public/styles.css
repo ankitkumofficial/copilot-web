@@ -1942,6 +1942,7 @@ button:disabled {
 
 .file-preview-text {
   box-sizing: border-box;
+  display: flex;
   width: 100%;
   min-width: 0;
   margin: 0;
@@ -1957,7 +1958,23 @@ button:disabled {
   white-space: pre;
 }
 
+.file-preview-line-numbers {
+  position: sticky;
+  left: 0;
+  flex: none;
+  margin-right: 12px;
+  padding-right: 12px;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  text-align: right;
+  user-select: none;
+}
+
 .file-preview-code {
+  display: block;
+  flex: none;
+  width: max-content;
   font: inherit;
 }
 
