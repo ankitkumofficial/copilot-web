@@ -236,6 +236,7 @@ export function initChangesPanel({
     editorUrlTemplate: null,
     session: null,
     sessionRoot: null,
+    editedRoot: null,
     sessionName: null,
     projectRepositories: null,
     projectRepositoriesAt: 0,
@@ -528,7 +529,7 @@ export function initChangesPanel({
     return s.projectRepositoriesPromise;
   }
 
-  // A repository picked in the panel stays; otherwise the conversation's working directory decides.
+  // A repository picked in the panel stays; otherwise the latest edited repository, then the working directory, decides.
   function chooseRepository() {
     if (s.repository && (s.repositoryFromStorage || s.repositoryChosen)) {
       return;
@@ -539,7 +540,7 @@ export function initChangesPanel({
       s.repositoryFromStorage = true;
       return;
     }
-    setRepository(s.sessionRoot);
+    setRepository(s.editedRoot ?? s.sessionRoot);
     s.repositoryFromStorage = false;
   }
 
@@ -561,11 +562,15 @@ export function initChangesPanel({
     renderHeader();
     try {
       if (session) {
-        const repository = await api(`/api/sessions/${encodeURIComponent(session.sessionId)}/repository`);
+        // The edited repository replays the conversation's history, so only an open panel asks for it.
+        const repository = await api(`/api/sessions/${encodeURIComponent(session.sessionId)}/repository${s.open ? "?edits=1" : ""}`);
         if (token !== s.sessionToken) {
           return;
         }
         s.sessionRoot = repository.root ?? null;
+        if (repository.editedRoot !== undefined) {
+          s.editedRoot = repository.editedRoot;
+        }
         s.sessionName = repository.name ?? null;
       }
       chooseRepository();
@@ -1982,6 +1987,7 @@ export function initChangesPanel({
       s.sessionToken += 1;
       s.repoToken += 1;
       s.sessionRoot = null;
+      s.editedRoot = null;
       s.sessionName = null;
       s.status = null;
       s.statusAt = 0;

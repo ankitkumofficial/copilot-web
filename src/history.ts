@@ -807,6 +807,16 @@ export class CopilotHistoryReader {
   }
 
   public async read(sessionId: string): Promise<JsonObject[]> {
+    return this.readEvents(
+      sessionId,
+      (event) => isNativeMessageEvent(event) && isRootAgentMessageEvent(event)
+    );
+  }
+
+  public async readEvents(
+    sessionId: string,
+    includeEvent: (event: JsonObject) => boolean
+  ): Promise<JsonObject[]> {
     if (!this.ready || !this.client) {
       throw new Error(
         this.failure ?? "Copilot persisted message history is unavailable"
@@ -815,11 +825,7 @@ export class CopilotHistoryReader {
 
     await this.client.start();
     // The SDK recreates RPC bindings after reconnecting, so resolve them for every read.
-    return readAllPersistedEvents(
-      this.currentPageReader(),
-      sessionId,
-      (event) => isNativeMessageEvent(event) && isRootAgentMessageEvent(event)
-    );
+    return readAllPersistedEvents(this.currentPageReader(), sessionId, includeEvent);
   }
 
   public async readPage(request: PersistedEventsRequest): Promise<unknown> {

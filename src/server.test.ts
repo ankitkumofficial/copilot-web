@@ -179,6 +179,25 @@ function emitNativePrompt(request, sessionId, reply) {
     content: promptText,
     attachments
   }, 0), true);
+  if (promptText.startsWith("edit-file:")) {
+    // Like the CLI, the edit is persisted for replay and reported live as ACP tool updates, not as session events.
+    const toolCallId = "live-edit-" + userMessageId;
+    const filePath = promptText.slice("edit-file:".length);
+    persistNativeEvent(sessionId, createNativeEvent("tool.execution_start", undefined, {
+      toolCallId, toolName: "edit", arguments: { path: filePath }
+    }, 50));
+    persistNativeEvent(sessionId, createNativeEvent("tool.execution_complete", undefined, {
+      toolCallId, success: true
+    }, 60));
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: {
+      sessionUpdate: "tool_call", toolCallId, title: "Editing file", kind: "edit", status: "pending",
+      rawInput: { path: filePath }, locations: [{ path: filePath }]
+    } } }) + "\\n");
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: {
+      sessionUpdate: "tool_call_update", toolCallId, status: "completed",
+      content: [{ type: "diff", path: filePath, oldText: "", newText: "edited" }]
+    } } }) + "\\n");
+  }
   emitNativeEvent(sessionId, createNativeEvent(
     "assistant.message_start",
     assistantMessageId,
@@ -1340,6 +1359,63 @@ test("session repository resolves the conversation's working-tree root once it i
   assert.equal(status.status, 200);
   assert.equal((await status.json() as JsonObject).hasCommits, false);
   assert.equal((await fetch(repositoryUrl)).status, 401);
+});
+
+function fileEditHistory(toolCallId: string, filePath: string, success: boolean, toolName = "edit"): JsonObject[] {
+  const timestamp = "2026-10-14T10:00:00.000Z";
+  return [
+    {
+      id: `${toolCallId}-start`, type: "tool.execution_start", timestamp, parentId: null,
+      data: { toolCallId, toolName, arguments: { path: filePath } }
+    },
+    {
+      id: `${toolCallId}-complete`, type: "tool.execution_complete", timestamp, parentId: null,
+      data: { toolCallId, success }
+    }
+  ];
+}
+
+test("session repository follows the newest successful edit inside a repository in the conversation history", {
+  skip: gitAvailable ? false : "git is not on PATH"
+}, async (t) => {
+  const workspace = await mkdtemp(path.join(tmpdir(), "copilot-edits-"));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const edited = await createTestRepository(path.join(workspace, "edited"), { "a.txt": "a\n" });
+  const other = await createTestRepository(path.join(workspace, "other"), { "b.txt": "b\n" });
+  const scratchDirectory = path.join(workspace, "notes");
+  await mkdir(scratchDirectory);
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeHistory: { events: [
+      ...fileEditHistory("call-1", path.join(edited, "a.txt"), true),
+      ...fileEditHistory("call-2", path.join(other, "b.txt"), true),
+      ...fileEditHistory("call-3", path.join(other, "c.txt"), false),
+      ...fileEditHistory("call-4", path.join(scratchDirectory, "scratch.md"), true, "create")
+    ] }
+  });
+
+  // The newest successful edit inside a repository wins; the failed edit and the scratch file outside repositories are skipped.
+  const response = await fetch(`${server.baseUrl}/api/sessions/session-1/repository?edits=1`, { headers: server.headers });
+  assert.deepEqual(await response.json(), { root: null, name: null, editedRoot: other });
+  const status = await fetch(`${server.baseUrl}/api/git/status?repo=${encodeURIComponent(other)}`, { headers: server.headers });
+  assert.equal(status.status, 200);
+});
+
+test("session repository follows live edits made while the conversation runs", {
+  skip: gitAvailable ? false : "git is not on PATH"
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeMessages: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "live-app"), { "a.txt": "a\n" });
+  const repositoryUrl = `${server.baseUrl}/api/sessions/session-1/repository?edits=1`;
+  const readRepository = async () => (await fetch(repositoryUrl, { headers: server.headers })).json();
+
+  assert.equal((await readRepository()).editedRoot, null);
+  const prompt = await server.post("messages", {
+    text: `edit-file:${path.join(repo, "a.txt")}`,
+    clientPromptId: "live-edit"
+  });
+  assert.equal(prompt.status, 200);
+  assert.equal((await readRepository()).editedRoot, repo);
 });
 
 test("retrieves account quota through the authenticated GitHub CLI", async (t) => {
@@ -4301,6 +4377,52 @@ test("changes view lists staged and unstaged files, stages and unstages them, re
 
   const prompts = (await server.requests()).filter((request) => request.method === "session/prompt");
   assert.equal(prompts.length, 1, "only the explicit test prompt was sent");
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("changes view follows the repository of the latest edit until a repository is picked", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeMessages: true, nativeHistory: { events: [] } });
+  const edited = await createTestRepository(path.join(server.projectsDirectory, "edited"), { "a.txt": "a\n", "b.txt": "b\n" });
+  const picked = await createTestRepository(path.join(server.projectsDirectory, "picked"), { "c.txt": "c\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "session-1"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "Choose a repository"`);
+
+  // The panel refreshes on demand; the edit itself is sent through the API so the test controls its timing.
+  const editWith = async (filePath: string, clientPromptId: string) => {
+    // Selecting the conversation can still be settling its configuration, which the API reports as a conflict.
+    const deadline = Date.now() + 5_000;
+    let response = await server.post("messages", { text: `edit-file:${filePath}`, clientPromptId });
+    while (response.status === 409 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      response = await server.post("messages", { text: `edit-file:${filePath}`, clientPromptId });
+    }
+    assert.equal(response.status, 200);
+  };
+  const refreshPanel = () => evaluate(`document.querySelector("#changes-refresh").click()`);
+  await editWith(path.join(edited, "a.txt"), "edit-first");
+  await refreshPanel();
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "edited"`);
+
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(picked)}).click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "picked"`);
+
+  // A later edit must not override the repository picked in the panel.
+  await editWith(path.join(edited, "b.txt"), "edit-second");
+  await refreshPanel();
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  assert.equal(await evaluate(`document.querySelector("#changes-repository-label").textContent`), "picked");
   assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
 });
 

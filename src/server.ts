@@ -51,6 +51,7 @@ import {
   type NativeMessage,
   type NativeMessageCollection
 } from "./history.js";
+import { fileEditEventFilter, latestEditedRepository, observeToolUpdate, RecentFileEdits } from "./file-edits.js";
 import {
   AttachmentStore,
   attachmentId,
@@ -1354,12 +1355,71 @@ async function main(): Promise<void> {
     return resolved;
   };
 
-  const readSessionRepository = async (session: SessionInfo): Promise<JsonObject> => {
+  // Live edits are queued until the persisted history has been replayed, so older replayed edits never override newer live ones.
+  interface SessionFileEdits {
+    edits: RecentFileEdits;
+    queued: Array<(edits: RecentFileEdits) => void> | undefined;
+    replayed: Promise<void>;
+  }
+  const sessionFileEdits = new Map<string, SessionFileEdits>();
+  const fileEditsFor = (sessionId: string): SessionFileEdits => {
+    let state = sessionFileEdits.get(sessionId);
+    if (!state) {
+      const queued: Array<(edits: RecentFileEdits) => void> = [];
+      const current: SessionFileEdits = { edits: new RecentFileEdits(), queued, replayed: Promise.resolve() };
+      current.replayed = copilotHistory.readEvents(sessionId, fileEditEventFilter())
+        // Without persisted history, only live edits can be seen.
+        .catch((): JsonObject[] => [])
+        .then((events) => {
+          for (const event of events) {
+            current.edits.observe(event);
+          }
+          for (const apply of queued) {
+            apply(current.edits);
+          }
+          current.queued = undefined;
+        });
+      sessionFileEdits.set(sessionId, current);
+      state = current;
+    }
+    return state;
+  };
+  const observeFileEdit = (sessionId: string, apply: (edits: RecentFileEdits) => void): void => {
+    // Without a replayed state, the persisted history read by the first replay already contains this update.
+    const state = sessionFileEdits.get(sessionId);
+    if (!state) {
+      return;
+    }
+    if (state.queued) {
+      state.queued.push(apply);
+    } else {
+      apply(state.edits);
+    }
+  };
+  const readEditedRepository = async (sessionId: string): Promise<string | null> => {
+    const state = fileEditsFor(sessionId);
+    await state.replayed;
+    const root = await latestEditedRepository(
+      state.edits.newestFirst(),
+      (directory) => cachedToplevel(directory).catch(() => undefined)
+    );
+    if (root) {
+      knownRepositoryRoots.add(root);
+    }
+    return root ?? null;
+  };
+
+  const readSessionRepository = async (session: SessionInfo, includeEdits: boolean): Promise<JsonObject> => {
     const root = session.cwd ? await cachedToplevel(session.cwd) : undefined;
     if (root) {
       knownRepositoryRoots.add(root);
     }
-    return { root: root ?? null, name: root ? path.basename(root) : null };
+    const name = root ? path.basename(root) : null;
+    // Replaying the history is costly, so only the open panel asks for the edited repository.
+    if (!includeEdits) {
+      return { root: root ?? null, name };
+    }
+    return { root: root ?? null, name, editedRoot: await readEditedRepository(session.sessionId) };
   };
 
   const projectRepositories = (): Promise<RepositoryEntry[]> => {
@@ -2072,6 +2132,9 @@ async function main(): Promise<void> {
       return;
     }
     const update = isRecord(event.params.update) ? event.params.update : undefined;
+    if (sessionId && update && (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")) {
+      observeFileEdit(sessionId, (edits) => observeToolUpdate(edits, update));
+    }
     if (
       sessionId &&
       activePrompt &&
@@ -2611,6 +2674,7 @@ async function main(): Promise<void> {
         sessionCache.delete(sessionId);
         sessionReplayCache.delete(sessionId);
         nativeMessageStates.delete(sessionId);
+        sessionFileEdits.delete(sessionId);
         historyPager.forget(sessionId);
         truncatedReplays.delete(sessionId);
         legacyReplaySessions.delete(sessionId);
@@ -2684,7 +2748,7 @@ async function main(): Promise<void> {
     }
 
     if (request.method === "GET" && subroute === "repository") {
-      jsonResponse(response, 200, await readSessionRepository(session));
+      jsonResponse(response, 200, await readSessionRepository(session, requestUrl.searchParams.get("edits") === "1"));
       return true;
     }
 
