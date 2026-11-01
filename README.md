@@ -150,6 +150,8 @@ keeps the model, tools, authentication, and workspace local.
 - Choose between the standard and long context tiers.
 - Attach files of any type to prompts by pasting, dragging and dropping, or
   using the attachment picker.
+- Preview internal files linked from messages with syntax coloring based on
+  their file type, without changing source text or whitespace.
 - Render common Markdown formatting in user and assistant messages, including
   emphasis, headings, lists, links, inline code, code blocks, and quotes.
 - Use a light or dark theme, defaulting to the browser/system theme.

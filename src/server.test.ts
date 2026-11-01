@@ -3433,6 +3433,36 @@ test("opens local file links from messages in a preview dialog", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
 }, async (t) => {
+  const previewFiles = [
+    {
+      path: "src/example.js",
+      language: "javascript",
+      tokenType: "keyword",
+      tokenText: "const",
+      text: 'const previewValue  = "two  spaces";\n// comment stays\n'
+    },
+    {
+      path: "src/Example.java",
+      language: "java",
+      tokenType: "keyword",
+      tokenText: "public",
+      text: 'public class Example {\n  String value = "two  spaces";\n}\n'
+    },
+    {
+      path: "src/styles.css",
+      language: "css",
+      tokenType: "property",
+      tokenText: "color",
+      text: "body {\n  color: #fff;\n  margin: 0;\n}\n"
+    },
+    {
+      path: "src/example.custom",
+      language: "generic",
+      tokenType: "keyword",
+      tokenText: "function",
+      text: "function genericPreview() { return 42; }\n"
+    }
+  ];
   const server = await startTestServer(t, {
     existingSession: true,
     nativeMessages: true,
@@ -3452,15 +3482,19 @@ test("opens local file links from messages in a preview dialog", {
           parentId: "persisted-user-event",
           data: {
             messageId: "native-assistant-1",
-            content: "Open [src/example.ts](src/example.ts#L1) and [docs](https://example.com)"
+            content: `Open ${previewFiles.map(({ path: filePath }) => (
+              `[${filePath}](${filePath}#L1)`
+            )).join(", ")} and [docs](https://example.com)`
           }
         }
       ]
     }
   });
-  const filePath = path.join(server.projectsDirectory, "src", "example.ts");
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(filePath, "const previewValue = 42;\n");
+  for (const file of previewFiles) {
+    const filePath = path.join(server.projectsDirectory, file.path);
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, file.text);
+  }
 
   const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
   await waitFor(`Boolean(document.querySelector(
@@ -3484,13 +3518,44 @@ test("opens local file links from messages in a preview dialog", {
   `), true);
 
   const pageUrl = await evaluate("location.href");
-  await evaluate(`document.querySelector(
-    ".message.assistant a[data-local-file-preview]"
-  ).click()`);
-  await waitFor(`document.querySelector("#image-preview-dialog").open &&
-    document.querySelector(".file-preview-text")?.textContent === "const previewValue = 42;\\n"`);
+  for (const [index, file] of previewFiles.entries()) {
+    await evaluate(`document.querySelectorAll(
+      ".message.assistant a[data-local-file-preview]"
+    )[${index}].click()`);
+    await waitFor(`document.querySelector("#image-preview-dialog").open &&
+      document.querySelector("#file-preview-title").textContent === ${JSON.stringify(path.basename(file.path))} &&
+      Boolean(document.querySelector(".file-preview-text"))`);
+    assert.equal(
+      await evaluate(`document.querySelector(".file-preview-text").textContent`),
+      file.text
+    );
+    assert.equal(
+      await evaluate(`document.querySelector(".file-preview-code").classList.contains(
+        "language-${file.language}"
+      )`),
+      true
+    );
+    assert.equal(
+      await evaluate(`Array.from(document.querySelectorAll(
+        ".file-preview-token-${file.tokenType}"
+      )).some((token) => token.textContent === ${JSON.stringify(file.tokenText)})`),
+      true
+    );
+    assert.equal(
+      await evaluate(`getComputedStyle(document.querySelector(
+        ".file-preview-token-${file.tokenType}"
+      )).color !== getComputedStyle(document.querySelector(".file-preview-text")).color`),
+      true
+    );
+    assert.equal(
+      await evaluate(`getComputedStyle(document.querySelector(".file-preview-text")).whiteSpace`),
+      "pre"
+    );
+    await evaluate(`document.querySelector("#image-preview-dialog").close()`);
+    await waitFor(`!document.querySelector("#image-preview-dialog").open &&
+      document.querySelector("#file-preview-title").textContent === ""`);
+  }
   assert.equal(await evaluate("location.href"), pageUrl);
-  assert.equal(await evaluate(`document.querySelector("#file-preview-title").textContent`), "example.ts");
 });
 
 test("renders native completion times outside message content through refresh", {
