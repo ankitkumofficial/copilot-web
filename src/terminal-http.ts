@@ -48,7 +48,7 @@ function jsonResponse(response: ServerResponse, status: number, body: unknown): 
   response.end(JSON.stringify(body));
 }
 
-function sameToken(candidate: string, expected: string): boolean {
+export function sameToken(candidate: string, expected: string): boolean {
   const left = Buffer.from(candidate);
   const right = Buffer.from(expected);
   return left.length === right.length && timingSafeEqual(left, right);
