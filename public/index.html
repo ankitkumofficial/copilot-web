@@ -11,31 +11,7 @@
       type="image/svg+xml"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='9' fill='%23e5b75c'/%3E%3Ccircle cx='16' cy='16' r='14' fill='none' stroke='%23e5b75c' stroke-opacity='.2' stroke-width='3'/%3E%3C/svg%3E"
     >
-    <script>
-      (() => {
-        let preference = "system";
-        try {
-          const stored = localStorage.getItem("copilot-web-theme");
-          if (stored === "light" || stored === "dark") {
-            preference = stored;
-          }
-        } catch {
-          preference = "system";
-        }
-        try {
-          if (localStorage.getItem("copilot-web-sidebar-collapsed") === "true") {
-            document.documentElement.dataset.sidebarCollapsed = "true";
-          }
-        } catch {
-          document.documentElement.dataset.sidebarCollapsed = "false";
-        }
-        const theme = preference === "system"
-          ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
-          : preference;
-        document.documentElement.dataset.theme = theme;
-        document.documentElement.dataset.themePreference = preference;
-      })();
-    </script>
+    <script src="/theme-bootstrap.js"></script>
     <link rel="stylesheet" href="/styles.css">
     <script type="module" src="/app.js"></script>
   </head>
@@ -244,6 +220,14 @@
                     </svg>
                     <span>Attach files</span>
                   </button>
+                  <template id="terminal-action-template">
+                    <button id="terminal-action" class="composer-more-item" type="button" aria-label="Terminal" title="Open a terminal in the selected repository">
+                      <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="m4 17 6-5-6-5M12 19h8"></path>
+                      </svg>
+                      <span>Terminal</span>
+                    </button>
+                  </template>
                   <button id="changes-toggle" class="composer-more-item" type="button" aria-controls="changes-panel" aria-pressed="false" aria-label="Repository" title="Show repository and changes (Ctrl+Shift+G)">
                     <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
                       <path d="M6 3v12m0 0a3 3 0 1 0 0 6 3 3 0 0 0 0-6Zm12-6a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm0 0c0 5-6 4-12 9"></path>
@@ -313,6 +297,11 @@
               </div>
               <span id="changes-branch" class="changes-branch"></span>
             </div>
+            <div class="repository-tabs" role="tablist" aria-label="Repository views">
+              <button id="repository-tab-changes" class="repository-tab" type="button" role="tab" aria-selected="true" aria-controls="changes-tabpanel">Changes</button>
+              <button id="repository-tab-terminal" class="repository-tab" type="button" role="tab" aria-selected="false" aria-controls="terminal-tabpanel" tabindex="-1" hidden>Terminal</button>
+            </div>
+            <div id="changes-tabpanel" class="repository-tabpanel changes-tabpanel" role="tabpanel" aria-labelledby="repository-tab-changes">
             <div class="changes-summary">
               <span id="changes-summary-text"></span>
               <input id="changes-filter" class="changes-filter" type="search" placeholder="Filter files" aria-label="Filter changed files" hidden>
@@ -333,6 +322,9 @@
                 <button id="changes-diff-back" class="changes-icon-button changes-diff-back" type="button" aria-label="Back to file list" title="Back to file list (Escape)">‹</button>
                 <h3 id="changes-diff-title" class="changes-diff-title"></h3>
                 <span id="changes-diff-meta" class="changes-diff-meta"></span>
+                <button id="changes-diff-close" class="changes-icon-button changes-diff-close" type="button" aria-label="Close diff" title="Close diff (Escape)">
+                  <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg>
+                </button>
               </div>
               <div class="changes-diff-actions" role="toolbar" aria-label="Diff actions">
                 <button id="changes-stage" class="changes-action" type="button" title="Stage file (S)">Stage</button>
@@ -351,6 +343,26 @@
                 </div>
               </div>
               <div id="changes-diff-body" class="changes-diff-body"></div>
+            </section>
+            </div>
+            <section id="terminal-tabpanel" class="repository-tabpanel terminal-tabpanel" role="tabpanel" aria-labelledby="repository-tab-terminal" hidden>
+              <div class="terminal-toolbar">
+                <div id="terminal-tabs" class="terminal-tabs" role="tablist" aria-label="Terminals in this repository"></div>
+                <button id="terminal-new" class="changes-icon-button" type="button" aria-label="New terminal in this repository" title="New terminal in this repository" disabled>
+                  <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>
+                </button>
+              </div>
+              <p id="terminal-notice" class="terminal-notice" role="status" aria-live="polite" hidden></p>
+              <div id="terminal-screen" class="terminal-screen" hidden></div>
+              <div id="terminal-empty" class="terminal-empty">
+                <p id="terminal-empty-text"></p>
+                <button id="terminal-empty-action" class="secondary-button" type="button" hidden>Open terminal</button>
+              </div>
+              <div id="terminal-footer" class="terminal-footer" hidden>
+                <span id="terminal-footer-status"></span>
+                <button id="terminal-restart" class="changes-action" type="button">Restart</button>
+                <button id="terminal-close" class="changes-action" type="button">Close</button>
+              </div>
             </section>
             <p id="changes-live" class="visually-hidden" role="status" aria-live="polite"></p>
           </aside>
@@ -374,6 +386,17 @@
         <div class="delete-dialog-actions">
           <button id="delete-cancel" class="secondary-button" value="cancel" type="submit">Cancel</button>
           <button id="delete-confirm" class="danger-button" value="confirm" type="submit">Delete</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="terminal-close-dialog" class="delete-dialog" aria-labelledby="terminal-close-title" aria-describedby="terminal-close-description">
+      <form id="terminal-close-form" method="dialog">
+        <h2 id="terminal-close-title">Close terminal?</h2>
+        <p id="terminal-close-description">Processes running in this terminal will stop.</p>
+        <div class="delete-dialog-actions">
+          <button class="secondary-button" value="cancel" type="submit">Cancel</button>
+          <button id="terminal-close-confirm" class="danger-button" value="confirm" type="submit">Close</button>
         </div>
       </form>
     </dialog>

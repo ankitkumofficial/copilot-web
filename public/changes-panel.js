@@ -145,7 +145,7 @@ function describeError(error) {
 
 function isEditableTarget(target) {
   return target instanceof Element && Boolean(target.closest(
-    "input, textarea, select, [contenteditable=''], [contenteditable='true'], prompt-editor, .terminal-dock"
+    "input, textarea, select, [contenteditable=''], [contenteditable='true'], prompt-editor, .terminal-tabpanel"
   ));
 }
 
@@ -171,6 +171,7 @@ export function initChangesPanel({
   api,
   insertIntoComposer,
   attachFiles,
+  terminal = null,
   notify = () => {}
 }) {
   const query = (selector) => document.querySelector(selector);
@@ -189,6 +190,13 @@ export function initChangesPanel({
     repositoryLabel: query("#changes-repository-label"),
     repositoryMenu: query("#changes-repository-menu"),
     branch: query("#changes-branch"),
+    tabChanges: query("#repository-tab-changes"),
+    tabTerminal: query("#repository-tab-terminal"),
+    tabsRow: query(".repository-tabs"),
+    changesTabpanel: query("#changes-tabpanel"),
+    terminalTabpanel: query("#terminal-tabpanel"),
+    // Created from a template only while the terminal is enabled, so a disabled server leaves no menu entry.
+    terminalAction: null,
     stage: query("#changes-stage"),
     summary: query("#changes-summary-text"),
     filter: query("#changes-filter"),
@@ -197,6 +205,7 @@ export function initChangesPanel({
     splitResizer: query("#changes-split-resizer"),
     diff: query("#changes-diff"),
     diffBack: query("#changes-diff-back"),
+    diffClose: query("#changes-diff-close"),
     diffTitle: query("#changes-diff-title"),
     diffMeta: query("#changes-diff-meta"),
     diffBody: query("#changes-diff-body"),
@@ -221,6 +230,9 @@ export function initChangesPanel({
     width: Number.isFinite(storedWidth) && storedWidth >= minimumWidth ? storedWidth : defaultWidth,
     expanded: false,
     wrap: readStorage(wrapStorageKey) === "true",
+    // The terminal tab exists only when the server enables it; the tab resets to Changes when it does not.
+    terminalEnabled: false,
+    tab: "changes",
     editorUrlTemplate: null,
     session: null,
     sessionRoot: null,
@@ -290,7 +302,112 @@ export function initChangesPanel({
     el.expand.setAttribute("aria-pressed", String(s.expanded));
     el.expand.setAttribute("aria-label", s.expanded ? "Restore repository panel width" : "Expand repository panel");
     el.expand.title = s.expanded ? "Restore width" : "Expand";
+    applyTabs();
+    syncTerminal();
   }
+
+  // ---- tabs ------------------------------------------------------------
+
+  function applyTabs() {
+    syncTerminalAction();
+    const onChanges = s.tab !== "terminal" || !s.terminalEnabled;
+    el.tabTerminal.hidden = !s.terminalEnabled;
+    el.tabChanges.setAttribute("aria-selected", String(onChanges));
+    el.tabChanges.tabIndex = onChanges ? 0 : -1;
+    el.tabTerminal.setAttribute("aria-selected", String(!onChanges));
+    el.tabTerminal.tabIndex = onChanges ? -1 : 0;
+    el.changesTabpanel.hidden = !onChanges;
+    el.terminalTabpanel.hidden = onChanges;
+    el.refresh.hidden = !onChanges;
+    el.panel.dataset.tab = onChanges ? "changes" : "terminal";
+  }
+
+  function syncTerminalAction() {
+    if (s.terminalEnabled && !el.terminalAction) {
+      const template = query("#terminal-action-template");
+      const action = template?.content.firstElementChild?.cloneNode(true);
+      if (!action) {
+        return;
+      }
+      action.addEventListener("click", () => openTerminal());
+      const attach = query("#attach-files");
+      if (attach) {
+        attach.after(action);
+      } else {
+        query("#composer-more-menu")?.append(action);
+      }
+      el.terminalAction = action;
+    } else if (!s.terminalEnabled && el.terminalAction) {
+      el.terminalAction.remove();
+      el.terminalAction = null;
+    }
+  }
+
+  function setTab(tab) {
+    if (tab === "terminal" && !s.terminalEnabled) {
+      return;
+    }
+    if (s.tab !== tab) {
+      s.tab = tab;
+      render();
+    }
+    applyTabs();
+    syncTerminal();
+  }
+
+  // The shell is connected only while its tab is visible, so closing the panel detaches the socket.
+  function syncTerminal() {
+    terminal?.setActive(s.terminalEnabled && s.open && s.tab === "terminal");
+  }
+
+  function syncTerminalRepository() {
+    if (s.terminalEnabled) {
+      terminal?.setRepository(s.repository);
+    }
+  }
+
+  function setTerminalEnabled(enabled) {
+    s.terminalEnabled = enabled === true;
+    if (!s.terminalEnabled && s.tab === "terminal") {
+      s.tab = "changes";
+    }
+    render();
+  }
+
+  // The Repository action shows the Changes view. From the terminal view it switches there rather than closing.
+  function openRepositoryView() {
+    if (s.open && s.tab === "changes") {
+      toggle(false);
+      return;
+    }
+    setTab("changes");
+    if (!s.open) {
+      toggle(true);
+    }
+  }
+
+  function openTerminal() {
+    if (!s.terminalEnabled || !terminal) {
+      return;
+    }
+    if (!s.open) {
+      toggle(true);
+    }
+    setTab("terminal");
+    void terminal.openRepository(s.repository);
+  }
+
+  el.tabChanges.addEventListener("click", () => setTab("changes"));
+  el.tabTerminal.addEventListener("click", () => setTab("terminal"));
+  el.tabsRow.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") {
+      return;
+    }
+    event.preventDefault();
+    const tab = s.tab === "terminal" ? "changes" : "terminal";
+    setTab(tab);
+    (tab === "terminal" ? el.tabTerminal : el.tabChanges).focus();
+  });
 
   function toggle(force) {
     const next = typeof force === "boolean" ? force : !s.open;
@@ -1320,6 +1437,7 @@ export function initChangesPanel({
   function render() {
     applyOpen();
     renderToolbar();
+    syncTerminalRepository();
     if (!s.open) {
       return;
     }
@@ -1574,7 +1692,7 @@ export function initChangesPanel({
     target?.focus();
   }
 
-  el.toggle.addEventListener("click", () => toggle());
+  el.toggle.addEventListener("click", () => openRepositoryView());
   el.close.addEventListener("click", () => {
     toggle(false);
     focusToggle();
@@ -1681,6 +1799,7 @@ export function initChangesPanel({
     renderList();
   });
   el.diffBack.addEventListener("click", closeDiff);
+  el.diffClose.addEventListener("click", closeDiff);
   el.ask.addEventListener("click", () => askCopilot());
   el.attach.addEventListener("click", () => void attachDiff(s.diff?.diff ?? ""));
   el.copy.addEventListener("click", () => void copyText(s.diff?.diff ?? "", "Diff"));
@@ -1726,6 +1845,18 @@ export function initChangesPanel({
 
   el.panel.addEventListener("keydown", (event) => {
     if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) {
+      return;
+    }
+    // Keys typed into the shell belong to the shell, including Escape.
+    if (event.target instanceof Element && event.target.closest(".terminal-tabpanel")) {
+      return;
+    }
+    if (s.tab === "terminal") {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        toggle(false);
+        focusToggle();
+      }
       return;
     }
     if (event.key === "Escape") {
@@ -1801,7 +1932,11 @@ export function initChangesPanel({
     event.preventDefault();
     toggle();
     if (s.open) {
-      el.list.focus();
+      if (s.tab === "terminal") {
+        terminal?.focus();
+      } else {
+        el.list.focus();
+      }
     }
   });
 
@@ -1828,6 +1963,8 @@ export function initChangesPanel({
         renderDiffArea();
       }
     },
+    setTerminalEnabled,
+    openTerminal,
     setSession(session) {
       const sessionId = session?.sessionId ?? null;
       if (sessionId === (s.session?.sessionId ?? null)) {

@@ -161,6 +161,9 @@ keeps the model, tools, authentication, and workspace local.
   to the bottom.
 - Collapse or expand the conversation sidebar; its state is remembered in the
   browser.
+- Open an interactive terminal for the selected repository from
+  **More actions** → **Terminal**, next to the Repository panel's **Changes**
+  tab; see [Interactive terminal](#interactive-terminal).
 - Review uncommitted changes in the **Repository** panel (**More actions** (⋯)
   menu in the message bar, or `Ctrl+Shift+G`). Staged and unstaged files are
   listed in separate sections; a file with both kinds of change appears in each.
@@ -371,10 +374,43 @@ This displays `YourName's Copilot Web` and uses `Y` as the brand mark. If
 `COPILOT_WEB_USER` is unset or empty, the interface uses `Copilot Web` and the
 brand mark uses `C`.
 
+## Interactive terminal
+
+The terminal is on by default; `npm start` is all it needs. Choose
+**More actions** → **Terminal** to open a shell in the selected repository, or
+in your projects folder when none is selected. Nothing starts until you choose
+it: selecting a repository never starts a terminal. **More actions** →
+**Repository** shows the Changes view. Each terminal is a real login shell
+(`$SHELL -l`) with a PTY, so
+`mvn`, `git add -p`, `vim`, `Ctrl+C`, and job control behave as in Terminal.app.
+Reloading the page restores the screen of a running terminal.
+
+> **Security:** the terminal is always available while the server runs. It gives
+> anyone who can use the Copilot Web browser session a shell as your macOS user.
+> The server listens on `127.0.0.1` only, and terminal requests need the browser
+> session cookie plus matching `Origin` and `Host` headers. The starting directory
+> is not a sandbox: the shell can `cd` anywhere. `COPILOT_ALLOW_ALL` does not
+> affect the terminal.
+
+- Terminal input and output are never sent to Copilot, logged, or saved to disk.
+- Terminals end when the server stops (`cpw stop`, `cpw restart`, or Ctrl+C), including
+  their running jobs. Closing a tab stops its shell; a background job started with
+  `nohup` or `disown` is not hunted down.
+- At most 8 terminals run at once (`COPILOT_WEB_TERMINAL_MAX` changes this, 1–32).
+- New runtime dependencies: `node-pty` (optional; native, prebuilt for macOS and
+  Windows), `ws`, `@xterm/xterm`, `@xterm/headless`, `@xterm/addon-fit`,
+  `@xterm/addon-web-links`, and `@xterm/addon-serialize`. If `node-pty` cannot
+  load, the server keeps running and the terminal stays off; the log says why.
+- npm can install `node-pty`'s `spawn-helper` without its execute bit, which makes
+  every spawn fail with `posix_spawnp failed`. The server restores the bit at
+  startup. If that is not possible, run `chmod +x` on the reported file.
+
 ## Current limitations
 
 - This is a single-user local interface. It is not intended to be exposed to
   a network or used as a multi-user service.
+- The interactive terminal does not persist across server restarts, has no
+  command presets or search yet, and is not supported on Windows.
 - Voice dictation uses the browser's Web Speech API, not a local speech model.
   Recognition availability and language support depend on the browser, and its
   speech-recognition service may process audio remotely. Dictation stops when
@@ -478,6 +514,7 @@ retrieve quota, the composer shows a warning in place of the numbers.
 | `COPILOT_NATIVE_SESSION_DELETE` | `true` | Enable the SDK/native CLI fallback for deleting sessions |
 | `COPILOT_SDK_PATH` | auto-discovered | Optional path to the installed Copilot SDK `index.js`, used for session deletion and persisted-message history |
 | `COPILOT_WEB_EDITOR_URL` | unset | Optional **Open in editor** link template for the Repository panel, such as `idea://open?file={path}&line={line}` or `vscode://file/{path}:{line}`; must contain `{path}` and use the `idea:`, `vscode:`, `vscode-insiders:`, `cursor:`, or `zed:` scheme |
+| `COPILOT_WEB_TERMINAL_MAX` | `8` | Maximum number of interactive terminals open at once (1–32) |
 
 Session deletion is confirmation-protected in the browser. ACP deletion is
 preferred when advertised; otherwise the backend uses Copilot CLI's native

@@ -6,6 +6,7 @@ import {
   tableDelimiterAlignments
 } from "./prompt-editor.js";
 import { initChangesPanel } from "./changes-panel.js";
+import { initTerminalPanel } from "./terminal-panel.js";
 
 const defaultBrandName = "Copilot Web";
 const defaultBrandInitial = "C";
@@ -764,6 +765,7 @@ let activeMessageSelectionHighlight = null;
 let selectionNoticeTimer = null;
 let renderedMessagesConversation = null;
 let changesPanel = null;
+let terminalPanel = null;
 
 const elements = {
   statusFavicon: document.querySelector("#app-favicon"),
@@ -1573,7 +1575,9 @@ function renderTable(header, alignments, rows) {
   const columnCount = header.length;
   const renderCell = (cell, index, tagName) => {
     const alignment = alignments[index];
-    const alignAttribute = alignment ? ` style="text-align:${alignment}"` : "";
+    const alignAttribute = alignment === "left" || alignment === "center" || alignment === "right"
+      ? ` data-align="${alignment}"`
+      : "";
     return `<${tagName}${alignAttribute}>${renderInlineMarkdown(cell ?? "")}</${tagName}>`;
   };
   const headerCells = header
@@ -3106,7 +3110,7 @@ function tableMarkdown(table) {
   const rows = Array.from(table.rows).map((row) => `| ${Array.from(row.cells).map(cellText).join(" | ")} |`);
   const header = table.rows[0];
   if (header) {
-    const delimiters = Array.from(header.cells).map((cell) => tableDelimiter(cell.style.textAlign));
+    const delimiters = Array.from(header.cells).map((cell) => tableDelimiter(cell.dataset.align));
     rows.splice(1, 0, `| ${delimiters.join(" | ")} |`);
   }
   return rows.join("\n");
@@ -7164,6 +7168,7 @@ async function refreshSessions() {
     }
   }
   state.capabilities = result.capabilities ?? state.capabilities;
+  applyTerminalCapability();
   state.newSessionDefaults = result.newSessionDefaults ?? state.newSessionDefaults;
   state.nativeMessageHistoryAvailable =
     result.nativeMessageHistoryAvailable === true;
@@ -8792,6 +8797,7 @@ function connectEvents() {
     state.requestScope = data.requestScope;
     applyBranding(data.brandName, data.brandInitial);
     state.capabilities = data.capabilities ?? state.capabilities;
+    applyTerminalCapability();
     state.projectsDirectory = data.projectsDirectory ?? "";
     state.newSessionDefaults = data.newSessionDefaults ?? state.newSessionDefaults;
     state.nativeMessageHistoryAvailable =
@@ -8870,6 +8876,11 @@ function connectEvents() {
       applySessionReplacement(data, data.previousSessionId);
     }
   });
+  for (const eventName of ["terminal-created", "terminal-updated", "terminal-removed"]) {
+    source.addEventListener(eventName, (event) => {
+      terminalPanel?.handleServerEvent(eventName, JSON.parse(event.data));
+    });
+  }
   source.addEventListener("session-deleted", (event) => {
     const data = JSON.parse(event.data);
     if (typeof data?.sessionId === "string") {
@@ -9127,7 +9138,7 @@ function setMoreActionsOpen(open, { focusTrigger = false } = {}) {
   elements.moreActionsMenu.hidden = !open;
   elements.moreActions.setAttribute("aria-expanded", String(open));
   if (open) {
-    elements.moreActionsMenu.querySelector("button:not(:disabled)")?.focus();
+    elements.moreActionsMenu.querySelector("button:not(:disabled):not([hidden])")?.focus();
   } else if (focusTrigger) {
     elements.moreActions.focus();
   }
@@ -9142,7 +9153,7 @@ elements.moreActionsMenu.addEventListener("click", (event) => {
   }
 });
 elements.moreActionsMenu.addEventListener("keydown", (event) => {
-  const items = Array.from(elements.moreActionsMenu.querySelectorAll("button:not(:disabled)"));
+  const items = Array.from(elements.moreActionsMenu.querySelectorAll("button:not(:disabled):not([hidden])"));
   const index = items.indexOf(document.activeElement);
   const target = {
     ArrowDown: items[(index + 1) % items.length],
@@ -9304,8 +9315,10 @@ if (typeof systemThemeQuery.addEventListener === "function") {
   systemThemeQuery.addListener(handleSystemThemeChange);
 }
 
+terminalPanel = initTerminalPanel({ api });
 changesPanel = initChangesPanel({
   api,
+  terminal: terminalPanel,
   insertIntoComposer,
   attachFiles: async (files) => {
     const conversation = currentComposerConversation();
@@ -9315,6 +9328,12 @@ changesPanel = initChangesPanel({
   },
   notify: (message) => setStatus(message, currentComposerConversation())
 });
+// The terminal entries are hidden only when the server could not start the terminal, and the reason is in its capability.
+function applyTerminalCapability() {
+  changesPanel?.setTerminalEnabled(state.capabilities.terminal?.enabled === true);
+  terminalPanel?.setDefaultDirectory(state.capabilities.terminal?.defaultDirectory ?? null);
+}
+applyTerminalCapability();
 renderSessionList();
 renderConversationControls();
 renderAttachmentList();
