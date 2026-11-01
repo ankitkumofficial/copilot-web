@@ -1350,6 +1350,40 @@ class PromptEditor extends HTMLElement {
 
   #emitInput(inputType) {
     this.dispatchEvent(new InputEvent("input", { bubbles: true, inputType }));
+    this.#revealCaret();
+  }
+
+  // Selection.collapse() does not scroll, so editor-driven edits (such as Enter
+  // splitting a block) must scroll the caret into view themselves. This runs
+  // after the input event so the host has already resized the editor.
+  #revealCaret() {
+    const range = this.#currentRange();
+    if (!range) {
+      return;
+    }
+    const caret = range.getClientRects()[0] ?? this.#emptyLineRect(range);
+    const box = this.getBoundingClientRect();
+    const style = getComputedStyle(this);
+    const top = box.top + Number.parseFloat(style.paddingTop);
+    const bottom = box.bottom - Number.parseFloat(style.paddingBottom);
+    if (caret.bottom > bottom) {
+      this.scrollTop += caret.bottom - bottom;
+    } else if (caret.top < top) {
+      this.scrollTop -= top - caret.top;
+    }
+  }
+
+  // Browsers report no client rects for a caret after a trailing newline (an
+  // empty last line in a code block). That line is the last line of its block,
+  // so measure one line up from the block's content bottom.
+  #emptyLineRect(range) {
+    const node = range.startContainer;
+    const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    const box = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    const bottom = box.bottom - Number.parseFloat(style.paddingBottom) - Number.parseFloat(style.borderBottomWidth);
+    const lineHeight = Number.parseFloat(style.lineHeight) || Number.parseFloat(style.fontSize) * 1.45;
+    return { top: bottom - lineHeight, bottom };
   }
 
   #snapshot() {
