@@ -5,6 +5,7 @@ import {
   tableDelimiter,
   tableDelimiterAlignments
 } from "./prompt-editor.js";
+import { initChangesPanel } from "./changes-panel.js";
 
 const defaultBrandName = "Copilot Web";
 const defaultBrandInitial = "C";
@@ -551,8 +552,9 @@ function restoreSelectionMessageMetadata(message, conversation) {
     return;
   }
   const promptText = message.rawSelectionPromptText ?? message.text;
+  const { hasRepositoryContext, text: unprefixedText } = splitRepositoryContext(promptText);
   const storedEntries = selectionMessageMetadata[conversation.sessionId] ?? [];
-  const recoveredPrompt = parseSelectionPrompt(promptText);
+  const recoveredPrompt = parseSelectionPrompt(unprefixedText);
   const identified = storedEntries.find((entry) => (
     (message.nativeMessageId && entry.messageId === message.nativeMessageId) ||
     (message.clientPromptId && entry.clientPromptId === message.clientPromptId)
@@ -581,6 +583,9 @@ function restoreSelectionMessageMetadata(message, conversation) {
 
   const recovered = recoveredPrompt;
   if (!recovered) {
+    if (hasRepositoryContext) {
+      message.text = unprefixedText;
+    }
     return;
   }
   const messageIndex = conversation.messages.indexOf(message);
@@ -758,6 +763,7 @@ let messageSelectionHighlightTimer = null;
 let activeMessageSelectionHighlight = null;
 let selectionNoticeTimer = null;
 let renderedMessagesConversation = null;
+let changesPanel = null;
 
 const elements = {
   statusFavicon: document.querySelector("#app-favicon"),
@@ -804,6 +810,8 @@ const elements = {
   keepAwake: document.querySelector("#keep-awake"),
   keepAwakeStatus: document.querySelector("#keep-awake-status"),
   reconnectTools: document.querySelector("#reconnect-tools"),
+  moreActions: document.querySelector("#composer-more-button"),
+  moreActionsMenu: document.querySelector("#composer-more-menu"),
   send: document.querySelector("#send-prompt"),
   cancel: document.querySelector("#cancel-prompt"),
   permissionDialog: document.querySelector("#permission-dialog"),
@@ -2914,6 +2922,28 @@ function renderSessionList() {
 
 function renderConversationControls() {
   renderConfigurationControls();
+  syncChangesPanelSession();
+}
+
+function syncChangesPanelSession() {
+  if (!changesPanel) {
+    return;
+  }
+  const sessionId = state.activeSessionId;
+  changesPanel.setSession(sessionId
+    ? { sessionId, cwd: selectedSession()?.cwd ?? state.projectsDirectory }
+    : null);
+}
+
+function insertIntoComposer(text) {
+  if (elements.input.disabled) {
+    setStatus("The message box is busy; try again in a moment");
+    return;
+  }
+  elements.input.focus();
+  const needsSeparator = elements.input.value.trim().length > 0 && !/\s$/.test(elements.input.value);
+  elements.input.insertMarkdown(`${needsSeparator ? " " : ""}${text}`);
+  elements.input.focus();
 }
 
 const copyIconMarkup = `
@@ -4857,6 +4887,24 @@ function promptWithSelections(text, selections) {
   return `${question}\n\nSelected passages from the conversation:\n${excerpts}`;
 }
 
+// The repository chosen in the Repository panel reaches Copilot as this first line; the transcript shows only the message.
+const repositoryContextPattern = /^Current repository: ("(?:[^"\\]|\\.)*")\. Unless I say otherwise, my questions about files and changes refer to it\.\n\n/;
+
+function promptWithRepository(text, repositoryRoot) {
+  // Slash commands are sent unchanged because Copilot reads them only at the start of a prompt.
+  if (!repositoryRoot || text.trimStart().startsWith("/")) {
+    return text;
+  }
+  return `Current repository: ${JSON.stringify(repositoryRoot)}. Unless I say otherwise, my questions about files and changes refer to it.\n\n${text}`;
+}
+
+function splitRepositoryContext(text) {
+  const match = repositoryContextPattern.exec(text);
+  return match
+    ? { hasRepositoryContext: true, text: text.slice(match[0].length) }
+    : { hasRepositoryContext: false, text };
+}
+
 function messagesAreAtBottom() {
   return elements.messages.scrollHeight -
     elements.messages.scrollTop -
@@ -5599,7 +5647,9 @@ function addMessage(
   }
 
   const message = {
-    role, text, attachments: [...attachments],
+    role,
+    text: role === "user" ? splitRepositoryContext(text).text : text,
+    attachments: [...attachments],
     displayKey: key ?? nextSyntheticMessageKey(role, conversation)
   };
   const restoreSelectionMetadata = selections.length === 0 &&
@@ -5932,6 +5982,7 @@ function ingestNativeMessage(record, conversation) {
   }
   if (record.role === "user") {
     message.rawSelectionPromptText = content;
+    message.text = splitRepositoryContext(content).text;
   }
   index = conversation.messages.length;
   conversation.messages.push(message);
@@ -7162,7 +7213,7 @@ function applyFallbackConversationTitle(queuedPrompt, conversation) {
     .filter((attachment) => typeof attachment.name === "string")
     .map((attachment) => attachment.name);
   const source = queuedPrompt.displayText.trim() ||
-    queuedPrompt.text.trim() ||
+    splitRepositoryContext(queuedPrompt.text).text.trim() ||
     (attachmentNames.length > 0 ? attachmentNames.join(", ") : "");
   const compact = cleanGeneratedConversationTitle(source);
   if (!compact) {
@@ -7196,6 +7247,7 @@ function createServerConversation(sourceConversation = currentComposerConversati
 
 async function createServerConversationInternal(sourceConversation) {
   const previousConversation = sourceConversation;
+  const previousSessionId = sourceConversation.sessionId ?? null;
   const promoteComposer = sourceConversation.sessionId === null;
   const configOverrides = promoteComposer
     ? selectedNewSessionConfigOverrides(sourceConversation)
@@ -7251,6 +7303,7 @@ async function createServerConversationInternal(sourceConversation) {
     applySessionSetup(result, context, conversation);
     if (currentComposerConversation() === sourceConversation) {
       state.composer = createConversationState();
+      changesPanel?.carryRepositoryChoice(previousSessionId, session.sessionId);
       state.activeSessionId = session.sessionId;
       activateConversation(session.sessionId);
       setStatus("Ready", conversation);
@@ -8164,7 +8217,10 @@ async function submitPrompt() {
   ) {
     return;
   }
-  const promptText = promptWithSelections(text, selections);
+  const promptText = promptWithRepository(
+    promptWithSelections(text, selections),
+    changesPanel?.repositoryForPrompt(conversation.sessionId ?? null) ?? null
+  );
   const displayText = text.trim()
     ? text
     : selections.length > 0
@@ -8490,6 +8546,7 @@ function connectEvents() {
     state.newSessionDefaults = data.newSessionDefaults ?? state.newSessionDefaults;
     state.nativeMessageHistoryAvailable =
       data.nativeMessageHistoryAvailable === true;
+    changesPanel?.setEditorUrlTemplate(data.editorUrlTemplate);
     if (!hasStoredContextPreference() && state.newSessionDefaults?.context) {
       state.selectedContext = state.newSessionDefaults.context;
     }
@@ -8508,7 +8565,16 @@ function connectEvents() {
     renderConversationControls();
   });
   source.addEventListener("session-update", (event) => {
-    handleSessionUpdate(JSON.parse(event.data));
+    const params = JSON.parse(event.data);
+    handleSessionUpdate(params);
+    const update = params?.update;
+    if (
+      typeof params?.sessionId === "string" &&
+      update?.sessionUpdate === "tool_call_update" &&
+      (update.status === "completed" || update.status === "failed")
+    ) {
+      changesPanel?.notifyToolCompletion(params.sessionId);
+    }
   });
   source.addEventListener("native-message", (event) => {
     handleNativeMessage(JSON.parse(event.data));
@@ -8558,6 +8624,7 @@ function connectEvents() {
     const data = JSON.parse(event.data);
     if (typeof data?.sessionId === "string") {
       applyServerPromptState(data.sessionId, { busy: false });
+      changesPanel?.forgetSession(data.sessionId);
       renderConversationControls();
     }
     void refreshSessions().catch(showError);
@@ -8617,6 +8684,7 @@ function connectEvents() {
     renderSessionList();
     renderConversationControls();
     renderConnectionStatus();
+    changesPanel?.notifyPromptComplete(data.sessionId);
     const conversation = conversationState(data.sessionId);
     if (finishRecoveredPrompt(data, conversation)) {
       return;
@@ -8805,6 +8873,49 @@ elements.imagePreviewDialog.addEventListener("click", (event) => {
 elements.imagePreviewDialog.addEventListener("close", () => {
   resetFilePreviewContent();
 });
+function setMoreActionsOpen(open, { focusTrigger = false } = {}) {
+  elements.moreActionsMenu.hidden = !open;
+  elements.moreActions.setAttribute("aria-expanded", String(open));
+  if (open) {
+    elements.moreActionsMenu.querySelector("button:not(:disabled)")?.focus();
+  } else if (focusTrigger) {
+    elements.moreActions.focus();
+  }
+}
+
+elements.moreActions.addEventListener("click", () => {
+  setMoreActionsOpen(elements.moreActionsMenu.hidden);
+});
+elements.moreActionsMenu.addEventListener("click", (event) => {
+  if (event.target.closest("button:not(:disabled)")) {
+    setMoreActionsOpen(false);
+  }
+});
+elements.moreActionsMenu.addEventListener("keydown", (event) => {
+  const items = Array.from(elements.moreActionsMenu.querySelectorAll("button:not(:disabled)"));
+  const index = items.indexOf(document.activeElement);
+  const target = {
+    ArrowDown: items[(index + 1) % items.length],
+    ArrowUp: items[(index - 1 + items.length) % items.length],
+    Home: items[0],
+    End: items.at(-1)
+  }[event.key];
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    setMoreActionsOpen(false, { focusTrigger: true });
+  } else if (event.key === "Tab") {
+    setMoreActionsOpen(false);
+  } else if (target) {
+    event.preventDefault();
+    target.focus();
+  }
+});
+document.addEventListener("pointerdown", (event) => {
+  if (!elements.moreActionsMenu.hidden && !event.target.closest(".composer-more")) {
+    setMoreActionsOpen(false);
+  }
+});
 elements.attachFiles.addEventListener("click", () => {
   if (!elements.attachFiles.disabled) {
     elements.fileInput.click();
@@ -8943,6 +9054,17 @@ if (typeof systemThemeQuery.addEventListener === "function") {
   systemThemeQuery.addListener(handleSystemThemeChange);
 }
 
+changesPanel = initChangesPanel({
+  api,
+  insertIntoComposer,
+  attachFiles: async (files) => {
+    const conversation = currentComposerConversation();
+    const before = conversation.attachments.length;
+    await addFiles(files);
+    return conversation.attachments.length > before;
+  },
+  notify: (message) => setStatus(message, currentComposerConversation())
+});
 renderSessionList();
 renderConversationControls();
 renderAttachmentList();
