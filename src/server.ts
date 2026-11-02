@@ -72,8 +72,26 @@ import {
   validateRelativePath,
   type RepositoryEntry
 } from "./git-changes.js";
+import { createTerminalHttp, type TerminalHttp } from "./terminal-http.js";
+import { loadTerminalRuntime } from "./terminal-runtime.js";
+import { readTerminalMaximum, TerminalManager } from "./terminal.js";
 
 const applicationVersion = "0.1.0";
+// Only this origin supplies scripts, so injected inline script cannot run. Inline styles stay allowed because
+// xterm.js writes its colour rules into <style> elements; CSS cannot run script, and img-src still blocks
+// external requests from styles. Other sites cannot frame the app.
+const contentSecurityPolicy = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "frame-src 'self' blob:",
+  "object-src 'self' blob:",
+  "connect-src 'self'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "frame-ancestors 'none'"
+].join("; ");
 const defaultBrandName = "Copilot Web";
 const defaultBrandInitial = "C";
 const maximumBodyBytes = 25 * 1024 * 1024;
@@ -1243,6 +1261,8 @@ async function main(): Promise<void> {
     await copilotHistory.readPage(request)
   ));
 
+  // Set by the terminal block below; stays disabled if the terminal cannot start.
+  let terminalCapability: { enabled: boolean; reason?: string; max?: number; defaultDirectory?: string } = { enabled: false };
   const browserCapabilities = () => {
     const capabilities = acp.getCapabilities();
     return {
@@ -1250,7 +1270,8 @@ async function main(): Promise<void> {
       sessionCapabilities: {
         ...capabilities.sessionCapabilities,
         delete: capabilities.sessionCapabilities.delete || nativeSessionDelete
-      }
+      },
+      terminal: terminalCapability
     };
   };
 
@@ -1788,6 +1809,43 @@ async function main(): Promise<void> {
     }
   };
 
+  // The terminal is on by default. If its packages or PTY cannot load, the server still runs without it.
+  console.warn(
+    `[terminal] Interactive terminal enabled: browser sessions have shell access as ${os.userInfo().username}.`
+  );
+  let terminalManager: TerminalManager | undefined;
+  let terminalHttp: TerminalHttp | undefined;
+  const maximum = readTerminalMaximum(process.env);
+  try {
+    const runtime = await loadTerminalRuntime((message) => console.warn(message));
+    const manager = new TerminalManager({
+      spawn: runtime.spawn,
+      createMirror: runtime.createMirror,
+      environment: process.env,
+      version: applicationVersion,
+      maximum,
+      onEvent: (event) => publish(
+        `terminal-${event.type}`,
+        event.type === "removed" ? { id: event.id } : { terminal: event.terminal }
+      ),
+      log: (message) => console.log(message)
+    });
+    terminalManager = manager;
+    terminalHttp = createTerminalHttp({
+      runtime,
+      manager,
+      port,
+      projectsDirectory,
+      browserToken,
+      readJsonBody
+    });
+    terminalCapability = { enabled: true, max: maximum, defaultDirectory: projectsRoot };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.warn(`[terminal] disabled: ${reason}`);
+    terminalCapability = { enabled: false, reason };
+  }
+
   const touchSessionActivity = (
     sessionId: string,
     activityAt = new Date().toISOString()
@@ -2205,6 +2263,8 @@ async function main(): Promise<void> {
       response.statusCode = 200;
       response.setHeader("Content-Type", contentType(filePath));
       response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Content-Security-Policy", contentSecurityPolicy);
+      response.setHeader("X-Content-Type-Options", "nosniff");
       if (requestedPath === "/") {
         response.setHeader(
           "Set-Cookie",
@@ -2227,6 +2287,13 @@ async function main(): Promise<void> {
       return false;
     }
     requireAuthorization(request);
+
+    if (requestUrl.pathname === "/api/terminals" || requestUrl.pathname.startsWith("/api/terminals/")) {
+      if (!terminalHttp) {
+        throw new HttpError(404, "Interactive terminal is disabled", "terminal_disabled");
+      }
+      return terminalHttp.handleApi(request, response, requestUrl);
+    }
 
     if (request.method === "GET" && requestUrl.pathname === "/api/health") {
       await acp.start();
@@ -3220,7 +3287,9 @@ async function main(): Promise<void> {
         if (requestUrl.pathname.startsWith("/api/")) {
           await handleApi(request, response, requestUrl);
         } else if (request.method === "GET" || request.method === "HEAD") {
-          await serveStatic(request, response);
+          if (!terminalHttp || !(await terminalHttp.serveVendorFile(request, response, requestUrl))) {
+            await serveStatic(request, response);
+          }
         } else {
           throw new HttpError(405, "Method not allowed");
         }
@@ -3244,6 +3313,15 @@ async function main(): Promise<void> {
     })();
   });
 
+  server.on("upgrade", (request, socket, head) => {
+    if (terminalHttp) {
+      terminalHttp.handleUpgrade(request, socket, head);
+      return;
+    }
+    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    socket.destroy();
+  });
+
   const heartbeat = setInterval(() => {
     for (const client of sseClients) {
       client.response.write(": heartbeat\n\n");
@@ -3258,6 +3336,9 @@ async function main(): Promise<void> {
       client.response.end();
     }
     sseClients.clear();
+    // Terminal shells end with the server, so no build or job outlives `cpw stop`.
+    await terminalManager?.disposeAll();
+    terminalHttp?.close();
     const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
     try {
       await acp.stop();
@@ -3292,6 +3373,7 @@ async function main(): Promise<void> {
   console.log(`Available context tiers: ${contextTiers.join(", ")}`);
   console.log(`Copilot allow-all permissions: ${allowAll ? "enabled" : "disabled"}`);
   console.log(`Session deletion supported: ${browserCapabilities().sessionCapabilities.delete}`);
+  console.log(`Interactive terminal: ${terminalCapability.enabled ? "enabled" : "disabled"}`);
   console.log(
     `Session deletion fallback: ${
       !nativeSessionDelete

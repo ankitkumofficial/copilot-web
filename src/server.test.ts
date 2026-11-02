@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test, { type TestContext } from "node:test";
+import { WebSocket as TerminalSocket } from "ws";
 
 import { isRecord, type JsonObject } from "./acp.js";
 
@@ -867,6 +869,7 @@ async function startTestServer(t: TestContext, options: {
     unsupported?: boolean;
     timestamp?: string;
   };
+  terminalMaximum?: number;
 } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-server-reconnect-test-"));
   const home = path.join(directory, "home");
@@ -939,6 +942,8 @@ async function startTestServer(t: TestContext, options: {
       TEST_HISTORY_UNSUPPORTED: String(options.nativeHistory?.unsupported ?? false),
       TEST_PROMPT_DELAY_MS: String(options.promptDelayMs ?? 20),
       TEST_MCP_RELOAD_DELAY_MS: String(options.reloadDelayMs ?? 200),
+      SHELL: "/bin/sh",
+      ...(options.terminalMaximum ? { COPILOT_WEB_TERMINAL_MAX: String(options.terminalMaximum) } : {}),
       ...(options.historyText ? { TEST_HISTORY_TEXT: options.historyText } : {}),
       PORT: String(port)
     },
@@ -4154,13 +4159,15 @@ test("changes view lists staged and unstaged files, stages and unstages them, re
     document.querySelector("#composer-more-menu").hidden,
     document.querySelector("#composer-more-button").getAttribute("aria-expanded"),
     Array.from(document.querySelectorAll("#composer-more-menu > button")).map((button) => button.id)
-  ]`), [false, "true", ["reconnect-tools", "attach-files", "changes-toggle"]]);
+  ]`), [false, "true", ["reconnect-tools", "attach-files", "terminal-action", "changes-toggle"]]);
 
   await evaluate(`document.querySelector("#changes-toggle").click()`);
   assert.equal(await evaluate(`document.querySelector("#composer-more-menu").hidden`), true);
   // This conversation runs outside any repository, so the picker decides.
   await evaluate(`document.querySelector("#changes-repository").click()`);
   await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]")).some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  // The list shows "Loading…" until the initial status request settles, so wait for the prompt before reading it.
+  await waitFor(`document.querySelector("#changes-list").textContent.includes("Choose a repository")`);
   assert.match(String(await evaluate(`document.querySelector("#changes-list").textContent`)), /Choose a repository/);
   await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
     .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
@@ -5501,7 +5508,7 @@ test("shows a focusable warning when the GitHub CLI cannot retrieve quota", {
 }, async (t) => {
   const server = await startTestServer(t, { quotaCommand: "missing" });
   const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
-  await waitFor(`!document.querySelector("#usage-quota-warning").hidden`);
+  await waitFor(`Boolean(document.querySelector("#usage-quota-warning")) && !document.querySelector("#usage-quota-warning").hidden`);
   assert.equal(
     await evaluate(`document.querySelector("#usage-quota-warning").title`),
     "GitHub CLI (gh) not available or not authenticated; quota could not be retrieved."
@@ -10046,5 +10053,492 @@ test("skips empty filtered pages while scrolling without blanking the transcript
   assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes("Hidden 0")`), false);
   assert.equal(await evaluate(`document.querySelectorAll("#messages > .message").length >= 30`), true);
   assert.equal(await evaluate(`document.querySelector("#messages .transcript-spacer") === null`), true);
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+});
+
+const terminalProtocol = "copilot-web-terminal.v1";
+
+async function errorCode(response: Response): Promise<unknown> {
+  const body: unknown = await response.json();
+  return isRecord(body) ? body.code : undefined;
+}
+
+// Resolves with the HTTP status the server answers the upgrade with, or "open" when the handshake succeeds.
+function upgradeOutcome(
+  url: string,
+  headers: Record<string, string>,
+  protocol: string | undefined
+): Promise<{ status: number | "open" | "destroyed"; socket?: TerminalSocket }> {
+  return new Promise((resolve) => {
+    const socket = protocol === undefined
+      ? new TerminalSocket(url, { headers })
+      : new TerminalSocket(url, protocol, { headers });
+    socket.once("open", () => resolve({ status: "open", socket }));
+    socket.once("unexpected-response", (_request, response) => {
+      resolve({ status: response.statusCode ?? 0 });
+      socket.terminate();
+    });
+    socket.once("error", () => resolve({ status: "destroyed" }));
+  });
+}
+
+function collectTerminalMessages(socket: TerminalSocket): Array<Record<string, unknown>> {
+  const messages: Array<Record<string, unknown>> = [];
+  socket.on("message", (data: Buffer) => {
+    const parsed: unknown = JSON.parse(data.toString("utf8"));
+    if (isRecord(parsed)) {
+      messages.push(parsed);
+    }
+  });
+  return messages;
+}
+
+async function waitForTerminalMessage(
+  messages: Array<Record<string, unknown>>,
+  predicate: (message: Record<string, unknown>) => boolean
+): Promise<Record<string, unknown>> {
+  const started = Date.now();
+  while (Date.now() - started < 10_000) {
+    const found = messages.find(predicate);
+    if (found) {
+      return found;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail("Expected terminal message did not arrive");
+}
+
+test("interactive terminal is on by default with eight terminals and serves its xterm assets", async (t) => {
+  const server = await startTestServer(t);
+  const health = await fetch(`${server.baseUrl}/api/health`, { headers: server.headers });
+  const body: unknown = await health.json();
+  assert.ok(isRecord(body) && isRecord(body.capabilities));
+  assert.deepEqual(body.capabilities.terminal, {
+    enabled: true,
+    max: 8,
+    defaultDirectory: await realpath(server.projectsDirectory)
+  });
+
+  const terminals = await fetch(`${server.baseUrl}/api/terminals`, { headers: server.headers });
+  assert.equal(terminals.status, 200);
+  const listBody: unknown = await terminals.json();
+  assert.ok(isRecord(listBody));
+  assert.deepEqual(listBody.limits, { max: 8 });
+
+  const vendor = await fetch(`${server.baseUrl}/vendor/xterm/xterm.mjs`);
+  assert.equal(vendor.status, 200);
+
+  const unauthenticated = await fetch(`${server.baseUrl}/api/terminals`);
+  assert.equal(unauthenticated.status, 401);
+});
+
+test("terminal REST routes create, list, restart, and remove shells in the requested directory", async (t) => {
+  const server = await startTestServer(t, { terminalMaximum: 2 });
+
+
+  const vendor = await fetch(`${server.baseUrl}/vendor/xterm/xterm.mjs`);
+  assert.equal(vendor.status, 200);
+  assert.match(vendor.headers.get("content-type") ?? "", /^text\/javascript/);
+
+  const created = await fetch(`${server.baseUrl}/api/terminals`, {
+    method: "POST",
+    headers: server.headers,
+    body: JSON.stringify({ cwd: server.projectsDirectory, cols: 100, rows: 40 })
+  });
+  assert.equal(created.status, 201);
+  const terminal: unknown = await created.json();
+  assert.ok(isRecord(terminal));
+  assert.equal(terminal.cwd, await realpath(server.projectsDirectory));
+  assert.equal(terminal.state, "running");
+  assert.equal(terminal.cols, 100);
+  assert.equal(typeof terminal.id, "string");
+  const id = String(terminal.id);
+
+  const listed = await fetch(`${server.baseUrl}/api/terminals`, { headers: server.headers });
+  const listBody: unknown = await listed.json();
+  assert.ok(isRecord(listBody) && Array.isArray(listBody.terminals));
+  assert.equal(listBody.terminals.some((entry) => isRecord(entry) && entry.id === id), true);
+  assert.deepEqual(listBody.limits, { max: 2 });
+
+  const relative = await fetch(`${server.baseUrl}/api/terminals`, {
+    method: "POST",
+    headers: server.headers,
+    body: JSON.stringify({ cwd: "relative/path" })
+  });
+  assert.equal(relative.status, 400);
+  assert.equal(await errorCode(relative), "invalid_cwd");
+
+  const second = await fetch(`${server.baseUrl}/api/terminals`, {
+    method: "POST",
+    headers: server.headers,
+    body: JSON.stringify({ cwd: server.projectsDirectory })
+  });
+  assert.equal(second.status, 201);
+  const secondBody: unknown = await second.json();
+  assert.ok(isRecord(secondBody));
+  const third = await fetch(`${server.baseUrl}/api/terminals`, {
+    method: "POST",
+    headers: server.headers,
+    body: JSON.stringify({ cwd: server.projectsDirectory })
+  });
+  assert.equal(third.status, 409);
+  assert.equal(await errorCode(third), "terminal_limit");
+
+  const running = await fetch(`${server.baseUrl}/api/terminals/${id}/restart`, { method: "POST", headers: server.headers });
+  assert.equal(running.status, 409);
+  assert.equal(await errorCode(running), "terminal_running");
+
+  const removed = await fetch(`${server.baseUrl}/api/terminals/${id}`, { method: "DELETE", headers: server.headers });
+  assert.equal(removed.status, 204);
+  const missing = await fetch(`${server.baseUrl}/api/terminals/${id}`, { method: "DELETE", headers: server.headers });
+  assert.equal(missing.status, 404);
+  assert.equal(await errorCode(missing), "terminal_not_found");
+
+  await fetch(`${server.baseUrl}/api/terminals/${String(secondBody.id)}`, { method: "DELETE", headers: server.headers });
+});
+
+test("terminal socket relays input and output and rejects unsafe handshakes", async (t) => {
+  const server = await startTestServer(t);
+  const created = await fetch(`${server.baseUrl}/api/terminals`, {
+    method: "POST",
+    headers: server.headers,
+    body: JSON.stringify({ cwd: server.projectsDirectory })
+  });
+  const terminal: unknown = await created.json();
+  assert.ok(isRecord(terminal));
+  const id = String(terminal.id);
+  const socketUrl = `${server.baseUrl.replace("http", "ws")}/api/terminals/${id}/socket`;
+  const origin = server.baseUrl;
+  const cookie = server.headers.Cookie;
+
+  assert.equal((await upgradeOutcome(socketUrl, { Origin: "http://evil.example", Cookie: cookie }, terminalProtocol)).status, 403);
+  assert.equal((await upgradeOutcome(socketUrl, { Cookie: cookie }, terminalProtocol)).status, 403);
+  assert.equal((await upgradeOutcome(socketUrl, { Origin: origin }, terminalProtocol)).status, 401);
+  assert.equal((await upgradeOutcome(socketUrl, { Origin: origin, Cookie: "copilot_web_token=wrong" }, terminalProtocol)).status, 401);
+  assert.equal((await upgradeOutcome(socketUrl, { Origin: origin, Cookie: cookie, Host: "evil.example" }, terminalProtocol)).status, 403);
+  assert.equal((await upgradeOutcome(socketUrl, { Origin: origin, Cookie: cookie }, undefined)).status, 400);
+  assert.equal((await upgradeOutcome(`${server.baseUrl.replace("http", "ws")}/api/terminals/${randomUUID()}/socket`,
+    { Origin: origin, Cookie: cookie }, terminalProtocol)).status, 404);
+  assert.equal((await upgradeOutcome(`${server.baseUrl.replace("http", "ws")}/api/other`,
+    { Origin: origin, Cookie: cookie }, terminalProtocol)).status, 404);
+
+  const crossSite = await fetch(`${server.baseUrl}/api/terminals`, {
+    headers: { ...server.headers, "Sec-Fetch-Site": "cross-site" }
+  });
+  assert.equal(crossSite.status, 403);
+
+  const outcome = await upgradeOutcome(socketUrl, { Origin: origin, Cookie: cookie }, terminalProtocol);
+  assert.equal(outcome.status, "open");
+  const socket = outcome.socket;
+  assert.ok(socket);
+  const messages = collectTerminalMessages(socket);
+  await waitForTerminalMessage(messages, (message) => message.t === "snapshot");
+
+  socket.send(JSON.stringify({ t: "in", d: "printf 'A%sB\\n' 42\r" }));
+  await waitForTerminalMessage(messages, (message) => message.t === "out" && String(message.d).includes("A42B"));
+
+  socket.send(JSON.stringify({ t: "in", d: "exit 3\r" }));
+  const exit = await waitForTerminalMessage(messages, (message) => message.t === "exit");
+  assert.equal(exit.code, 3);
+
+  socket.send("not json");
+  const protocolError = await waitForTerminalMessage(messages, (message) => message.t === "error");
+  assert.equal(protocolError.code, "protocol_error");
+
+  await fetch(`${server.baseUrl}/api/terminals/${id}`, { method: "DELETE", headers: server.headers });
+});
+
+test("terminal opens from More actions for the selected repository and keeps its screen across reloads", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), { "a.txt": "one\n" });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl,
+    `window.__cspViolations = [];
+     document.addEventListener("securitypolicyviolation", (event) => window.__cspViolations.push(event.violatedDirective));`);
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  assert.deepEqual(await evaluate(`[
+    document.querySelector("#composer-more-button").click(),
+    Array.from(document.querySelectorAll("#composer-more-menu > button")).map((button) => button.id)
+  ][1]`), ["reconnect-tools", "attach-files", "terminal-action", "changes-toggle"]);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+
+  await waitFor(`document.querySelector("#changes-repository").dataset.root !== undefined`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]")).some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelector("#changes-repository").dataset.root === ${JSON.stringify(repo)}`);
+
+  await evaluate(`document.querySelector("#composer-more-button").click()`);
+  await evaluate(`document.querySelector("#terminal-action").click()`);
+  await waitFor(`document.querySelector("#terminal-tabpanel").hidden === false &&
+    document.querySelectorAll("#terminal-tabs [role=tab]").length === 1 &&
+    Boolean(document.querySelector("#terminal-screen .xterm-rows")?.textContent.trim())`);
+  assert.equal(await evaluate(`document.querySelector("#changes-tabpanel").hidden`), true);
+  assert.equal(await evaluate(`document.querySelector("#terminal-tabs [role=tab]").textContent`), "app");
+  assert.equal(await evaluate(`document.querySelector("#repository-tab-terminal").getAttribute("aria-selected")`), "true");
+
+  await evaluate(`document.querySelector("#terminal-screen textarea").focus()`);
+  await command("Input.insertText", { text: "echo cpw-$((6*7))" }, sessionId);
+  await command("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" }, sessionId);
+  await command("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 }, sessionId);
+  await waitFor(`document.querySelector("#terminal-screen .xterm-rows").textContent.includes("cpw-42")`);
+
+  await command("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+  await command("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+  assert.equal(await evaluate(`document.querySelector("#changes-panel").hidden`), false);
+
+  await command("Page.reload", {}, sessionId);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await waitFor(`document.querySelector("#changes-panel").hidden === false`);
+  await waitFor(`document.querySelector("#changes-repository").dataset.root === ${JSON.stringify(repo)}`);
+  await evaluate(`document.querySelector("#repository-tab-terminal").click()`);
+  await waitFor(`document.querySelector("#terminal-screen .xterm-rows")?.textContent.includes("cpw-42")`);
+  assert.equal(await evaluate(`document.querySelectorAll("#terminal-tabs [role=tab]").length`), 1);
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+  // xterm and the terminal panel must run entirely under the page's Content-Security-Policy.
+  assert.deepEqual(await evaluate(`window.__cspViolations`), []);
+});
+
+test("an exited terminal offers restart and close, and closing it leaves the repository without a terminal", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), { "a.txt": "one\n" });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`document.querySelector("#changes-repository").dataset.root !== undefined`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]")).some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await evaluate(`document.querySelector("#composer-more-button").click()`);
+  await evaluate(`document.querySelector("#terminal-action").click()`);
+  await waitFor(`document.querySelector("#terminal-screen .xterm-rows")?.textContent.trim().length > 0`);
+
+  const type = async (text: string) => {
+    await evaluate(`document.querySelector("#terminal-screen textarea").focus()`);
+    await command("Input.insertText", { text }, sessionId);
+    await command("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" }, sessionId);
+    await command("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 }, sessionId);
+  };
+  await type("exit 3");
+  await waitFor(`!document.querySelector("#terminal-footer").hidden &&
+    document.querySelector("#terminal-footer-status").textContent === "Process exited with code 3"`);
+
+  await evaluate(`document.querySelector("#terminal-restart").click()`);
+  await waitFor(`document.querySelector("#terminal-footer").hidden === true &&
+    document.querySelector("#terminal-tabs .terminal-tab-status").classList.contains("is-running")`);
+  await type("echo back-$((1+1))");
+  await waitFor(`document.querySelector("#terminal-screen .xterm-rows").textContent.includes("back-2")`);
+
+  await type("exit 0");
+  await waitFor(`document.querySelector("#terminal-footer-status").textContent === "Process exited with code 0"`);
+  await evaluate(`document.querySelector("#terminal-close").click()`);
+  await waitFor(`document.querySelectorAll("#terminal-tabs [role=tab]").length === 0 &&
+    document.querySelector("#terminal-empty-text").textContent === "No terminal is open in app."`);
+  assert.equal(await evaluate(`document.querySelector("#terminal-empty-action").hidden`), false);
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+});
+
+test("hostile Markdown in a conversation cannot run script, handlers, or javascript links", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  const hostile = [
+    "<img src=x onerror=\"window.__pwned = 'img'\">",
+    "<script>window.__pwned = 'script'</script>",
+    "<svg onload=\"window.__pwned = 'svg'\"></svg>",
+    "<iframe src=\"javascript:window.__pwned = 'iframe'\"></iframe>",
+    "[click me](javascript:window.__pwned = 'link')",
+    "![pixel](https://example.invalid/track.png)"
+  ].join("\n\n");
+  const server = await startTestServer(t, { existingSession: true, historyText: hostile });
+  const preload = `window.__cspViolations = [];
+    document.addEventListener("securitypolicyviolation", (event) => window.__cspViolations.push(event.violatedDirective));`;
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, preload);
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("click me")`);
+
+  assert.equal(await evaluate(`window.__pwned`), undefined);
+  assert.equal(await evaluate(`document.querySelectorAll("#messages [onerror], #messages [onload]").length`), 0);
+  assert.equal(await evaluate(`document.querySelectorAll("#messages script, #messages iframe").length`), 0);
+  assert.equal(await evaluate(`document.querySelectorAll("#messages a[href^='javascript:']").length`), 0);
+  assert.match(String(await evaluate(`document.querySelector("#messages").textContent`)), /<img src=x onerror/);
+
+  // Defense in depth: even if a script element reaches the page, the policy refuses to run it.
+  await evaluate(`(() => {
+    const script = document.createElement("script");
+    script.textContent = "window.__injected = 'script'";
+    document.body.append(script);
+    const image = document.createElement("img");
+    image.src = "/does-not-exist.png";
+    image.setAttribute("onerror", "window.__injected = 'handler'");
+    document.body.append(image);
+  })()`);
+  await waitFor(`window.__cspViolations.length > 0`);
+  assert.equal(await evaluate(`window.__injected`), undefined);
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+});
+
+test("the app page sends a strict Content-Security-Policy that forbids inline script and framing", async (t) => {
+  const server = await startTestServer(t);
+  const response = await fetch(`${server.baseUrl}/`);
+  const policy = response.headers.get("content-security-policy") ?? "";
+  assert.match(policy, /script-src 'self'(;|$)/);
+  assert.doesNotMatch(policy, /script-src[^;]*unsafe/);
+  assert.doesNotMatch(policy, /unsafe-eval/);
+  assert.match(policy, /frame-ancestors 'none'/);
+  assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+});
+
+test("selecting a repository starts no terminal; only the Terminal action does", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), { "a.txt": "one\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const terminalCount = `fetch("/api/terminals").then((response) => response.json()).then((body) => body.terminals.length)`;
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]")).some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelector("#changes-repository").dataset.root === ${JSON.stringify(repo)}`);
+  assert.equal(await evaluate(terminalCount), 0);
+
+  await evaluate(`document.querySelector("#repository-tab-terminal").click()`);
+  await waitFor(`document.querySelector("#terminal-empty-text").textContent === "No terminal is open in app."`);
+  assert.equal(await evaluate(terminalCount), 0);
+
+  await evaluate(`document.querySelector("#composer-more-button").click()`);
+  await evaluate(`document.querySelector("#terminal-action").click()`);
+  await waitFor(`document.querySelectorAll("#terminal-tabs [role=tab]").length === 1 &&
+    Boolean(document.querySelector("#terminal-screen .xterm-rows")?.textContent.trim())`);
+  assert.equal(await evaluate(terminalCount), 1);
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+});
+
+test("the Terminal action without a selected repository opens in the projects folder", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const projects = await realpath(server.projectsDirectory);
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`document.querySelector("#composer-more-button").click()`);
+  await evaluate(`document.querySelector("#terminal-action").click()`);
+  await waitFor(`document.querySelectorAll("#terminal-tabs [role=tab]").length === 1 &&
+    Boolean(document.querySelector("#terminal-screen .xterm-rows")?.textContent.trim())`);
+  assert.equal(await evaluate(`fetch("/api/terminals").then((response) => response.json()).then((body) => body.terminals[0].cwd)`), projects);
+  assert.equal(await evaluate(`document.querySelector("#terminal-tabs .terminal-tab-title").textContent`), path.basename(projects));
+});
+
+test("the Repository action switches a terminal view back to Changes", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`document.querySelector("#composer-more-button").click()`);
+  await evaluate(`document.querySelector("#terminal-action").click()`);
+  await waitFor(`document.querySelector("#terminal-tabpanel").hidden === false &&
+    Boolean(document.querySelector("#terminal-screen .xterm-rows")?.textContent.trim())`);
+
+  await evaluate(`document.querySelector("#composer-more-button").click()`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`document.querySelector("#changes-tabpanel").hidden === false &&
+    document.querySelector("#terminal-tabpanel").hidden === true`);
+  assert.equal(await evaluate(`document.querySelector("#changes-panel").hidden`), false);
+  assert.equal(await evaluate(`document.querySelector("#repository-tab-changes").getAttribute("aria-selected")`), "true");
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+});
+
+test("closing a running terminal asks in a dialog that Cancel can keep open", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl,
+    `window.confirm = () => { window.__nativeConfirm = true; return true; };`);
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`document.querySelector("#composer-more-button").click()`);
+  await evaluate(`document.querySelector("#terminal-action").click()`);
+  await waitFor(`document.querySelectorAll("#terminal-tabs [role=tab]").length === 1 &&
+    Boolean(document.querySelector("#terminal-screen .xterm-rows")?.textContent.trim())`);
+
+  await evaluate(`document.querySelector(".terminal-tab-close").click()`);
+  await waitFor(`document.querySelector("#terminal-close-dialog").open === true`);
+  assert.match(String(await evaluate(`document.querySelector("#terminal-close-title").textContent`)), /^Close ".+"\?$/);
+  await evaluate(`document.querySelector("#terminal-close-dialog button[value=cancel]").click()`);
+  await waitFor(`document.querySelector("#terminal-close-dialog").open === false`);
+  assert.equal(await evaluate(`document.querySelectorAll("#terminal-tabs [role=tab]").length`), 1);
+
+  await evaluate(`document.querySelector(".terminal-tab-close").click()`);
+  await waitFor(`document.querySelector("#terminal-close-dialog").open === true`);
+  await evaluate(`document.querySelector("#terminal-close-confirm").click()`);
+  await waitFor(`document.querySelectorAll("#terminal-tabs [role=tab]").length === 0`);
+  assert.equal(await evaluate(`window.__nativeConfirm`), undefined);
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+});
+
+test("the diff view has a close button that still works after the file is staged", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), { "a.txt": "one\n" });
+  await writeFile(path.join(repo, "a.txt"), "one\ntwo\n");
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]")).some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`Boolean(document.querySelector('[data-key="unstaged:a.txt"]'))`);
+
+  await evaluate(`document.querySelector('[data-key="unstaged:a.txt"]').click()`);
+  await waitFor(`document.querySelector("#changes-diff").hidden === false`);
+  await evaluate(`document.querySelector("#changes-stage").click()`);
+  await waitFor(`Boolean(document.querySelector('[data-key="staged:a.txt"]'))`);
+  assert.equal(await evaluate(`document.querySelector("#changes-diff").hidden`), false);
+
+  await evaluate(`document.querySelector("#changes-diff-close").click()`);
+  await waitFor(`document.querySelector("#changes-diff").hidden === true`);
+  assert.equal(await evaluate(`document.querySelector("#changes-list").hidden`), false);
   assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
 });

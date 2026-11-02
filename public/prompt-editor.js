@@ -856,7 +856,7 @@ function pastedTableHtml(table) {
     return "";
   }
   const alignments = Array.from(rows[0].cells).map((cell) =>
-    (cell.style?.textAlign || cell.getAttribute("align") || "").toLowerCase());
+    (cell.dataset?.align || cell.style?.textAlign || cell.getAttribute("align") || "").toLowerCase());
   return editorTableHtml(cells, alignments);
 }
 
