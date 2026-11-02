@@ -3871,6 +3871,257 @@ function filePreviewDownloadLink(name, objectUrl) {
   return link;
 }
 
+const filePreviewLanguageByExtension = new Map([
+  ["js", "javascript"], ["jsx", "javascript"], ["mjs", "javascript"], ["cjs", "javascript"],
+  ["ts", "javascript"], ["tsx", "javascript"], ["java", "java"],
+  ["css", "css"], ["scss", "css"], ["sass", "css"], ["less", "css"],
+  ["py", "python"], ["pyw", "python"], ["sh", "shell"], ["bash", "shell"], ["zsh", "shell"],
+  ["rb", "ruby"], ["yml", "yaml"], ["yaml", "yaml"], ["sql", "sql"],
+  ["html", "html"], ["htm", "html"], ["xml", "html"], ["svg", "html"]
+]);
+
+const filePreviewKeywordSets = new Map([
+  ["javascript", new Set(
+    "as async await break case catch class const continue debugger default delete do else export extends finally for from function get if import in instanceof let new of return set static super switch this throw try typeof var void while with yield".split(" ")
+  )],
+  ["java", new Set(
+    "abstract assert boolean break byte case catch char class const continue default do double else enum extends final finally float for goto if implements import instanceof int interface long native new package private protected public record return short static strictfp super switch synchronized this throw throws transient try var void volatile while".split(" ")
+  )],
+  ["css", new Set(
+    "auto block bold center currentcolor flex grid important inherit initial inline none normal revert revert-layer unset".split(" ")
+  )],
+  ["python", new Set(
+    "and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield".split(" ")
+  )],
+  ["shell", new Set(
+    "case do done elif else esac fi for function if in select then time until while".split(" ")
+  )],
+  ["ruby", new Set(
+    "alias and begin break case class def defined do else elsif end ensure for if in module next not or redo rescue retry return self super then undef unless until when while yield".split(" ")
+  )],
+  ["sql", new Set(
+    "all alter and as asc begin by case commit create cross database default delete desc distinct drop else end except exists fetch from full grant group having in index inner insert intersect into is join left limit not null offset on or order outer primary references right rollback select set table then true union unique update using values view when where with".split(" ")
+  )],
+  ["generic", new Set(
+    "abstract async await break case catch class const continue def else enum export extends false final finally for function if implements import in interface let new null package private protected public return static struct super switch this throw true try type var void while yield".split(" ")
+  )]
+]);
+
+const filePreviewHashCommentLanguages = new Set(["python", "shell", "ruby", "yaml"]);
+const filePreviewSlashLineCommentLanguages = new Set(["javascript", "java", "generic"]);
+const filePreviewBlockCommentLanguages = new Set(["javascript", "java", "css", "generic", "sql"]);
+
+function filePreviewLanguage(name) {
+  const extension = name.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
+  return extension ? filePreviewLanguageByExtension.get(extension) ?? "generic" : "generic";
+}
+
+function filePreviewStringEnd(source, start, language) {
+  const quote = source[start];
+  const delimiterLength = language === "python" && source.startsWith(quote.repeat(3), start) ? 3 : 1;
+  const delimiter = quote.repeat(delimiterLength);
+  let index = start + delimiterLength;
+  while (index < source.length) {
+    if (source[index] === "\\") {
+      index += 2;
+    } else if (source.startsWith(delimiter, index)) {
+      return index + delimiterLength;
+    } else {
+      index += 1;
+    }
+  }
+  return source.length;
+}
+
+function filePreviewNextNonWhitespace(source, index) {
+  while (index < source.length && /\s/.test(source[index])) {
+    index += 1;
+  }
+  return source[index] ?? "";
+}
+
+function filePreviewPreviousNonWhitespace(source, index) {
+  index -= 1;
+  while (index >= 0 && /\s/.test(source[index])) {
+    index -= 1;
+  }
+  return source[index] ?? "";
+}
+
+function appendFilePreviewToken(fragment, source, start, end, tokenType) {
+  if (start === end) {
+    return;
+  }
+  const value = source.slice(start, end);
+  if (!tokenType) {
+    fragment.append(document.createTextNode(value));
+    return;
+  }
+  const token = document.createElement("span");
+  token.className = `file-preview-token-${tokenType}`;
+  token.textContent = value;
+  fragment.append(token);
+}
+
+function createHighlightedFilePreview(name, source) {
+  const language = filePreviewLanguage(name);
+  const keywords = filePreviewKeywordSets.get(language) ?? filePreviewKeywordSets.get("generic");
+  const identifierPattern = language === "css"
+    ? /(?:--|-)?[A-Za-z_][A-Za-z0-9_-]*/y
+    : /[A-Za-z_$][A-Za-z0-9_$]*/y;
+  const numberPattern = /(?:0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*|0[bB][01](?:_?[01])*|0[oO][0-7](?:_?[0-7])*|(?:\d(?:_?\d)*(?:\.\d(?:_?\d)*)?|\.\d(?:_?\d)*)(?:[eE][+-]?\d(?:_?\d)*)?n?)/y;
+  const operatorPattern = /(?:===|!==|=>|==|!=|<=|>=|\+\+|--|\+=|-=|\*=|\/=|&&|\|\||\?\?|\?\.|\*\*|\.\.\.|[=+\-*\/%&|!<>^~?:])/y;
+  const cssAtRulePattern = /@[A-Za-z_-][A-Za-z0-9_-]*/y;
+  const cssHexPattern = /#(?:[0-9a-f]{8}|[0-9a-f]{6}|[0-9a-f]{4}|[0-9a-f]{3})(?![A-Za-z0-9_-])/iy;
+  const cssSelectorPattern = /[.#][A-Za-z_][A-Za-z0-9_-]*/y;
+  const htmlTagPattern = /<\/?[A-Za-z][A-Za-z0-9:-]*/y;
+  const fragment = document.createDocumentFragment();
+  const code = document.createElement("code");
+  code.className = `file-preview-code language-${language}`;
+  let index = 0;
+  let plainTextStart = 0;
+
+  const matchAt = (pattern) => {
+    pattern.lastIndex = index;
+    return pattern.exec(source);
+  };
+  const addToken = (end, tokenType) => {
+    appendFilePreviewToken(fragment, source, plainTextStart, index, null);
+    appendFilePreviewToken(fragment, source, index, end, tokenType);
+    index = end;
+    plainTextStart = end;
+  };
+
+  while (index < source.length) {
+    let tokenEnd = index;
+    let tokenType;
+    if (language === "html" && source.startsWith("<!--", index)) {
+      const end = source.indexOf("-->", index + 4);
+      tokenEnd = end < 0 ? source.length : end + 3;
+      tokenType = "comment";
+    } else if (
+      filePreviewBlockCommentLanguages.has(language) &&
+      source.startsWith("/*", index)
+    ) {
+      const end = source.indexOf("*/", index + 2);
+      tokenEnd = end < 0 ? source.length : end + 2;
+      tokenType = "comment";
+    } else if (
+      filePreviewSlashLineCommentLanguages.has(language) &&
+      source.startsWith("//", index)
+    ) {
+      const end = source.indexOf("\n", index + 2);
+      tokenEnd = end < 0 ? source.length : end;
+      tokenType = "comment";
+    } else if (language === "sql" && source.startsWith("--", index)) {
+      const end = source.indexOf("\n", index + 2);
+      tokenEnd = end < 0 ? source.length : end;
+      tokenType = "comment";
+    } else if (filePreviewHashCommentLanguages.has(language) && source[index] === "#") {
+      const end = source.indexOf("\n", index + 1);
+      tokenEnd = end < 0 ? source.length : end;
+      tokenType = "comment";
+    } else if (["'", "\"", "`"].includes(source[index])) {
+      tokenEnd = filePreviewStringEnd(source, index, language);
+      tokenType = "string";
+    } else if (language === "css" && source[index] === "@") {
+      const match = matchAt(cssAtRulePattern);
+      if (match) {
+        tokenEnd = match.index + match[0].length;
+        tokenType = "keyword";
+      }
+    } else if (language === "css" && source[index] === "#") {
+      const color = matchAt(cssHexPattern);
+      const selector = color ? null : matchAt(cssSelectorPattern);
+      const match = color ?? selector;
+      if (match) {
+        tokenEnd = match.index + match[0].length;
+        tokenType = color ? "number" : "selector";
+      }
+    } else if (language === "css" && source[index] === ".") {
+      const match = matchAt(cssSelectorPattern);
+      if (match && match[0].length > 1) {
+        tokenEnd = match.index + match[0].length;
+        tokenType = "selector";
+      }
+    } else if (language === "html" && source[index] === "<") {
+      const match = matchAt(htmlTagPattern);
+      if (match) {
+        tokenEnd = match.index + match[0].length;
+        tokenType = "tag";
+      }
+    }
+
+    if (tokenEnd === index) {
+      const identifier = matchAt(identifierPattern);
+      if (identifier) {
+        const word = identifier[0];
+        const end = index + word.length;
+        const next = filePreviewNextNonWhitespace(source, end);
+        const previous = filePreviewPreviousNonWhitespace(source, index);
+        const lowerWord = word.toLowerCase();
+        if (/^(?:true|false|null|undefined|nan|infinity|none|nil)$/.test(lowerWord)) {
+          tokenType = "literal";
+        } else if (
+          keywords?.has(word) ||
+          ((language === "css" || language === "sql") && keywords?.has(lowerWord))
+        ) {
+          tokenType = "keyword";
+        } else if (
+          language === "css" &&
+          next === ":" &&
+          previous !== ":" &&
+          previous !== "." &&
+          previous !== "#"
+        ) {
+          tokenType = "property";
+        } else if (
+          (language === "java" || language === "generic") &&
+          /^[A-Z]/.test(word)
+        ) {
+          tokenType = "type";
+        } else if (next === "(") {
+          tokenType = "function";
+        }
+        tokenEnd = end;
+      } else {
+        const number = matchAt(numberPattern);
+        if (number) {
+          tokenEnd = index + number[0].length;
+          tokenType = "number";
+        } else if (language === "css" && source[index] === ".") {
+          const selector = matchAt(cssSelectorPattern);
+          if (selector && selector[0].length > 1) {
+            tokenEnd = index + selector[0].length;
+            tokenType = "selector";
+          }
+        }
+      }
+    }
+
+    if (tokenEnd === index) {
+      const operator = matchAt(operatorPattern);
+      if (operator) {
+        tokenEnd = index + operator[0].length;
+        tokenType = "operator";
+      }
+    }
+
+    if (tokenEnd > index) {
+      addToken(tokenEnd, tokenType);
+    } else {
+      index += 1;
+    }
+  }
+
+  appendFilePreviewToken(fragment, source, plainTextStart, source.length, null);
+  code.append(fragment);
+  const preview = document.createElement("pre");
+  preview.className = "file-preview-text";
+  preview.append(code);
+  return preview;
+}
+
 async function openLocalFilePreview(url, fallbackName) {
   const requestSequence = ++filePreviewRequestSequence;
   revokeFilePreviewObjectUrl();
@@ -3901,10 +4152,9 @@ async function openLocalFilePreview(url, fallbackName) {
 
     elements.filePreviewTitle.textContent = preview.name;
     if (typeof preview.text === "string") {
-      const text = document.createElement("pre");
-      text.className = "file-preview-text";
-      text.textContent = preview.text;
-      elements.filePreviewContent.replaceChildren(text);
+      elements.filePreviewContent.replaceChildren(
+        createHighlightedFilePreview(preview.name, preview.text)
+      );
       return;
     }
     if (typeof preview.data !== "string") {

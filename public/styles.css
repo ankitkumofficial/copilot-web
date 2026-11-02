@@ -14,6 +14,14 @@
   --danger: #f2788b;
   --user: #272d48;
   --tool-label: #73c69b;
+  --syntax-keyword: #c792ea;
+  --syntax-string: #c3e88d;
+  --syntax-number: #f78c6c;
+  --syntax-comment: #858b98;
+  --syntax-function: #82aaff;
+  --syntax-type: #ffcb6b;
+  --syntax-property: #89ddff;
+  --syntax-selector: #f07178;
   --shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
   --diff-add-bg: rgba(63, 185, 80, 0.16);
   --diff-add-fg: #7ee2a8;
@@ -37,6 +45,14 @@
   --danger: #c23f59;
   --user: #e8e7ff;
   --tool-label: #176b40;
+  --syntax-keyword: #7d3fb0;
+  --syntax-string: #287a3d;
+  --syntax-number: #bd4d21;
+  --syntax-comment: #707784;
+  --syntax-function: #1c54a7;
+  --syntax-type: #865d00;
+  --syntax-property: #006d79;
+  --syntax-selector: #be354a;
   --shadow: 0 18px 48px rgba(35, 40, 60, 0.14);
   --diff-add-bg: #e6f6ea;
   --diff-add-fg: #116329;
@@ -61,6 +77,14 @@
     --danger: #c23f59;
     --user: #e8e7ff;
     --tool-label: #176b40;
+    --syntax-keyword: #7d3fb0;
+    --syntax-string: #287a3d;
+    --syntax-number: #bd4d21;
+    --syntax-comment: #707784;
+    --syntax-function: #1c54a7;
+    --syntax-type: #865d00;
+    --syntax-property: #006d79;
+    --syntax-selector: #be354a;
     --shadow: 0 18px 48px rgba(35, 40, 60, 0.14);
     --diff-add-bg: #e6f6ea;
     --diff-add-fg: #116329;
@@ -1919,6 +1943,45 @@ button:disabled {
   font-size: 0.84rem;
   line-height: 1.5;
   white-space: pre;
+}
+
+.file-preview-code {
+  font: inherit;
+}
+
+.file-preview-token-keyword,
+.file-preview-token-operator {
+  color: var(--syntax-keyword);
+}
+
+.file-preview-token-string {
+  color: var(--syntax-string);
+}
+
+.file-preview-token-number,
+.file-preview-token-literal {
+  color: var(--syntax-number);
+}
+
+.file-preview-token-comment {
+  color: var(--syntax-comment);
+}
+
+.file-preview-token-function {
+  color: var(--syntax-function);
+}
+
+.file-preview-token-type {
+  color: var(--syntax-type);
+}
+
+.file-preview-token-property {
+  color: var(--syntax-property);
+}
+
+.file-preview-token-selector,
+.file-preview-token-tag {
+  color: var(--syntax-selector);
 }
 
 .file-preview-frame {
