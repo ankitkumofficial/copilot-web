@@ -118,8 +118,8 @@ keeps the model, tools, authentication, and workspace local.
   event is missing, without replacing newer descriptive live metadata.
   If cached activity exceeds its display budget, large tool output is omitted
   before reasoning and tool progress, and a history warning explains any loss.
-- Toggle **Keep awake** using the coffee-cup button immediately before
-  **Reconnect tools** in the message bar. It uses the browser's Screen Wake Lock
+- Toggle **Keep awake** using the coffee-cup button immediately before the
+  **More actions** (⋯) menu in the message bar. It uses the browser's Screen Wake Lock
   API to prevent the display from sleeping and normal display-sleep-triggered
   locking while this tab is visible, without starting a native process or video.
   The button is highlighted while the wake lock is active. It pauses when the
@@ -134,7 +134,8 @@ keeps the model, tools, authentication, and workspace local.
   returning to the tab or refreshing retries a failed request.
   It requires a supported browser and HTTPS or localhost; unsupported browsers
   show a disabled button. Manual and company-enforced locks are unaffected.
-- Reload MCP connections using **Reconnect tools**, even when Copilot says a
+- Reload MCP connections using **Reconnect tools** in the **More actions** (⋯)
+  menu, even when Copilot says a
   tool is unavailable without attempting a call, or after refreshing the page.
   This uses the native `/mcp reload` ACP command without restarting the CLI,
   rerunning earlier actions, or clearing your draft.
@@ -158,6 +159,28 @@ keeps the model, tools, authentication, and workspace local.
   to the bottom.
 - Collapse or expand the conversation sidebar; its state is remembered in the
   browser.
+- Review uncommitted changes in the **Repository** panel (**More actions** (⋯)
+  menu in the message bar, or `Ctrl+Shift+G`). Staged and unstaged files are
+  listed in separate sections; a file with both kinds of change appears in each.
+  Stage or unstage a file with its row button, the diff's **Stage** or
+  **Unstage** button, or `S` on the highlighted row. An unstaged file's row also
+  has a **Reset** button: after confirmation it discards that file's unstaged
+  changes, or deletes the file if Git doesn't track it yet. The panel shows status,
+  line counts, renames, and renders unified diffs with line numbers. It offers
+  **Ask Copilot** (inserts a reference into the message without sending),
+  **Attach diff**, copy actions, a wrap toggle, and a full-file view. The
+  repository is the conversation's working directory when that is inside a git
+  repository; otherwise a picker lists the repositories under `COPILOT_PROJECTS_DIR`
+  as a collapsible folder tree. Folders start collapsed and expand on click or
+  with the arrow keys. Repositories up to three levels deep are listed; folders
+  inside a repository and hidden or `node_modules` folders are not searched. The
+  choice is remembered per conversation. In that conversation, a repository you
+  pick is also sent to Copilot as the first line of each message, replacing any
+  earlier pick; the transcript shows only your text, and slash commands are sent
+  unchanged. The panel refreshes after Copilot tool activity and prompt completion,
+  on window focus, and on demand (`R`). Inside the panel, `↑`/`↓` and `Enter` select and open
+  files, `N`/`P` move between hunks, `W` toggles wrapping, and `Escape` returns
+  to the list or closes the panel.
 
 New sessions use `~/projects` as their starting directory. Copilot can then
 navigate to repositories below that directory when prompted. Resumed sessions
@@ -401,6 +424,20 @@ brand mark uses `C`.
   share. If a turn's native and ACP messages cannot be matched exactly, that
   part of the transcript is shown from ACP rather than risking shifted or
   duplicated messages.
+- The Repository panel never commits or pushes. Staging only updates the Git index,
+  one whole file at a time. Reset is the only action that changes the working
+  tree: after confirmation, it restores a tracked file to its staged version (or
+  its committed version when nothing is staged) or deletes a new file, and it
+  never touches staged changes. Folders, nested repositories, and conflicted
+  files cannot be reset. Staged diffs compare the index with `HEAD`; unstaged
+  diffs compare the working tree with the index, so a partially staged file
+  shows both parts. The panel does not show per-turn or per-tool-call diffs.
+  Repositories must be under
+  `COPILOT_PROJECTS_DIR` or be the conversation's working-directory repository.
+  Lists stop at 2,000 files, diffs at 1 MiB (cut at a hunk boundary), and
+  untracked files over 2 MB are not diffed. Git must be on the server's `PATH`
+  (for the macOS LaunchAgent, see `SERVICE_PATH` in
+  `cpw-installer/macOS/install.sh`).
 - Tool recovery requires the CLI to advertise the native `/mcp` command through
   ACP. Recovery waits up to five seconds for delayed command metadata and
   reports an explicit timeout if it never arrives. Cancelling during that wait
@@ -438,6 +475,7 @@ retrieve quota, the composer shows a warning in place of the numbers.
 | `COPILOT_ALLOW_ALL` | `false` | Pass `--allow-all` to the Copilot ACP process |
 | `COPILOT_NATIVE_SESSION_DELETE` | `true` | Enable the SDK/native CLI fallback for deleting sessions |
 | `COPILOT_SDK_PATH` | auto-discovered | Optional path to the installed Copilot SDK `index.js`, used for session deletion and persisted-message history |
+| `COPILOT_WEB_EDITOR_URL` | unset | Optional **Open in editor** link template for the Repository panel, such as `idea://open?file={path}&line={line}` or `vscode://file/{path}:{line}`; must contain `{path}` and use the `idea:`, `vscode:`, `vscode-insiders:`, `cursor:`, or `zed:` scheme |
 
 Session deletion is confirmation-protected in the browser. ACP deletion is
 preferred when advertised; otherwise the backend uses Copilot CLI's native

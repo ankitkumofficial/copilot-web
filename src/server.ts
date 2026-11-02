@@ -59,6 +59,19 @@ import {
   type StoredAttachment
 } from "./attachments.js";
 import { SerialTaskQueue } from "./persistence.js";
+import {
+  computeStatus,
+  GitChangesError,
+  isWithinOrEqual,
+  listProjectRepositories,
+  readFileDiff,
+  readStatus,
+  resetChangedFile,
+  resolveToplevel,
+  setChangeStaged,
+  validateRelativePath,
+  type RepositoryEntry
+} from "./git-changes.js";
 
 const applicationVersion = "0.1.0";
 const defaultBrandName = "Copilot Web";
@@ -227,6 +240,27 @@ function readBooleanEnvironment(name: string): boolean {
     return true;
   }
   throw new Error(`${name} must be true or false`);
+}
+
+const editorUrlSchemes = new Set(["idea:", "vscode:", "vscode-insiders:", "cursor:", "zed:"]);
+
+function readEditorUrlTemplate(): string | null {
+  const value = process.env.COPILOT_WEB_EDITOR_URL?.trim();
+  if (!value) {
+    return null;
+  }
+  let scheme: string;
+  try {
+    scheme = new URL(value.replaceAll("{path}", "path").replaceAll("{line}", "1")).protocol;
+  } catch {
+    throw new Error("COPILOT_WEB_EDITOR_URL must be a URL template such as vscode://file/{path}:{line}");
+  }
+  if (!editorUrlSchemes.has(scheme) || !value.includes("{path}")) {
+    throw new Error(
+      `COPILOT_WEB_EDITOR_URL must contain {path} and use one of: ${[...editorUrlSchemes].join(", ")}`
+    );
+  }
+  return value;
 }
 
 async function runChildProcess(
@@ -1160,6 +1194,7 @@ async function main(): Promise<void> {
     throw new Error(`COPILOT_PROJECTS_DIR is not a directory: ${projectsDirectory}`);
   }
   const projectsRoot = await realpath(projectsDirectory);
+  const editorUrlTemplate = readEditorUrlTemplate();
   const sessionTitlesPath = path.join(
     os.homedir(),
     ".copilot-web",
@@ -1224,6 +1259,7 @@ async function main(): Promise<void> {
   const sessionTitleWrites = new SerialTaskQueue();
   const sessionUsageWrites = new SerialTaskQueue();
   const sessionActivityWrites = new SerialTaskQueue();
+  const gitIndexWrites = new SerialTaskQueue();
   const replayingSessions = new Map<string, JsonObject[]>();
   const fallbackReplayTails = new Map<string, JsonObject[]>();
   const busySessions = new Map<string, BusyPrompt>();
@@ -1241,6 +1277,83 @@ async function main(): Promise<void> {
   const browserToken = randomBytes(32).toString("hex");
   const requestScope = randomBytes(12).toString("hex");
   let updateSequence = 0;
+  const toplevelCache = new Map<string, Promise<string | undefined>>();
+  const maximumToplevelCacheEntries = 2_000;
+  const knownRepositoryRoots = new Set<string>();
+  let projectRepositoriesCache: { expiresAt: number; promise: Promise<RepositoryEntry[]> } | undefined;
+
+  const cachedToplevel = (directory: string): Promise<string | undefined> => {
+    let pending = toplevelCache.get(directory);
+    if (!pending) {
+      // A directory can become a repository later, so only found roots stay cached.
+      const resolving = resolveToplevel(directory).then((root) => {
+        if (root === undefined) {
+          toplevelCache.delete(directory);
+        }
+        return root;
+      }, (error: unknown) => {
+        toplevelCache.delete(directory);
+        if (error instanceof GitChangesError && error.code === "git_unavailable") {
+          throw error;
+        }
+        return undefined;
+      });
+      pending = resolving;
+      toplevelCache.set(directory, resolving);
+      if (toplevelCache.size > maximumToplevelCacheEntries) {
+        const oldest = toplevelCache.keys().next().value;
+        if (oldest !== undefined) {
+          toplevelCache.delete(oldest);
+        }
+      }
+    }
+    return pending;
+  };
+
+  const resolveAllowedRepository = async (value: string | null): Promise<string> => {
+    if (!value || value.length > 4096 || value.includes("\0") || !path.isAbsolute(value)) {
+      throw new HttpError(400, "An absolute repository path is required", "invalid_repository");
+    }
+    const notAllowed = new HttpError(
+      403,
+      "This repository is outside the allowed roots",
+      "repository_not_allowed"
+    );
+    const resolved = await realpath(value).catch(() => undefined);
+    if (resolved === undefined) {
+      throw notAllowed;
+    }
+    if (!isWithinOrEqual(projectsRoot, resolved) && !knownRepositoryRoots.has(resolved)) {
+      throw notAllowed;
+    }
+    const repositoryStats = await stat(resolved).catch(() => undefined);
+    if (!repositoryStats?.isDirectory() || await resolveToplevel(resolved) !== resolved) {
+      throw notAllowed;
+    }
+    return resolved;
+  };
+
+  const readSessionRepository = async (session: SessionInfo): Promise<JsonObject> => {
+    const root = session.cwd ? await cachedToplevel(session.cwd) : undefined;
+    if (root) {
+      knownRepositoryRoots.add(root);
+    }
+    return { root: root ?? null, name: root ? path.basename(root) : null };
+  };
+
+  const projectRepositories = (): Promise<RepositoryEntry[]> => {
+    const now = Date.now();
+    if (!projectRepositoriesCache || projectRepositoriesCache.expiresAt <= now) {
+      const promise = listProjectRepositories(projectsRoot);
+      projectRepositoriesCache = { expiresAt: now + 30_000, promise };
+      promise.catch(() => {
+        if (projectRepositoriesCache?.promise === promise) {
+          projectRepositoriesCache = undefined;
+        }
+      });
+    }
+    return projectRepositoriesCache.promise;
+  };
   // Settled results stay long enough for refresh retries without growing for the server's lifetime.
   const maximumSettledSubmissions = 256;
   const submittedRequests = new Map<string, {
@@ -2126,6 +2239,7 @@ async function main(): Promise<void> {
         capabilities: browserCapabilities(),
         contexts: contextOptions,
         nativeMessageHistoryAvailable: copilotHistory.available,
+        editorUrlTemplate,
         newSessionDefaults
       });
       return true;
@@ -2196,6 +2310,7 @@ async function main(): Promise<void> {
         projectsDirectory,
         contexts: contextOptions,
         nativeMessageHistoryAvailable: copilotHistory.available,
+        editorUrlTemplate,
         newSessionDefaults
       }));
       sseClients.add(client);
@@ -2312,6 +2427,60 @@ async function main(): Promise<void> {
         };
       });
       jsonResponse(response, 201, result);
+      return true;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/api/git/repositories") {
+      jsonResponse(response, 200, { repositories: await projectRepositories() });
+      return true;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/api/git/status") {
+      const repo = await resolveAllowedRepository(requestUrl.searchParams.get("repo"));
+      jsonResponse(response, 200, await readStatus(repo));
+      return true;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/api/git/diff") {
+      const repo = await resolveAllowedRepository(requestUrl.searchParams.get("repo"));
+      const filePath = await validateRelativePath(repo, requestUrl.searchParams.get("path") ?? "");
+      const requestedOldPath = requestUrl.searchParams.get("oldPath");
+      const oldPath = requestedOldPath ? await validateRelativePath(repo, requestedOldPath) : undefined;
+      const requestedContext = requestUrl.searchParams.get("context") ?? "3";
+      if (requestedContext !== "full" && !/^\d{1,3}$/.test(requestedContext)) {
+        throw new HttpError(400, "Context must be full or a number of lines", "invalid_context");
+      }
+      const requestedSection = requestUrl.searchParams.get("section");
+      if (requestedSection !== "staged" && requestedSection !== "unstaged") {
+        throw new HttpError(400, "Section must be staged or unstaged", "invalid_section");
+      }
+      jsonResponse(response, 200, await readFileDiff(repo, filePath, {
+        oldPath,
+        section: requestedSection,
+        context: requestedContext === "full" ? "full" : Number(requestedContext)
+      }));
+      return true;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/api/git/stage") {
+      const body = await readJsonBody(request);
+      const repo = await resolveAllowedRepository(typeof body.repo === "string" ? body.repo : null);
+      const filePath = await validateRelativePath(repo, body.path);
+      if (body.action !== "stage" && body.action !== "unstage") {
+        throw new HttpError(400, "Action must be stage or unstage", "invalid_action");
+      }
+      const action = body.action;
+      await gitIndexWrites.enqueue(() => setChangeStaged(repo, filePath, action));
+      jsonResponse(response, 200, await computeStatus(repo));
+      return true;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/api/git/reset") {
+      const body = await readJsonBody(request);
+      const repo = await resolveAllowedRepository(typeof body.repo === "string" ? body.repo : null);
+      const filePath = await validateRelativePath(repo, body.path);
+      await gitIndexWrites.enqueue(() => resetChangedFile(repo, filePath));
+      jsonResponse(response, 200, await computeStatus(repo));
       return true;
     }
 
@@ -2445,6 +2614,11 @@ async function main(): Promise<void> {
 
     if (!subroute) {
       throw new HttpError(404, "API route not found");
+    }
+
+    if (request.method === "GET" && subroute === "repository") {
+      jsonResponse(response, 200, await readSessionRepository(session));
+      return true;
     }
 
     if (request.method === "GET" && subroute === "history") {
@@ -3051,7 +3225,7 @@ async function main(): Promise<void> {
           throw new HttpError(405, "Method not allowed");
         }
       } catch (error) {
-        const status = error instanceof HttpError ? error.status : 500;
+        const status = error instanceof HttpError || error instanceof GitChangesError ? error.status : 500;
         const message = error instanceof Error ? error.message : "Unexpected server error";
         if (status >= 500) {
           console.error(`[server] ${message}`);
@@ -3059,7 +3233,9 @@ async function main(): Promise<void> {
         if (!response.headersSent) {
           jsonResponse(response, status, {
             error: message,
-            ...(error instanceof HttpError && error.code ? { code: error.code } : {})
+            ...((error instanceof HttpError || error instanceof GitChangesError) && error.code
+              ? { code: error.code }
+              : {})
           });
         } else {
           response.end();

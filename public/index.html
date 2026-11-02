@@ -81,6 +81,8 @@
         title="Drag or use the arrow keys to resize conversation history"
       ></div>
 
+      <div id="workspace" class="workspace">
+        <div id="workspace-body" class="workspace-body">
       <main class="conversation">
         <section id="messages" class="messages" aria-live="polite">
           <div id="empty-state" class="empty-state">
@@ -222,17 +224,35 @@
                   <path d="M5 8h12v7a5 5 0 0 1-5 5h-2a5 5 0 0 1-5-5ZM17 8h2a3 3 0 0 1 0 6h-2M8 3v2m4-2v2m4-2v2"></path>
                 </svg>
               </button>
-              <button id="reconnect-tools" class="secondary-button icon-button" type="button" aria-label="Reconnect tools" title="Reload MCP connections without rerunning your prompt" disabled>
-                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M20 7v5h-5M4 17v-5h5"></path>
-                  <path d="M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 17.9 17"></path>
-                </svg>
-              </button>
-              <button id="attach-files" class="secondary-button icon-button" type="button" aria-label="Attach files" title="Attach files">
-                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="m20.5 11.5-8.1 8.1a5 5 0 0 1-7.1-7.1l8.5-8.5a3.5 3.5 0 0 1 5 5l-8.5 8.5a2 2 0 0 1-2.8-2.8l7.8-7.8"></path>
-                </svg>
-              </button>
+              <div class="composer-more">
+                <button id="composer-more-button" class="secondary-button icon-button" type="button" aria-label="More actions" title="More actions" aria-haspopup="true" aria-expanded="false" aria-controls="composer-more-menu">
+                  <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M5 12h.01M12 12h.01M19 12h.01"></path>
+                  </svg>
+                </button>
+                <div id="composer-more-menu" class="composer-more-menu" hidden>
+                  <button id="reconnect-tools" class="composer-more-item" type="button" aria-label="Reconnect tools" title="Reload MCP connections without rerunning your prompt" disabled>
+                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M20 7v5h-5M4 17v-5h5"></path>
+                      <path d="M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 17.9 17"></path>
+                    </svg>
+                    <span>Reconnect tools</span>
+                  </button>
+                  <button id="attach-files" class="composer-more-item" type="button" aria-label="Attach files" title="Attach files">
+                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="m20.5 11.5-8.1 8.1a5 5 0 0 1-7.1-7.1l8.5-8.5a3.5 3.5 0 0 1 5 5l-8.5 8.5a2 2 0 0 1-2.8-2.8l7.8-7.8"></path>
+                    </svg>
+                    <span>Attach files</span>
+                  </button>
+                  <button id="changes-toggle" class="composer-more-item" type="button" aria-controls="changes-panel" aria-pressed="false" aria-label="Repository" title="Show repository and changes (Ctrl+Shift+G)">
+                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M6 3v12m0 0a3 3 0 1 0 0 6 3 3 0 0 0 0-6Zm12-6a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm0 0c0 5-6 4-12 9"></path>
+                    </svg>
+                    <span>Repository</span>
+                    <span id="changes-badge" class="changes-toggle-badge" aria-hidden="true" hidden></span>
+                  </button>
+                </div>
+              </div>
               <input id="file-input" type="file" multiple hidden>
               <button id="voice-input" class="secondary-button icon-button" type="button" data-icon="microphone" aria-label="Start voice input" aria-pressed="false" aria-describedby="voice-input-status" title="Start voice input" disabled>
                 <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -257,6 +277,85 @@
           <p id="keep-awake-status" class="keep-awake-status visually-hidden" role="status"></p>
         </form>
       </main>
+          <div
+            id="changes-resizer"
+            class="changes-resizer"
+            role="separator"
+            aria-label="Resize repository panel"
+            aria-controls="changes-panel"
+            aria-orientation="vertical"
+            aria-valuemin="320"
+            tabindex="0"
+            title="Drag or use the arrow keys to resize the repository panel"
+            hidden
+          ></div>
+          <aside id="changes-panel" class="changes-panel" aria-labelledby="changes-title" data-view="list" hidden>
+            <header class="changes-header">
+              <button id="changes-back" class="changes-icon-button changes-back" type="button" aria-label="Back to conversation" title="Back to conversation">‹</button>
+              <h2 id="changes-title">Repository</h2>
+              <button id="changes-refresh" class="changes-icon-button" type="button" aria-label="Refresh changes" title="Refresh (R)">
+                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5"></path><path d="M19.4 12A7.5 7.5 0 1 1 17 6.5L20 9"></path></svg>
+              </button>
+              <button id="changes-expand" class="changes-icon-button" type="button" aria-label="Expand repository panel" aria-pressed="false" title="Expand">
+                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7"></path></svg>
+              </button>
+              <button id="changes-close" class="changes-icon-button" type="button" aria-label="Close repository panel" title="Close (Ctrl+Shift+G)">
+                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg>
+              </button>
+            </header>
+            <div class="changes-repository-row">
+              <div class="changes-repository-picker">
+                <button id="changes-repository" class="composer-setting changes-repository-button" type="button" title="Repository" aria-haspopup="tree" aria-expanded="false" aria-controls="changes-repository-menu">
+                  <svg class="composer-setting-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5A1.5 1.5 0 0 1 6.5 3H19v15H6.5A1.5 1.5 0 0 0 5 19.5Z"></path><path d="M5 19.5A1.5 1.5 0 0 0 6.5 21H19v-3"></path></svg>
+                  <span id="changes-repository-label" class="changes-repository-label">Choose a repository</span>
+                </button>
+                <div id="changes-repository-menu" class="changes-repository-menu" role="tree" aria-label="Repositories" tabindex="-1" hidden></div>
+              </div>
+              <span id="changes-branch" class="changes-branch"></span>
+            </div>
+            <div class="changes-summary">
+              <span id="changes-summary-text"></span>
+              <input id="changes-filter" class="changes-filter" type="search" placeholder="Filter files" aria-label="Filter changed files" hidden>
+            </div>
+            <div id="changes-warnings" class="changes-warnings" hidden></div>
+            <div id="changes-list" class="changes-list" role="listbox" aria-label="Changed files" tabindex="0"></div>
+            <div
+              id="changes-split-resizer"
+              class="changes-split-resizer"
+              role="separator"
+              aria-label="Resize file list"
+              aria-orientation="horizontal"
+              tabindex="0"
+              hidden
+            ></div>
+            <section id="changes-diff" class="changes-diff" aria-labelledby="changes-diff-title" hidden>
+              <div class="changes-diff-header">
+                <button id="changes-diff-back" class="changes-icon-button changes-diff-back" type="button" aria-label="Back to file list" title="Back to file list (Escape)">‹</button>
+                <h3 id="changes-diff-title" class="changes-diff-title"></h3>
+                <span id="changes-diff-meta" class="changes-diff-meta"></span>
+              </div>
+              <div class="changes-diff-actions" role="toolbar" aria-label="Diff actions">
+                <button id="changes-stage" class="changes-action" type="button" title="Stage file (S)">Stage</button>
+                <button id="changes-ask" class="changes-action" type="button" title="Insert a reference to this change into the message">Ask Copilot</button>
+                <button id="changes-attach" class="changes-action" type="button" title="Attach this diff as a file">Attach diff</button>
+                <button id="changes-copy" class="changes-action" type="button">Copy diff</button>
+                <button id="changes-wrap" class="changes-action" type="button" aria-pressed="false" title="Wrap long lines (W)">Wrap</button>
+                <button id="changes-full" class="changes-action" type="button" aria-pressed="false" title="Show the whole file">Full file</button>
+                <div class="changes-more">
+                  <button id="changes-more" class="changes-action" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="changes-more-menu" aria-label="More actions" title="More actions">⋯</button>
+                  <div id="changes-more-menu" class="changes-more-menu" role="menu" hidden>
+                    <button type="button" role="menuitem" data-action="copy-path">Copy path</button>
+                    <button type="button" role="menuitem" data-action="copy-absolute-path">Copy absolute path</button>
+                    <a id="changes-open-editor" role="menuitem" data-action="open-editor" rel="noopener noreferrer" hidden>Open in editor</a>
+                  </div>
+                </div>
+              </div>
+              <div id="changes-diff-body" class="changes-diff-body"></div>
+            </section>
+            <p id="changes-live" class="visually-hidden" role="status" aria-live="polite"></p>
+          </aside>
+        </div>
+      </div>
     </div>
 
     <dialog id="permission-dialog" class="permission-dialog">
@@ -275,6 +374,17 @@
         <div class="delete-dialog-actions">
           <button id="delete-cancel" class="secondary-button" value="cancel" type="submit">Cancel</button>
           <button id="delete-confirm" class="danger-button" value="confirm" type="submit">Delete</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="changes-reset-dialog" class="delete-dialog" aria-labelledby="changes-reset-title" aria-describedby="changes-reset-description">
+      <form method="dialog">
+        <h2 id="changes-reset-title">Reset changes?</h2>
+        <p id="changes-reset-description"></p>
+        <div class="delete-dialog-actions">
+          <button class="secondary-button" value="cancel" type="submit">Cancel</button>
+          <button id="changes-reset-confirm" class="danger-button" value="confirm" type="submit">Reset</button>
         </div>
       </form>
     </dialog>

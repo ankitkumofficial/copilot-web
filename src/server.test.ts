@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -390,6 +390,16 @@ input.on("line", (line) => {
       const nativeEvents = nativeMessages && !reload
         ? emitNativePrompt(request, request.params.sessionId, reply)
         : null;
+      if (request.params.prompt[0]?.text?.startsWith("edit-file:")) {
+        const editedPath = request.params.prompt[0].text.slice("edit-file:".length);
+        update(request.params.sessionId, {
+          sessionUpdate: "tool_call", toolCallId: "edit-tool", title: "Edit file",
+          kind: "edit", status: "in_progress", locations: [{ path: editedPath }]
+        });
+        update(request.params.sessionId, {
+          sessionUpdate: "tool_call_update", toolCallId: "edit-tool", status: "completed"
+        });
+      }
       if (request.params.prompt[0]?.text === "token-reasoning") {
         update(request.params.sessionId, {
           sessionUpdate: "tool_call", toolCallId: "early-tool", title: "Early tool", status: "in_progress"
@@ -1112,6 +1122,220 @@ async function startTestServer(t: TestContext, options: {
     )
   };
 }
+
+const gitAvailable = (() => {
+  try {
+    execFileSync("git", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+function testGit(repo: string, ...args: string[]): void {
+  execFileSync("git", [
+    "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main",
+    "-c", "commit.gpgsign=false", ...args
+  ], { cwd: repo, stdio: "ignore" });
+}
+
+async function createTestRepository(repo: string, files: Record<string, string>): Promise<string> {
+  await mkdir(repo, { recursive: true });
+  testGit(repo, "init", "-q");
+  for (const [name, content] of Object.entries(files)) {
+    await mkdir(path.dirname(path.join(repo, name)), { recursive: true });
+    await writeFile(path.join(repo, name), content);
+  }
+  testGit(repo, "add", ".");
+  testGit(repo, "commit", "-qm", "initial");
+  return realpath(repo);
+}
+
+test("changes endpoints list staged and unstaged files, serve section diffs, and stage or unstage files", {
+  skip: gitAvailable ? false : "git is not on PATH"
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const directory = path.dirname(server.projectsDirectory);
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), {
+    "src/a.txt": "one\ntwo\n",
+    "b.txt": "unchanged\n",
+    "partial.txt": "base\n",
+    "staged.txt": "before\n"
+  });
+  await writeFile(path.join(repo, "src", "a.txt"), "one\nTWO\nthree\n");
+  await writeFile(path.join(repo, "c.txt"), "new\n");
+  await writeFile(path.join(repo, "partial.txt"), "base\nstaged\n");
+  await writeFile(path.join(repo, "staged.txt"), "after\n");
+  testGit(repo, "add", "partial.txt", "staged.txt");
+  await writeFile(path.join(repo, "partial.txt"), "base\nstaged\nunstaged\n");
+  const outsideRepo = await createTestRepository(path.join(directory, "outside-repo"), { "x.txt": "x\n" });
+
+  const get = (url: string, headers: Record<string, string> = server.headers) => fetch(`${server.baseUrl}${url}`, { headers });
+  const post = (body: unknown, headers: Record<string, string> = server.headers) => fetch(`${server.baseUrl}/api/git/stage`, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const repoQuery = `repo=${encodeURIComponent(repo)}`;
+  const sectionKeys = (status: unknown): string[] => {
+    assert.ok(isRecord(status) && Array.isArray(status.files));
+    return status.files.filter(isRecord).map((file) => `${String(file.section)}:${String(file.path)}`).sort();
+  };
+  const expectedKeys = [
+    "staged:partial.txt", "staged:staged.txt", "unstaged:c.txt", "unstaged:partial.txt", "unstaged:src/a.txt"
+  ];
+
+  const statusResponse = await get(`/api/git/status?${repoQuery}`);
+  assert.equal(statusResponse.status, 200);
+  const status: unknown = await statusResponse.json();
+  assert.ok(isRecord(status));
+  assert.equal(status.branch, "main");
+  assert.deepEqual(sectionKeys(status), expectedKeys);
+  assert.deepEqual(status.totals, { files: 4, additions: 6, deletions: 2 });
+  const byKey = new Map((status.files as unknown[]).filter(isRecord).map((file) => [`${file.section}:${file.path}`, file]));
+  assert.deepEqual([byKey.get("unstaged:src/a.txt")?.additions, byKey.get("unstaged:src/a.txt")?.deletions], [2, 1]);
+  assert.equal(byKey.get("staged:staged.txt")?.status, "modified");
+  assert.equal(byKey.get("unstaged:c.txt")?.status, "untracked");
+
+  const diffOf = async (query: string) => {
+    const response = await get(`/api/git/diff?${repoQuery}&${query}`);
+    return { status: response.status, body: await response.json() as JsonObject };
+  };
+  const stagedDiff = await diffOf("path=partial.txt&section=staged");
+  assert.equal(stagedDiff.status, 200);
+  assert.equal(stagedDiff.body.section, "staged");
+  assert.match(String(stagedDiff.body.diff), /^\+staged$/m);
+  assert.doesNotMatch(String(stagedDiff.body.diff), /^\+unstaged$/m);
+  const unstagedDiff = await diffOf(`path=${encodeURIComponent("src/a.txt")}&section=unstaged`);
+  assert.equal(unstagedDiff.status, 200);
+  assert.equal(unstagedDiff.body.status, "modified");
+  assert.match(String(unstagedDiff.body.diff), /^\+TWO$/m);
+  assert.equal((await diffOf("path=c.txt&section=unstaged&context=full")).status, 200);
+  const unchanged = await diffOf("path=b.txt&section=unstaged");
+  assert.equal(unchanged.status, 404);
+  assert.equal(unchanged.body.code, "file_not_changed");
+  assert.equal((await diffOf("path=src/a.txt&section=staged")).body.code, "file_not_changed");
+  assert.equal((await diffOf("path=src/a.txt")).body.code, "invalid_section");
+  assert.equal((await diffOf("path=src/a.txt&section=both")).body.code, "invalid_section");
+  for (const invalidPath of ["../../etc/passwd", "/etc/passwd", ".git/config", ""]) {
+    const response = await diffOf(`path=${encodeURIComponent(invalidPath)}&section=unstaged`);
+    assert.equal(response.status, 400, invalidPath);
+    assert.equal(response.body.code, "invalid_path");
+  }
+  assert.equal((await diffOf("path=c.txt&section=unstaged&context=lots")).status, 400);
+
+  const stage = await post({ repo, path: "src/a.txt", action: "stage" });
+  assert.equal(stage.status, 200);
+  assert.ok(sectionKeys(await stage.json()).includes("staged:src/a.txt"));
+  const stale = await post({ repo, path: "src/a.txt", action: "stage" });
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json() as JsonObject).code, "file_not_changed");
+  const unstage = await post({ repo, path: "src/a.txt", action: "unstage" });
+  assert.equal(unstage.status, 200);
+  assert.deepEqual(sectionKeys(await unstage.json()), expectedKeys);
+  assert.equal((await post({ repo, path: "src/a.txt", action: "discard" })).status, 400);
+  assert.equal((await post({ repo, path: "../../etc/passwd", action: "stage" })).status, 400);
+  assert.equal((await post({ path: "src/a.txt", action: "stage" })).status, 400);
+  const outsideStage = await post({ repo: outsideRepo, path: "x.txt", action: "stage" });
+  assert.equal(outsideStage.status, 403);
+  assert.equal((await outsideStage.json() as JsonObject).code, "repository_not_allowed");
+  assert.equal((await post({ repo, path: "src/a.txt", action: "stage" }, { ...server.headers, Origin: "http://evil.example" })).status, 401);
+  assert.equal((await fetch(`${server.baseUrl}/api/git/stage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ repo, path: "src/a.txt", action: "stage" })
+  })).status, 401);
+  assert.deepEqual(sectionKeys(await (await get(`/api/git/status?${repoQuery}`)).json()), expectedKeys);
+
+  const subdirectory = await get(`/api/git/status?repo=${encodeURIComponent(path.join(repo, "src"))}`);
+  assert.equal(subdirectory.status, 403);
+  const outside = await get(`/api/git/status?repo=${encodeURIComponent(outsideRepo)}`);
+  assert.equal(outside.status, 403);
+  assert.equal((await outside.json() as JsonObject).code, "repository_not_allowed");
+  assert.equal((await get("/api/git/status?repo=relative/path")).status, 400);
+  assert.equal((await fetch(`${server.baseUrl}/api/git/status?${repoQuery}`)).status, 401);
+  assert.equal((await get(`/api/git/status?${repoQuery}`, {
+    ...server.headers, Origin: "http://evil.example"
+  })).status, 401);
+  assert.equal((await fetch(`${server.baseUrl}/api/sessions/session-1/repository`)).status, 401);
+
+  const repositoriesResponse = await get("/api/git/repositories");
+  assert.equal(repositoriesResponse.status, 200);
+  assert.deepEqual(await repositoriesResponse.json(), { repositories: [{ root: repo, name: "app", relativePath: "app" }] });
+
+  const methods = (await server.requests().catch(() => [])).map((request) => request.method);
+  assert.ok(!methods.includes("session/load"), "the changes view must not load the conversation");
+  assert.ok(!methods.includes("session/prompt"), "the changes view must not prompt the conversation");
+});
+
+test("changes reset endpoint discards unstaged edits, deletes new files, and refuses unchanged or foreign files", {
+  skip: gitAvailable ? false : "git is not on PATH"
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const directory = path.dirname(server.projectsDirectory);
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "reset-app"), {
+    "tracked.txt": "base\n",
+    "keep.txt": "keep\n"
+  });
+  const outsideRepo = await createTestRepository(path.join(directory, "reset-outside"), { "x.txt": "x\n" });
+  await writeFile(path.join(repo, "tracked.txt"), "changed\n");
+  await writeFile(path.join(repo, "new.txt"), "new\n");
+  const post = (body: unknown, headers: Record<string, string> = server.headers) => fetch(`${server.baseUrl}/api/git/reset`, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const changedKeys = async (response: Response): Promise<string[]> => {
+    const status: unknown = await response.json();
+    assert.ok(isRecord(status) && Array.isArray(status.files));
+    return status.files.filter(isRecord).map((file) => `${String(file.section)}:${String(file.path)}`);
+  };
+
+  const reset = await post({ repo, path: "tracked.txt" });
+  assert.equal(reset.status, 200);
+  assert.deepEqual(await changedKeys(reset), ["unstaged:new.txt"]);
+  assert.equal(await readFile(path.join(repo, "tracked.txt"), "utf8"), "base\n");
+
+  const deleted = await post({ repo, path: "new.txt" });
+  assert.equal(deleted.status, 200);
+  assert.deepEqual(await changedKeys(deleted), []);
+  assert.equal(existsSync(path.join(repo, "new.txt")), false);
+
+  const stale = await post({ repo, path: "tracked.txt" });
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json() as JsonObject).code, "file_not_changed");
+  assert.equal((await post({ repo, path: "keep.txt" })).status, 409);
+  assert.equal((await post({ repo, path: "../../etc/passwd" })).status, 400);
+  assert.equal((await post({ path: "tracked.txt" })).status, 400);
+  const outside = await post({ repo: outsideRepo, path: "x.txt" });
+  assert.equal(outside.status, 403);
+  assert.equal((await outside.json() as JsonObject).code, "repository_not_allowed");
+  assert.equal((await post({ repo, path: "keep.txt" }, { ...server.headers, Origin: "http://evil.example" })).status, 401);
+  assert.equal((await fetch(`${server.baseUrl}/api/git/reset`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ repo, path: "tracked.txt" })
+  })).status, 401);
+  assert.equal(await readFile(path.join(repo, "keep.txt"), "utf8"), "keep\n");
+});
+
+test("session repository resolves the conversation's working-tree root once it is a repository", {
+  skip: gitAvailable ? false : "git is not on PATH"
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repositoryUrl = `${server.baseUrl}/api/sessions/session-1/repository`;
+  const readRepository = async () => (await fetch(repositoryUrl, { headers: server.headers })).json();
+
+  // The fixture conversation runs in the projects directory, which is not a repository yet.
+  assert.deepEqual(await readRepository(), { root: null, name: null });
+  testGit(server.projectsDirectory, "init", "-q");
+  const root = await realpath(server.projectsDirectory);
+  assert.deepEqual(await readRepository(), { root, name: path.basename(root) });
+  const status = await fetch(`${server.baseUrl}/api/git/status?repo=${encodeURIComponent(root)}`, { headers: server.headers });
+  assert.equal(status.status, 200);
+  assert.equal((await status.json() as JsonObject).hasCommits, false);
+  assert.equal((await fetch(repositoryUrl)).status, 401);
+});
 
 test("retrieves account quota through the authenticated GitHub CLI", async (t) => {
   const server = await startTestServer(t, { quotaCommand: "success" });
@@ -2875,7 +3099,7 @@ test("toggles a native screen wake lock from the message bar", {
   assert.equal(await evaluate(`window.isSecureContext && typeof navigator.wakeLock.request === 'function'`), true);
   assert.equal(await evaluate(`${button}.disabled`), false);
   assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "false");
-  assert.equal(await evaluate(`${button}.nextElementSibling.id`), "reconnect-tools");
+  assert.equal(await evaluate(`${button}.nextElementSibling.firstElementChild.id`), "composer-more-button");
   await evaluate(`${button}.click()`);
   await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
   assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "true");
@@ -3806,6 +4030,530 @@ const conversationLayout = `
   })
 `;
 
+test("changes view lists staged and unstaged files, stages and unstages them, renders diffs, and inserts references into the composer", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), {
+    "src/a.txt": "one\ntwo\n",
+    "b.txt": "unchanged\n",
+    "staged.txt": "before\n"
+  });
+  await writeFile(path.join(repo, "src", "a.txt"), "one\nTWO\nthree\n");
+  await writeFile(path.join(repo, "c.txt"), "<img src=x onerror=window.injected=1>\n");
+  await writeFile(path.join(repo, "staged.txt"), "after\n");
+  testGit(repo, "add", "staged.txt");
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await command("Emulation.setDeviceMetricsOverride", {
+    width: 1400, height: 1000, deviceScaleFactor: 1, mobile: false
+  }, sessionId);
+
+  const parsed = await evaluate(`import("/diff-view.js").then(({ parseUnifiedDiff }) => {
+    const { files } = parseUnifiedDiff([
+      "diff --git a/old name.txt b/new name.txt",
+      "old mode 100644",
+      "new mode 100755",
+      "similarity index 90%",
+      "rename from old name.txt",
+      "rename to new name.txt",
+      "--- a/old name.txt\\t",
+      "+++ b/new name.txt\\t",
+      "@@ -1,2 +1,2 @@ section",
+      " keep",
+      "-old",
+      "+new",
+      "\\\\ No newline at end of file",
+      ""
+    ].join("\\n"));
+    const [file] = files;
+    return [file.oldPath, file.newPath, file.isRename, file.oldMode, file.newMode, file.similarity,
+      file.hunks[0].section, file.hunks[0].lines.map((line) => [line.type, line.oldLine, line.newLine, line.text])];
+  })`);
+  assert.deepEqual(parsed, ["old name.txt", "new name.txt", true, "100644", "100755", 90, "section", [
+    ["context", 1, 1, "keep"],
+    ["del", 2, null, "old"],
+    ["add", null, 2, "new"],
+    ["meta", null, null, "No newline at end of file"]
+  ]]);
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  assert.equal(await evaluate(`document.querySelector("#changes-toggle").getAttribute("aria-label")`), "Repository");
+  assert.equal(await evaluate(`document.querySelector("#composer-more-menu").hidden`), true);
+  await evaluate(`document.querySelector("#composer-more-button").click()`);
+  assert.deepEqual(await evaluate(`[
+    document.querySelector("#composer-more-menu").hidden,
+    document.querySelector("#composer-more-button").getAttribute("aria-expanded"),
+    Array.from(document.querySelectorAll("#composer-more-menu > button")).map((button) => button.id)
+  ]`), [false, "true", ["reconnect-tools", "attach-files", "changes-toggle"]]);
+
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  assert.equal(await evaluate(`document.querySelector("#composer-more-menu").hidden`), true);
+  // This conversation runs outside any repository, so the picker decides.
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]")).some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  assert.match(String(await evaluate(`document.querySelector("#changes-list").textContent`)), /Choose a repository/);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelectorAll("#changes-list [role=option]").length === 3 &&
+    document.querySelector("#changes-badge").textContent === "3"`);
+  assert.match(String(await evaluate(`document.querySelector("#changes-toggle").getAttribute("aria-label")`)),
+    /^Repository, 3 uncommitted files in app · main/);
+  assert.match(String(await evaluate(`document.querySelector("#changes-toggle").title`)), /^app · main.*\nHide repository and changes/);
+  assert.equal(await evaluate(`document.querySelector("#changes-toggle").getAttribute("aria-pressed")`), "true");
+  assert.equal(await evaluate(`document.querySelector("#changes-repository").dataset.root`), repo);
+  assert.equal(await evaluate(`document.querySelector("#changes-repository-menu").hidden`), true);
+  assert.equal(await evaluate(`localStorage.getItem("copilot-web-changes-open")`), "true");
+  assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll("#changes-list [role=option]")).map((row) => row.dataset.key)`), [
+    "unstaged:src/a.txt", "unstaged:c.txt", "staged:staged.txt"
+  ]);
+  assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll("#changes-list .changes-group-title")).map((title) => title.textContent)`), [
+    "Unstaged changes2 · +3 −1", "Staged changes1 · +1 −1"
+  ]);
+
+  // Stage an untracked file from its row; the row moves to the staged section.
+  await evaluate(`document.querySelector('[data-key="unstaged:c.txt"] .changes-file-action:not(.changes-file-action-reset)').click()`);
+  await waitFor(`Boolean(document.querySelector('.changes-group-staged [data-key="staged:c.txt"]'))`);
+  assert.equal(await evaluate(`document.querySelector('[data-key="unstaged:c.txt"]')`), null);
+  assert.equal(await evaluate(`document.querySelector("#changes-badge").textContent`), "3");
+
+  // Opening the staged file shows its index diff; the diff bar unstages it and keeps it open.
+  await evaluate(`document.querySelector('[data-key="staged:c.txt"]').click()`);
+  await waitFor(`document.querySelector("#changes-diff-body .diff-add .diff-code")?.textContent.includes("<img")`);
+  assert.equal(await evaluate(`window.injected`), undefined);
+  assert.equal(await evaluate(`document.querySelectorAll("#changes-diff-body img").length`), 0);
+  assert.equal(await evaluate(`document.querySelector("#changes-diff-meta").textContent`), "Staged · Added");
+  assert.equal(await evaluate(`document.querySelector("#changes-stage").textContent`), "Unstage");
+  await evaluate(`document.querySelector("#changes-stage").click()`);
+  await waitFor(`Boolean(document.querySelector('.changes-group-unstaged [data-key="unstaged:c.txt"]'))`);
+  assert.equal(await evaluate(`document.querySelector("#changes-diff-title").textContent`), "c.txt");
+  assert.equal(await evaluate(`document.querySelector("#changes-diff-meta").textContent`), "Unstaged · Untracked");
+  assert.equal(await evaluate(`document.querySelector("#changes-stage").textContent`), "Stage");
+
+  await evaluate(`document.querySelector('[data-key="unstaged:src/a.txt"]').click()`);
+  await waitFor(`document.querySelectorAll("#changes-diff-body .diff-line").length > 0`);
+  assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll("#changes-diff-body .diff-line")).map((row) => [
+    row.querySelector(".diff-num-old").textContent,
+    row.querySelector(".diff-num-new").textContent,
+    row.classList.contains("diff-add") ? "+" : row.classList.contains("diff-del") ? "-" : " ",
+    row.querySelector(".diff-code").textContent
+  ])`), [
+    ["1", "1", " ", "one"],
+    ["2", "", "-", "two"],
+    ["", "2", "+", "TWO"],
+    ["", "3", "+", "three"]
+  ]);
+  assert.equal(await evaluate(`document.querySelector("#changes-diff-title").textContent`), "src/a.txt");
+  // Visually hidden diff labels are absolutely positioned; they must not extend the page beyond the viewport.
+  assert.equal(await evaluate(`Array.from(document.querySelectorAll("#changes-panel .visually-hidden"))
+    .every((node) => document.querySelector("#changes-panel").contains(node.offsetParent))`), true);
+
+  await evaluate(`document.querySelector("#changes-ask").click()`);
+  await waitFor(`document.querySelector("#prompt-input").value.includes("Review my unstaged changes to")`);
+  const prompt = String(await evaluate(`document.querySelector("#prompt-input").value`));
+  assert.ok(prompt.includes("src/a.txt") && prompt.includes(repo) && prompt.includes("git diff -- src/a.txt"), prompt);
+
+  await evaluate(`document.querySelector("#changes-attach").click()`);
+  await waitFor(`document.querySelector("#attachment-list").textContent.includes("a.txt.diff")`);
+
+  // The keyboard stages and unstages the highlighted row; the highlight follows the file across sections.
+  await evaluate(`document.querySelector("#changes-list").focus()`);
+  const key = (name: string) => evaluate(`document.querySelector("#changes-list").dispatchEvent(
+    new KeyboardEvent("keydown", { key: ${JSON.stringify(name)}, bubbles: true, cancelable: true }))`);
+  await key("s");
+  await waitFor(`Boolean(document.querySelector('.changes-group-staged [data-key="staged:src/a.txt"]'))`);
+  assert.equal(await evaluate(`document.querySelector('#changes-list [aria-selected="true"]').dataset.key`), "staged:src/a.txt");
+  assert.equal(await evaluate(`document.querySelector("#changes-diff-meta").textContent.startsWith("Staged")`), true);
+  await key("S");
+  await waitFor(`Boolean(document.querySelector('.changes-group-unstaged [data-key="unstaged:src/a.txt"]'))`);
+  assert.equal(await evaluate(`document.querySelector('#changes-list [aria-selected="true"]').dataset.key`), "unstaged:src/a.txt");
+
+  // Copilot's new file shows up in the unstaged section without a manual refresh.
+  await writeFile(path.join(repo, "d.txt"), "live\n");
+  assert.equal((await server.post("messages", { text: `edit-file:${path.join(repo, "d.txt")}` })).status, 200);
+  await waitFor(`Boolean(document.querySelector('[data-key="unstaged:d.txt"]')) &&
+    document.querySelector("#changes-badge").textContent === "4"`);
+
+  const background = (selector: string) => evaluate(`(() => {
+    const row = document.querySelector(${JSON.stringify(selector)});
+    return row ? getComputedStyle(row).backgroundColor : null;
+  })()`);
+  await evaluate(`document.querySelector('[data-key="unstaged:src/a.txt"]').click()`);
+  await waitFor(`document.querySelectorAll("#changes-diff-body .diff-add").length > 0`);
+  await evaluate(`document.documentElement.dataset.theme = "dark"`);
+  const darkAdd = await background("#changes-diff-body .diff-add");
+  await evaluate(`document.documentElement.dataset.theme = "light"`);
+  const lightAdd = await background("#changes-diff-body .diff-add");
+  assert.ok(darkAdd && lightAdd && darkAdd !== lightAdd, `${String(darkAdd)} / ${String(lightAdd)}`);
+
+  const panelLayout = () => evaluate(`(() => {
+    const panel = document.querySelector("#changes-panel").getBoundingClientRect();
+    const body = document.querySelector("#workspace-body").getBoundingClientRect();
+    return [getComputedStyle(document.querySelector("#changes-panel")).position,
+      Math.round(panel.width), Math.round(body.width),
+      getComputedStyle(document.querySelector("#changes-back")).display !== "none"];
+  })()`);
+  const wide = await panelLayout() as [string, number, number, boolean];
+  assert.equal(wide[0], "relative");
+  assert.equal(wide[1], 480);
+  assert.equal(wide[3], false);
+  await command("Emulation.setDeviceMetricsOverride", { width: 900, height: 900, deviceScaleFactor: 1, mobile: false }, sessionId);
+  await waitFor(`getComputedStyle(document.querySelector("#changes-panel")).position === "absolute"`);
+  const drawer = await panelLayout() as [string, number, number, boolean];
+  assert.ok(drawer[1] < drawer[2]);
+  await command("Emulation.setDeviceMetricsOverride", { width: 600, height: 900, deviceScaleFactor: 1, mobile: false }, sessionId);
+  await waitFor(`getComputedStyle(document.querySelector("#changes-back")).display !== "none"`);
+  const narrow = await panelLayout() as [string, number, number, boolean];
+  assert.equal(narrow[1], narrow[2]);
+  await command("Emulation.setDeviceMetricsOverride", { width: 1400, height: 1000, deviceScaleFactor: 1, mobile: false }, sessionId);
+
+  await evaluate(`document.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "G", code: "KeyG", ctrlKey: true, shiftKey: true, bubbles: true
+  }))`);
+  await waitFor(`document.querySelector("#changes-panel").hidden === true`);
+  assert.equal(await evaluate(`document.querySelector("#changes-toggle").getAttribute("aria-pressed")`), "false");
+
+  const historyReadsBeforeReload = (await server.historyReads()).length;
+  await evaluate(`location.reload()`);
+  await waitFor(`document.querySelector("#messages")?.getAttribute("aria-busy") === "false" &&
+    document.querySelector("#changes-badge")?.textContent === "4"`);
+  assert.equal(await evaluate(`document.querySelector("#changes-panel").hidden`), true);
+  assert.match(String(await evaluate(`document.querySelector("#changes-toggle").getAttribute("aria-label")`)), / in app · main/);
+  const changesReads = (await server.historyReads()).slice(historyReadsBeforeReload)
+    .filter((entry) => isRecord(entry) && entry.direction === undefined);
+  assert.deepEqual(changesReads, [], "a closed panel must not read the full persisted history");
+
+  const prompts = (await server.requests()).filter((request) => request.method === "session/prompt");
+  assert.equal(prompts.length, 1, "only the explicit test prompt was sent");
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("changes view offers a repository picker for an unsent conversation and supports keyboard navigation", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true });
+  const first = await createTestRepository(path.join(server.projectsDirectory, "first"), { "a.txt": "a\n" });
+  await createTestRepository(path.join(server.projectsDirectory, "second"), { "b.txt": "b\n" });
+  const nested = await createTestRepository(path.join(server.projectsDirectory, "team", "service"), { "api.txt": "api\n" });
+  await writeFile(path.join(first, "a.txt"), "changed\n");
+  await writeFile(path.join(first, "z.txt"), "new\n");
+  await writeFile(path.join(nested, "api.txt"), "changed\n");
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`document.querySelectorAll("#changes-repository-menu [role=treeitem]").length === 3`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  assert.match(String(await evaluate(`document.querySelector("#changes-list").textContent`)), /Choose a repository/);
+  assert.equal(await evaluate(`document.querySelector("#changes-repository-label").textContent`), "Choose a repository");
+  const itemNames = `Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .map((item) => item.getAttribute("aria-label") ?? item.textContent)`;
+  // Folders start collapsed, so the nested repository stays hidden until its folder is expanded.
+  assert.deepEqual(await evaluate(itemNames), ["first", "second", "team"]);
+  assert.equal(await evaluate(`document.querySelector('#changes-repository-menu [data-folder="team"]').getAttribute("aria-expanded")`), "false");
+  assert.equal(await evaluate(`document.querySelectorAll("#changes-repository-menu [role=group]").length`), 0);
+  const toggleTeam = `document.querySelector('#changes-repository-menu [data-folder="team"] > .changes-repository-folder-row').click()`;
+  await evaluate(toggleTeam);
+  await waitFor(`document.querySelector('#changes-repository-menu [data-folder="team"]').getAttribute("aria-expanded") === "true"`);
+  assert.deepEqual(await evaluate(itemNames), ["first", "second", "team", "service"]);
+  assert.equal(await evaluate(`document.querySelector('#changes-repository-menu [data-folder="team"] [role=group] [role=treeitem]').dataset.root`), nested);
+  await evaluate(toggleTeam);
+  await waitFor(`document.querySelector('#changes-repository-menu [data-folder="team"]').getAttribute("aria-expanded") === "false"`);
+  assert.deepEqual(await evaluate(itemNames), ["first", "second", "team"]);
+
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(first)}).click()`);
+  await waitFor(`document.querySelectorAll("#changes-list [role=option]").length === 2`);
+  assert.equal(await evaluate(`document.querySelector("#changes-repository-label").textContent`), "first");
+  await evaluate(`document.querySelector("#changes-list").focus()`);
+  const key = (name: string) => evaluate(`document.querySelector("#changes-list").dispatchEvent(
+    new KeyboardEvent("keydown", { key: ${JSON.stringify(name)}, bubbles: true, cancelable: true }))`);
+  await key("ArrowDown");
+  await key("ArrowDown");
+  assert.equal(await evaluate(`document.querySelector('#changes-list [aria-selected="true"]').dataset.key`), "unstaged:z.txt");
+  await key("Enter");
+  await waitFor(`document.querySelector("#changes-diff").hidden === false &&
+    document.querySelectorAll("#changes-diff-body .diff-add").length === 1`);
+  await key("w");
+  assert.equal(await evaluate(`document.querySelector("#changes-diff-body").classList.contains("diff-wrap")`), true);
+  await key("Escape");
+  await waitFor(`document.querySelector("#changes-diff").hidden === true`);
+
+  // The picker is a tree: arrows move through the visible items, Right and Left open and close folders,
+  // and Enter picks the highlighted repository.
+  const picker = (name: string) => evaluate(`document.querySelector("#changes-repository").dispatchEvent(
+    new KeyboardEvent("keydown", { key: ${JSON.stringify(name)}, bubbles: true, cancelable: true }))`);
+  const menu = (name: string) => evaluate(`document.querySelector("#changes-repository-menu").dispatchEvent(
+    new KeyboardEvent("keydown", { key: ${JSON.stringify(name)}, bubbles: true, cancelable: true }))`);
+  const highlighted = () => evaluate(`document.getElementById(document.querySelector("#changes-repository-menu")
+    .getAttribute("aria-activedescendant"))?.dataset.key ?? null`);
+  const teamExpanded = () => evaluate(`document.querySelector('#changes-repository-menu [data-folder="team"]').getAttribute("aria-expanded")`);
+  await picker("ArrowDown");
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  assert.equal(await highlighted(), first);
+  await menu("ArrowDown");
+  await menu("ArrowDown");
+  assert.equal(await highlighted(), `folder:team`);
+  await menu("ArrowRight");
+  assert.equal(await teamExpanded(), "true");
+  assert.equal(await highlighted(), `folder:team`);
+  await menu("ArrowDown");
+  assert.equal(await highlighted(), nested);
+  await menu("ArrowLeft");
+  assert.equal(await highlighted(), `folder:team`);
+  await menu("ArrowLeft");
+  assert.equal(await teamExpanded(), "false");
+  await menu("ArrowRight");
+  await menu("ArrowDown");
+  await menu("Enter");
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === true &&
+    document.querySelectorAll("#changes-list [role=option]").length === 1`);
+  assert.equal(await evaluate(`document.querySelector("#changes-repository-label").textContent`), "team/service");
+  assert.equal(await evaluate(`document.querySelector("#changes-list [role=option]").dataset.key`), "unstaged:api.txt");
+  assert.equal(await evaluate(`document.activeElement.id`), "changes-repository");
+
+  // Reopening starts on the selected repository, which is visible because its folder is still open.
+  await picker("ArrowDown");
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  assert.equal(await highlighted(), nested);
+  await menu("Escape");
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === true`);
+  assert.equal(await evaluate(`document.activeElement.id`), "changes-repository");
+
+  await key("Escape");
+  await waitFor(`document.querySelector("#changes-panel").hidden === true`);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("changes view resets unstaged files only after confirmation, deleting new files only when confirmed", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "reset-app"), {
+    "tracked.txt": "base\n",
+    "staged.txt": "before\n"
+  });
+  await writeFile(path.join(repo, "tracked.txt"), "changed\n");
+  await writeFile(path.join(repo, "fresh.txt"), "new\n");
+  await writeFile(path.join(repo, "staged.txt"), "after\n");
+  testGit(repo, "add", "staged.txt");
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`document.querySelectorAll("#changes-repository-menu [role=treeitem]").length === 1`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelectorAll("#changes-list [role=option]").length === 3`);
+
+  // Only unstaged rows get a reset button, and it sits just before their stage button.
+  assert.deepEqual(await evaluate(`Object.fromEntries(Array.from(document.querySelectorAll("#changes-list [role=option]"))
+    .map((row) => [row.dataset.key, Array.from(row.querySelectorAll(".changes-file-action"))
+      .map((button) => button.classList.contains("changes-file-action-reset") ? "reset" : "stage")]))`), {
+    "staged:staged.txt": ["stage"],
+    "unstaged:fresh.txt": ["reset", "stage"],
+    "unstaged:tracked.txt": ["reset", "stage"]
+  });
+
+  const dialog = `document.querySelector("#changes-reset-dialog")`;
+  // Cancelling the dialog leaves the file alone.
+  await evaluate(`document.querySelector('[data-key="unstaged:tracked.txt"] .changes-file-action-reset').click()`);
+  await waitFor(`${dialog}.open === true`);
+  assert.equal(await evaluate(`document.querySelector("#changes-reset-title").textContent`), "Reset tracked.txt?");
+  assert.match(String(await evaluate(`document.querySelector("#changes-reset-description").textContent`)),
+    /restored to its committed version/);
+  assert.equal(await evaluate(`document.querySelector("#changes-reset-confirm").textContent`), "Reset");
+  await evaluate(`${dialog}.querySelector('button[value="cancel"]').click()`);
+  await waitFor(`${dialog}.open === false`);
+  assert.equal(await readFile(path.join(repo, "tracked.txt"), "utf8"), "changed\n");
+  assert.equal(await evaluate(`Boolean(document.querySelector('[data-key="unstaged:tracked.txt"]'))`), true);
+
+  // Escape cancels the dialog for a new file and leaves the Repository panel open.
+  await evaluate(`document.querySelector('[data-key="unstaged:fresh.txt"] .changes-file-action-reset').click()`);
+  await waitFor(`${dialog}.open === true`);
+  assert.equal(await evaluate(`document.querySelector("#changes-reset-title").textContent`), "Delete fresh.txt?");
+  await command("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+  await command("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+  await waitFor(`${dialog}.open === false`);
+  assert.equal(await evaluate(`document.querySelector("#changes-panel").hidden`), false);
+  assert.equal(await readFile(path.join(repo, "fresh.txt"), "utf8"), "new\n");
+
+  // Confirming deletes the new file.
+  await evaluate(`document.querySelector('[data-key="unstaged:fresh.txt"] .changes-file-action-reset').click()`);
+  await waitFor(`${dialog}.open === true`);
+  await evaluate(`document.querySelector("#changes-reset-confirm").click()`);
+  await waitFor(`!document.querySelector('[data-key="unstaged:fresh.txt"]')`);
+  assert.equal(existsSync(path.join(repo, "fresh.txt")), false);
+  // The earlier cancelled reset must not run now that another confirmation has happened.
+  assert.equal(await readFile(path.join(repo, "tracked.txt"), "utf8"), "changed\n");
+  assert.equal(await evaluate(`Boolean(document.querySelector('[data-key="unstaged:tracked.txt"] .changes-file-action-reset'))`), true);
+
+  // Confirming a tracked reset restores the file to its committed version.
+  await evaluate(`document.querySelector('[data-key="unstaged:tracked.txt"] .changes-file-action-reset').click()`);
+  await waitFor(`${dialog}.open === true`);
+  await evaluate(`document.querySelector("#changes-reset-confirm").click()`);
+  await waitFor(`!document.querySelector('[data-key="unstaged:tracked.txt"]')`);
+  assert.equal(await readFile(path.join(repo, "tracked.txt"), "utf8"), "base\n");
+
+  // The staged change stays staged and has no reset button.
+  assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll("#changes-list [role=option]")).map((row) => row.dataset.key)`), [
+    "staged:staged.txt"
+  ]);
+  assert.equal(await readFile(path.join(repo, "staged.txt"), "utf8"), "after\n");
+  assert.equal(await evaluate(`document.querySelector("#changes-badge").textContent`), "1");
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+// The first line Copilot receives for a message sent while a repository is picked in the Repository panel.
+const repositoryContextPrompt = (repository: string, text: string): string => (
+  `Current repository: ${JSON.stringify(repository)}. Unless I say otherwise, my questions about files and changes refer to it.\n\n${text}`
+);
+
+async function sentPromptTexts(server: { requests(): Promise<JsonObject[]> }, count: number): Promise<string[]> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    const texts = (await server.requests())
+      .filter((request) => request.method === "session/prompt")
+      .map((request) => String(request.text));
+    if (texts.length >= count || Date.now() >= deadline) {
+      return texts;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+test("a repository picked in the Repository panel reaches Copilot with each message, while the transcript shows only the typed text", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "picked-app"), { "a.txt": "a\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+
+  const send = async (text: string, sent: number) => {
+    await waitFor(`!document.querySelector("#prompt-input").disabled`);
+    await evaluate(`document.querySelector("#prompt-input").value = ${JSON.stringify(text)};
+      document.querySelector("#composer").requestSubmit();`);
+    await sentPromptTexts(server, sent);
+    await waitFor(`!document.querySelector("#prompt-input").disabled`);
+  };
+
+  // Nothing is picked yet, so the message is sent unchanged.
+  await send("before pick", 1);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "picked-app"`);
+
+  await send("first question", 2);
+  await send("second question", 3);
+  // Slash commands must start the prompt, so they are sent exactly as typed.
+  await send("/status check", 4);
+  await send("third question", 5);
+  assert.deepEqual(await sentPromptTexts(server, 5), [
+    "before pick",
+    repositoryContextPrompt(repo, "first question"),
+    repositoryContextPrompt(repo, "second question"),
+    "/status check",
+    repositoryContextPrompt(repo, "third question")
+  ]);
+  assert.doesNotMatch(String(await evaluate(`document.querySelector("#messages").textContent`)), /Current repository/);
+
+  // The restored transcript hides the repository line too, and the choice survives the reload.
+  await evaluate(`location.reload()`);
+  await waitFor(`document.querySelector("#messages")?.getAttribute("aria-busy") === "false" &&
+    document.querySelector("#messages")?.textContent.includes("third question")`);
+  assert.match(String(await evaluate(`document.querySelector("#messages").textContent`)), /first question/);
+  assert.doesNotMatch(String(await evaluate(`document.querySelector("#messages").textContent`)), /Current repository/);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "picked-app"`);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("a repository picked for a new conversation travels with its first message and the messages after it", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "draft-app"), { "a.txt": "a\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector("#new-chat").click()`);
+  await waitFor(`!document.querySelector("#prompt-input").disabled`);
+
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "draft-app"`);
+
+  // The first message creates the conversation; the picked repository carries over to it.
+  await evaluate(`document.querySelector("#prompt-input").value = "draft first";
+    document.querySelector("#composer").requestSubmit();`);
+  await sentPromptTexts(server, 1);
+  await waitFor(`!document.querySelector("#prompt-input").disabled`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "draft-app"`);
+
+  await evaluate(`document.querySelector("#prompt-input").value = "draft second";
+    document.querySelector("#composer").requestSubmit();`);
+  assert.deepEqual(await sentPromptTexts(server, 2), [
+    repositoryContextPrompt(repo, "draft first"),
+    repositoryContextPrompt(repo, "draft second")
+  ]);
+  await waitFor(`!document.querySelector("#prompt-input").disabled`);
+  assert.doesNotMatch(String(await evaluate(`document.querySelector("#messages").textContent`)), /Current repository/);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("restored native history hides the repository line from user messages", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 30_000
+}, async (t) => {
+  const repository = "/projects/native-app";
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeHistory: {
+      events: [
+        nativeTranscriptEvent("user.message", "repo-user", repositoryContextPrompt(repository, "native question"), 0),
+        nativeTranscriptEvent("assistant.message", "repo-assistant", "Native answer", 1)
+      ]
+    }
+  });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false" &&
+    document.querySelector("#messages").textContent.includes("Native answer")`);
+  const transcript = String(await evaluate(`document.querySelector("#messages").textContent`));
+  assert.match(transcript, /native question/);
+  assert.doesNotMatch(transcript, /Current repository/);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
 test("keeps the active composer disabled when startup defaults finish during history loading", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
@@ -4605,7 +5353,7 @@ test("sizes composer selectors to their labels and wraps usage without overlap",
     document.querySelector('#usage-aic-metric').hidden = false;
     document.querySelector('#usage-context-metric').hidden = false;
   `);
-  const labelsFit = `[...document.querySelectorAll('.composer-setting select')].every((select) => {
+  const labelsFit = `[...document.querySelectorAll('.composer-settings .composer-setting select')].every((select) => {
     const width = select.getBoundingClientRect().width;
     return [...select.options].every((option) => {
       const probe = select.cloneNode(false);
@@ -4621,7 +5369,7 @@ test("sizes composer selectors to their labels and wraps usage without overlap",
   const noOverlap = `(() => {
     const footer = document.querySelector('.composer-footer').getBoundingClientRect();
     const boxes = [
-      ...document.querySelectorAll('.composer-setting'),
+      ...document.querySelectorAll('.composer-settings .composer-setting'),
       document.querySelector('#usage-summary'),
       document.querySelector('.composer-actions')
     ].map((element) => element.getBoundingClientRect());
@@ -4646,7 +5394,7 @@ test("sizes composer selectors to their labels and wraps usage without overlap",
     `);
     assert.equal(await evaluate(`(() => {
       const usage = document.querySelector('#usage-summary').getBoundingClientRect();
-      const settings = [...document.querySelectorAll('.composer-setting')]
+      const settings = [...document.querySelectorAll('.composer-settings .composer-setting')]
         .map((element) => element.getBoundingClientRect());
       const settingsBottom = Math.max(...settings.map((box) => box.bottom));
       const staysInline = settings.every((box) => Math.abs(box.bottom - usage.bottom) < 1) &&
@@ -4678,7 +5426,7 @@ test("sizes composer selectors to their labels and wraps usage without overlap",
     }, sessionId);
     assert.equal(await evaluate(labelsFit), true, `Selector labels should fit at ${width}px`);
     assert.equal(await evaluate(noOverlap), true, `Composer should not overflow or overlap at ${width}px`);
-    assert.equal(await evaluate(`document.querySelector('#keep-awake').nextElementSibling.id`), "reconnect-tools");
+    assert.equal(await evaluate(`document.querySelector('#keep-awake').nextElementSibling.firstElementChild.id`), "composer-more-button");
   }
 });
 
