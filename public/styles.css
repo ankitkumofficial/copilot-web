@@ -616,9 +616,19 @@ button:disabled {
   outline-offset: 3px;
 }
 
-.ask-selection {
+.selection-actions {
   position: fixed;
   z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.selection-actions[hidden] {
+  display: none;
+}
+
+.selection-action {
   display: flex;
   align-items: center;
   gap: 7px;
@@ -633,23 +643,52 @@ button:disabled {
   white-space: nowrap;
 }
 
-.ask-selection[hidden] {
-  display: none;
-}
-
-.ask-selection:hover,
-.ask-selection:focus-visible {
+.selection-action:hover,
+.selection-action:focus-visible {
   border-color: var(--accent);
   background: var(--surface-hover);
   color: var(--accent-strong);
 }
 
-.ask-selection:focus-visible {
+.selection-action:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
 }
 
-.ask-selection svg {
+.speak-selection {
+  gap: 5px;
+  padding-inline: 10px;
+}
+
+.speak-language {
+  font-size: 0.72rem;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+}
+
+.speak-selection .stop-icon,
+.speak-selection:is([data-state="starting"], [data-state="speaking"]) .speak-icon {
+  display: none;
+}
+
+.speak-selection:is([data-state="starting"], [data-state="speaking"]) .stop-icon {
+  display: block;
+}
+
+.speak-selection:is([data-state="starting"], [data-state="speaking"]) {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.speak-selection[data-state="starting"] {
+  opacity: 0.75;
+}
+
+.speak-selection[data-state="unavailable"] {
+  opacity: 0.55;
+}
+
+.selection-action svg {
   width: 16px;
   height: 16px;
   flex: 0 0 auto;

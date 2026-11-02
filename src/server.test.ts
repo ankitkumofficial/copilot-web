@@ -4925,9 +4925,9 @@ test("attaches multiple selections and briefly highlights their source messages"
         return false;
       })()
     `), true, `Expected to select "${text}" in ${selector}`);
-    assert.equal(await evaluate(`document.querySelector("#ask-selection").hidden`), true);
+    assert.equal(await evaluate(`document.querySelector("#selection-actions").hidden`), true);
     await evaluate(`document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }))`);
-    await waitFor(`!document.querySelector('#ask-selection').hidden`);
+    await waitFor(`!document.querySelector('#selection-actions').hidden`);
   };
   const highlightedText = `(() => {
     const highlight = window.CSS.highlights?.get("copilot-web-source-selection");
@@ -5050,6 +5050,276 @@ test("attaches multiple selections and briefly highlights their source messages"
   `);
 });
 
+const mockSpeechSynthesis = `
+  window.speechSynthesisTest = {
+    spoken: [],
+    utterances: [],
+    cancelCalls: 0,
+    listeners: [],
+    voices: [
+      { name: "Google US English", lang: "en-US", localService: false, default: false },
+      { name: "Albert", lang: "en-US", localService: true, default: false },
+      { name: "Eddy (English (US))", lang: "en-US", localService: true, default: false },
+      { name: "Daniel", lang: "en-GB", localService: true, default: false },
+      { name: "Samantha", lang: "en-US", localService: true, default: false },
+      { name: "Google Deutsch", lang: "de-DE", localService: false, default: true },
+      { name: "Anna", lang: "de_DE", localService: true, default: false }
+    ]
+  };
+  window.SpeechSynthesisUtterance = class {
+    constructor(text) {
+      this.text = text;
+      this.voice = null;
+      this.lang = "";
+    }
+  };
+  const speechSynthesisMock = {
+    current: null,
+    getVoices() {
+      return window.speechSynthesisTest.voices;
+    },
+    speak(utterance) {
+      const test = window.speechSynthesisTest;
+      test.spoken.push({ text: utterance.text, voice: utterance.voice?.name, lang: utterance.lang });
+      test.utterances.push(utterance);
+      this.current = utterance;
+      utterance.onstart?.({ type: "start" });
+    },
+    cancel() {
+      window.speechSynthesisTest.cancelCalls += 1;
+      const utterance = this.current;
+      this.current = null;
+      utterance?.onerror?.({ type: "error", error: "interrupted" });
+    },
+    addEventListener(type, listener) {
+      if (type === "voiceschanged") {
+        window.speechSynthesisTest.listeners.push(listener);
+      }
+    }
+  };
+  window.speechSynthesisTest.changeVoices = (voices) => {
+    window.speechSynthesisTest.voices = voices;
+    window.speechSynthesisTest.listeners.forEach((listener) => listener({ type: "voiceschanged" }));
+  };
+  Object.defineProperty(window, "speechSynthesis", { configurable: true, value: speechSynthesisMock });
+`;
+
+test("reads selected text aloud in English or German with matching local voices", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    historyText: "Say Guten Morgen to greet someone in the morning."
+  });
+  const { evaluate, waitFor } = await startTestBrowser(
+    t,
+    server.baseUrl,
+    `${mockSpeechSynthesis}\n${mockSpeechRecognition}`
+  );
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('button.session-item[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector('#messages').textContent.includes('Guten Morgen')`);
+
+  assert.equal(await evaluate(`
+    (() => {
+      document.querySelector("#messages").dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      const body = document.querySelector(".message.assistant .message-body");
+      const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        const start = node.textContent.indexOf("Guten Morgen");
+        if (start < 0) continue;
+        const range = document.createRange();
+        range.setStart(node, start);
+        range.setEnd(node, start + "Guten Morgen".length);
+        window.getSelection().removeAllRanges();
+        window.getSelection().addRange(range);
+        document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+        return window.getSelection().toString();
+      }
+      return null;
+    })()
+  `), "Guten Morgen");
+  await waitFor(`!document.querySelector("#selection-actions").hidden`);
+
+  const controlState = `(() => Object.fromEntries(
+    [...document.querySelectorAll(".speak-selection")].map((button) => [
+      button.dataset.speechLanguage,
+      {
+        state: button.dataset.state,
+        pressed: button.getAttribute("aria-pressed"),
+        label: button.getAttribute("aria-label"),
+        title: button.title
+      }
+    ])
+  ))()`;
+  type SpeakControl = { state: string; pressed: string; label: string; title: string };
+  const controls = async () => await evaluate(controlState) as Record<"en" | "de", SpeakControl>;
+  assert.deepEqual(await controls(), {
+    en: {
+      state: "idle",
+      pressed: "false",
+      label: "Read selected text aloud in English",
+      title: "Read selected text aloud in English (Samantha, en-US)"
+    },
+    de: {
+      state: "idle",
+      pressed: "false",
+      label: "Read selected text aloud in German",
+      title: "Read selected text aloud in German (Anna, de-DE)"
+    }
+  });
+
+  await evaluate(`document.querySelector("#speak-selection-de").click()`);
+  assert.deepEqual(await evaluate(`window.speechSynthesisTest.spoken`), [
+    { text: "Guten Morgen", voice: "Anna", lang: "de-DE" }
+  ]);
+  assert.deepEqual((await controls()).de, {
+    state: "speaking",
+    pressed: "true",
+    label: "Stop reading aloud in German",
+    title: "Stop reading aloud in German"
+  });
+  assert.equal(await evaluate(`window.getSelection().toString()`), "Guten Morgen");
+  assert.equal(await evaluate(`document.querySelector("#selection-actions").hidden`), false);
+
+  await evaluate(`document.querySelector("#speak-selection-en").click()`);
+  assert.deepEqual(await evaluate(`window.speechSynthesisTest.spoken[1]`), {
+    text: "Guten Morgen",
+    voice: "Samantha",
+    lang: "en-US"
+  });
+  await evaluate(`window.speechSynthesisTest.utterances[0].onend?.({ type: "end" })`);
+  assert.deepEqual(
+    Object.values(await controls()).map((control) => control.state),
+    ["speaking", "idle"]
+  );
+
+  const cancelsBeforeStop = await evaluate(`window.speechSynthesisTest.cancelCalls`) as number;
+  await evaluate(`document.querySelector("#speak-selection-en").click()`);
+  assert.equal((await controls()).en.state, "idle");
+  assert.ok(await evaluate(`window.speechSynthesisTest.cancelCalls`) as number > cancelsBeforeStop);
+  assert.equal(await evaluate(`window.speechSynthesisTest.spoken.length`), 2);
+
+  await evaluate(`document.querySelector("#speak-selection-en").click()`);
+  await evaluate(`window.speechSynthesisTest.utterances[2].onend?.({ type: "end" })`);
+  assert.equal((await controls()).en.state, "idle");
+
+  await evaluate(`document.querySelector("#speak-selection-en").click()`);
+  assert.equal((await controls()).en.state, "speaking");
+  await evaluate(`document.querySelector("#voice-input").click()`);
+  await waitFor(`document.querySelector("#voice-input").getAttribute("aria-pressed") === "true"`);
+  assert.equal((await controls()).en.state, "idle");
+  await evaluate(`document.querySelector("#speak-selection-de").click()`);
+  assert.equal(await evaluate(`window.speechSynthesisTest.spoken.length`), 4);
+  await waitFor(`document.querySelector("#voice-input").getAttribute("aria-pressed") === "false"`);
+  await evaluate(`document.querySelector("#speak-selection-de").click()`);
+  assert.deepEqual(await evaluate(`window.speechSynthesisTest.spoken[4]`), {
+    text: "Guten Morgen",
+    voice: "Anna",
+    lang: "de-DE"
+  });
+  await evaluate(`window.speechSynthesisTest.utterances[4].onend?.({ type: "end" })`);
+
+  await evaluate(`window.speechSynthesisTest.changeVoices(
+    window.speechSynthesisTest.voices.filter((voice) => voice.name !== "Anna")
+  )`);
+  assert.equal((await controls()).de.state, "unavailable");
+  await evaluate(`document.querySelector("#speak-selection-de").click()`);
+  assert.equal(await evaluate(`window.speechSynthesisTest.spoken.length`), 5);
+  assert.equal(
+    await evaluate(`document.querySelector("#selection-status").textContent`),
+    "No local German voice is available. Install a German system voice and try again."
+  );
+});
+
+test("shows selection actions after triple-clicking a whole message paragraph", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    historyText: "Only one paragraph lives in this answer."
+  });
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await command("Emulation.setDeviceMetricsOverride", {
+    width: 1200, height: 900, deviceScaleFactor: 1, mobile: false
+  }, sessionId);
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('button.session-item[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector('#messages').textContent.includes('Only one paragraph')`);
+
+  const { x, y } = await evaluate(`
+    (() => {
+      const walker = document.createTreeWalker(
+        document.querySelector(".message.assistant .message-body"),
+        NodeFilter.SHOW_TEXT
+      );
+      let node;
+      while ((node = walker.nextNode())) {
+        const start = node.textContent.indexOf("paragraph");
+        if (start < 0) continue;
+        const range = document.createRange();
+        range.setStart(node, start);
+        range.setEnd(node, start + 4);
+        const rect = range.getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      }
+      return null;
+    })()
+  `) as { x: number; y: number };
+  for (const clickCount of [1, 2, 3]) {
+    await command("Input.dispatchMouseEvent", {
+      type: "mousePressed", x, y, button: "left", buttons: 1, clickCount
+    }, sessionId);
+    await command("Input.dispatchMouseEvent", {
+      type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount
+    }, sessionId);
+  }
+  assert.equal(
+    await evaluate(`window.getSelection().toString().trim()`),
+    "Only one paragraph lives in this answer."
+  );
+  await waitFor(`!document.querySelector("#selection-actions").hidden`);
+
+  await evaluate(`document.querySelector("#ask-selection").click()`);
+  assert.equal(
+    await evaluate(`document.querySelector(".selection-card-label").textContent`),
+    "Selection 1"
+  );
+  await evaluate(`document.querySelector('[aria-label="Jump to Selection 1 at its source"]').click()`);
+  await waitFor(`(() => {
+    const highlight = window.CSS.highlights?.get("copilot-web-source-selection");
+    const text = highlight
+      ? [...highlight].map((range) => range.toString()).join("")
+      : window.getSelection().toString();
+    return text.trim() === "Only one paragraph lives in this answer.";
+  })()`);
+
+  await evaluate(`
+    (() => {
+      document.querySelector("#messages").dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      const userText = document.createTreeWalker(
+        document.querySelector(".message.user .message-body"),
+        NodeFilter.SHOW_TEXT
+      ).nextNode();
+      const assistantText = document.createTreeWalker(
+        document.querySelector(".message.assistant .message-body"),
+        NodeFilter.SHOW_TEXT
+      ).nextNode();
+      const range = document.createRange();
+      range.setStart(userText, 0);
+      range.setEnd(assistantText, 4);
+      window.getSelection().removeAllRanges();
+      window.getSelection().addRange(range);
+      document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    })()
+  `);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(await evaluate(`document.querySelector("#selection-actions").hidden`), true);
+});
+
 test("keeps multi-block selections, Ask Copilot, and highlights through re-renders", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
@@ -5097,7 +5367,7 @@ test("keeps multi-block selections, Ask Copilot, and highlights through re-rende
   const selectedText = String(await evaluate(selectAcrossBlocks)).trim();
   assert.equal(compact(selectedText), "paragraphtext.FirstlistitemSecond");
   assert.match(selectedText, /\n/);
-  await waitFor(`!document.querySelector("#ask-selection").hidden`);
+  await waitFor(`!document.querySelector("#selection-actions").hidden`);
   await evaluate(`document.querySelector("#ask-selection").click()`);
   await evaluate(`document.querySelector('[aria-label="Jump to Selection 1 at its source"]').click()`);
   await waitFor(`${highlightedText}.replace(/\\s+/g, "") === "paragraphtext.FirstlistitemSecond"`);
@@ -5115,11 +5385,11 @@ test("keeps multi-block selections, Ask Copilot, and highlights through re-rende
   `);
 
   await evaluate(selectAcrossBlocks);
-  await waitFor(`!document.querySelector("#ask-selection").hidden`);
+  await waitFor(`!document.querySelector("#selection-actions").hidden`);
   const responsePosted = server.post("messages", { text: "selection survives streaming" });
   await waitFor(`document.querySelector("#messages").textContent.match(/Done\\./g)?.length === 2`);
   assert.equal((await responsePosted).status, 200);
-  assert.equal(await evaluate(`document.querySelector("#ask-selection").hidden`), false);
+  assert.equal(await evaluate(`document.querySelector("#selection-actions").hidden`), false);
   assert.equal(
     compact(String(await evaluate(`window.getSelection().toString()`))),
     "paragraphtext.FirstlistitemSecond"
@@ -5178,13 +5448,13 @@ test("restores sent selection chips and source links after a page refresh", {
         selection.addRange(range);
         break;
       }
-      const askSelectionWasHidden = document.querySelector("#ask-selection").hidden;
+      const askSelectionWasHidden = document.querySelector("#selection-actions").hidden;
       document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
       return askSelectionWasHidden;
     })();
   `);
   assert.equal(askSelectionWasHidden, true);
-  await waitFor(`!document.querySelector("#ask-selection").hidden`);
+  await waitFor(`!document.querySelector("#selection-actions").hidden`);
   await evaluate(`document.querySelector("#ask-selection").click()`);
   assert.equal(await evaluate(`document.querySelector("#selection-list").children.length`), 1);
 
@@ -7923,7 +8193,7 @@ test("renders user Markdown in live and restored history, rich copies, and selec
       document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
     })()
   `);
-  await waitFor(`!document.querySelector("#ask-selection").hidden`);
+  await waitFor(`!document.querySelector("#selection-actions").hidden`);
   await evaluate(`
     document.querySelector("#ask-selection").click();
     ${input}.value = "Explain this.";
