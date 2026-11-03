@@ -1418,6 +1418,26 @@ test("session repository follows live edits made while the conversation runs", {
   assert.equal((await readRepository()).editedRoot, repo);
 });
 
+test("rejects HTTP and WebSocket requests whose Host is not the local Copilot Web address", async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const statusWithHost = (host: string, requestPath: string, headers: Record<string, string> = {}) =>
+    new Promise<number>((resolve, reject) => {
+      const request = httpRequest(`${server.baseUrl}${requestPath}`, { headers: { ...headers, Host: host } }, (response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      });
+      request.on("error", reject);
+      request.end();
+    });
+
+  assert.equal(await statusWithHost("evil.example", "/"), 403);
+  assert.equal(await statusWithHost("evil.example", "/api/health", server.headers), 403);
+  assert.equal(await statusWithHost(new URL(server.baseUrl).host, "/api/health", server.headers), 200);
+
+  const socketUrl = `ws://${new URL(server.baseUrl).host}/api/terminals/unknown/socket`;
+  assert.equal((await upgradeOutcome(socketUrl, { Host: "evil.example", Cookie: server.headers.Cookie }, undefined)).status, 403);
+});
+
 test("retrieves account quota through the authenticated GitHub CLI", async (t) => {
   const server = await startTestServer(t, { quotaCommand: "success" });
   const response = await fetch(`${server.baseUrl}/api/quota`, { headers: server.headers });

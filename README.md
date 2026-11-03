@@ -4,6 +4,23 @@
 GitHub Copilot CLI. It starts Copilot in Agent Client Protocol (ACP) mode and
 keeps the model, tools, authentication, and workspace local.
 
+## Intended use
+
+`copilot-web` is a personal tool: one developer runs it on their own machine,
+under their own macOS account, for their own work. It is not a multi-user or
+remote service.
+
+- The server listens on `127.0.0.1` only. Use it from a browser on that same
+  machine at `http://127.0.0.1:8765` or `http://localhost:8765`.
+- Any process running as your account can already do what the server can, so
+  the server does not defend against that. Its protections target web pages
+  from other sites you visit: requests are accepted only when the `Host` header
+  is the local address, terminal requests also need a matching `Origin`, and the
+  session cookie is HttpOnly and `SameSite=Strict`.
+- Do not share the machine account, expose the port, or put the server behind a
+  proxy or tunnel. Such setups send a different `Host` header, which the server
+  rejects.
+
 ## Supported features
 
 - Start a new conversation from the browser.
@@ -390,10 +407,10 @@ Reloading the page restores the screen of a running terminal.
 
 > **Security:** the terminal is always available while the server runs. It gives
 > anyone who can use the Copilot Web browser session a shell as your macOS user.
-> The server listens on `127.0.0.1` only, and terminal requests need the browser
-> session cookie plus matching `Origin` and `Host` headers. The starting directory
-> is not a sandbox: the shell can `cd` anywhere. `COPILOT_ALLOW_ALL` does not
-> affect the terminal.
+> The server listens on `127.0.0.1` only. Every request must use the local `Host`
+> address, and terminal requests also need the browser session cookie and a matching
+> `Origin`. The starting directory is not a sandbox: the shell can `cd` anywhere.
+> `COPILOT_ALLOW_ALL` does not affect the terminal.
 
 - Terminal input and output are never sent to Copilot, logged, or saved to disk.
 - Terminals end when the server stops (`cpw stop`, `cpw restart`, or Ctrl+C), including
@@ -426,7 +443,8 @@ Reloading the page restores the screen of a running terminal.
   deletion RPC and falls back to `/session delete <id> --yes --local-only`.
 - A browser session is authenticated with a local, HttpOnly cookie issued by
   the server. Start the server locally and do not share that cookie or expose
-  the port beyond loopback.
+  the port beyond loopback. Requests whose `Host` header is not `127.0.0.1` or
+  `localhost` on the server port are rejected.
 - Only the selected conversation's composer and settings are shown in the main
   panel. Background conversations continue processing and show a working or
   queued indicator in the sidebar.

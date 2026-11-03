@@ -73,7 +73,7 @@ import {
   validateRelativePath,
   type RepositoryEntry
 } from "./git-changes.js";
-import { createTerminalHttp, type TerminalHttp } from "./terminal-http.js";
+import { createTerminalHttp, sameToken, type TerminalHttp } from "./terminal-http.js";
 import { loadTerminalRuntime } from "./terminal-runtime.js";
 import { readTerminalMaximum, TerminalManager } from "./terminal.js";
 
@@ -2299,10 +2299,11 @@ async function main(): Promise<void> {
     }
 
     const authorization = request.headers.authorization;
-    if (authorization === `Bearer ${browserToken}`) {
+    if (authorization !== undefined && sameToken(authorization, `Bearer ${browserToken}`)) {
       return true;
     }
-    return parseCookies(request.headers.cookie).get("copilot_web_token") === browserToken;
+    const cookie = parseCookies(request.headers.cookie).get("copilot_web_token");
+    return cookie !== undefined && sameToken(cookie, browserToken);
   };
 
   const requireAuthorization = (request: IncomingMessage): void => {
@@ -3343,9 +3344,14 @@ async function main(): Promise<void> {
     throw new HttpError(404, "API route not found");
   };
 
+  const allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
+
   const server = createServer((request, response) => {
     void (async () => {
       try {
+        if (!allowedHosts.has(request.headers.host ?? "")) {
+          throw new HttpError(403, "Requests must use the local Copilot Web address");
+        }
         const requestUrl = new URL(request.url ?? "/", "http://localhost");
         if (requestUrl.pathname.startsWith("/api/")) {
           await handleApi(request, response, requestUrl);
@@ -3377,6 +3383,11 @@ async function main(): Promise<void> {
   });
 
   server.on("upgrade", (request, socket, head) => {
+    if (!allowedHosts.has(request.headers.host ?? "")) {
+      socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+      socket.destroy();
+      return;
+    }
     if (terminalHttp) {
       terminalHttp.handleUpgrade(request, socket, head);
       return;
