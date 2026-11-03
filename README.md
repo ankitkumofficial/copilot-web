@@ -174,12 +174,15 @@ keeps the model, tools, authentication, and workspace local.
   line counts, renames, and renders unified diffs with line numbers. It offers
   **Ask Copilot** (inserts a reference into the message without sending),
   **Attach diff**, copy actions, a wrap toggle, and a full-file view. The
-  repository is the conversation's working directory when that is inside a git
-  repository; otherwise a picker lists the repositories under `COPILOT_PROJECTS_DIR`
+  repository is the one containing the conversation's newest successful `edit` or
+  `create`. When the panel opens, that is found by replaying the conversation's
+  history; while it is open, it follows Copilot's edits. Without such an edit, it is
+  the conversation's working directory when that is inside a git repository; otherwise a picker lists the repositories under `COPILOT_PROJECTS_DIR`
   as a collapsible folder tree. Folders start collapsed and expand on click or
   with the arrow keys. Repositories up to three levels deep are listed; folders
-  inside a repository and hidden or `node_modules` folders are not searched. The
-  choice is remembered per conversation. In that conversation, a repository you
+  inside a repository and hidden or `node_modules` folders are not searched. A
+  repository you pick takes precedence over the automatic choice and is remembered
+  per conversation. In that conversation, a repository you
   pick is also sent to Copilot as the first line of each message, replacing any
   earlier pick; the transcript shows only your text, and slash commands are sent
   unchanged. The panel refreshes after Copilot tool activity and prompt completion,
@@ -471,7 +474,7 @@ Reloading the page restores the screen of a running terminal.
   diffs compare the working tree with the index, so a partially staged file
   shows both parts. The panel does not show per-turn or per-tool-call diffs.
   Repositories must be under
-  `COPILOT_PROJECTS_DIR` or be the conversation's working-directory repository.
+  `COPILOT_PROJECTS_DIR`, or be the conversation's working-directory repository or the repository of its newest edit.
   Lists stop at 2,000 files, diffs at 1 MiB (cut at a hunk boundary), and
   untracked files over 2 MB are not diffed. Git must be on the server's `PATH`
   (for the macOS LaunchAgent, see `SERVICE_PATH` in
