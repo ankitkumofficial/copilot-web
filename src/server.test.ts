@@ -3542,6 +3542,20 @@ test("opens local file links from messages in a preview dialog", {
       tokenType: "keyword",
       tokenText: "function",
       text: "function genericPreview() { return 42; }\n"
+    },
+    {
+      path: "src/mixed-line-endings.custom",
+      language: "generic",
+      tokenType: "keyword",
+      tokenText: "function",
+      text: "function first() {}\r\nfunction second() {}\rfunction third() {}\n"
+    },
+    {
+      path: "src/chunked-lines.custom",
+      language: "generic",
+      tokenType: "keyword",
+      tokenText: "function",
+      text: `function chunkedPreview() {}\n${"\n".repeat(4095)}`
     }
   ];
   const server = await startTestServer(t, {
@@ -3607,8 +3621,19 @@ test("opens local file links from messages in a preview dialog", {
       document.querySelector("#file-preview-title").textContent === ${JSON.stringify(path.basename(file.path))} &&
       Boolean(document.querySelector(".file-preview-text"))`);
     assert.equal(
-      await evaluate(`document.querySelector(".file-preview-text").textContent`),
+      await evaluate(`document.querySelector(".file-preview-code").textContent`),
       file.text
+    );
+    assert.equal(
+      await evaluate(`document.querySelector(".file-preview-line-numbers").textContent`),
+      Array.from(
+        { length: file.text.split(/\r\n|\r|\n/).length },
+        (_, lineIndex) => lineIndex + 1
+      ).join("\n")
+    );
+    assert.equal(
+      await evaluate(`document.querySelector(".file-preview-line-numbers").getAttribute("aria-hidden")`),
+      "true"
     );
     assert.equal(
       await evaluate(`document.querySelector(".file-preview-code").classList.contains(

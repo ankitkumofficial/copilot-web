@@ -3967,6 +3967,31 @@ function appendFilePreviewToken(fragment, source, start, end, tokenType) {
   fragment.append(token);
 }
 
+function appendFilePreviewLineNumbers(element, source) {
+  let lineCount = 1;
+  for (let index = 0; index < source.length; index += 1) {
+    const characterCode = source.charCodeAt(index);
+    if (characterCode === 10 || characterCode === 13) {
+      lineCount += 1;
+      if (characterCode === 13 && source.charCodeAt(index + 1) === 10) {
+        index += 1;
+      }
+    }
+  }
+
+  const lineNumberChunkSize = 4096;
+  for (let firstLine = 1; firstLine <= lineCount; firstLine += lineNumberChunkSize) {
+    const lastLine = Math.min(firstLine + lineNumberChunkSize - 1, lineCount);
+    const chunk = [];
+    for (let lineNumber = firstLine; lineNumber <= lastLine; lineNumber += 1) {
+      chunk.push(String(lineNumber));
+    }
+    element.append(document.createTextNode(
+      `${firstLine === 1 ? "" : "\n"}${chunk.join("\n")}`
+    ));
+  }
+}
+
 function createHighlightedFilePreview(name, source) {
   const language = filePreviewLanguage(name);
   const keywords = filePreviewKeywordSets.get(language) ?? filePreviewKeywordSets.get("generic");
@@ -4120,9 +4145,13 @@ function createHighlightedFilePreview(name, source) {
 
   appendFilePreviewToken(fragment, source, plainTextStart, source.length, null);
   code.append(fragment);
+  const lineNumbers = document.createElement("span");
+  lineNumbers.className = "file-preview-line-numbers";
+  lineNumbers.setAttribute("aria-hidden", "true");
+  appendFilePreviewLineNumbers(lineNumbers, source);
   const preview = document.createElement("pre");
   preview.className = "file-preview-text";
-  preview.append(code);
+  preview.append(lineNumbers, code);
   return preview;
 }
 
