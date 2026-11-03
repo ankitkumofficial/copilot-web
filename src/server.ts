@@ -1409,17 +1409,16 @@ async function main(): Promise<void> {
     return root ?? null;
   };
 
-  const readSessionRepository = async (session: SessionInfo, includeEdits: boolean): Promise<JsonObject> => {
+  const readSessionRepository = async (session: SessionInfo): Promise<JsonObject> => {
     const root = session.cwd ? await cachedToplevel(session.cwd) : undefined;
     if (root) {
       knownRepositoryRoots.add(root);
     }
-    const name = root ? path.basename(root) : null;
-    // Replaying the history is costly, so only the open panel asks for the edited repository.
-    if (!includeEdits) {
-      return { root: root ?? null, name };
-    }
-    return { root: root ?? null, name, editedRoot: await readEditedRepository(session.sessionId) };
+    return {
+      root: root ?? null,
+      name: root ? path.basename(root) : null,
+      editedRoot: await readEditedRepository(session.sessionId)
+    };
   };
 
   const projectRepositories = (): Promise<RepositoryEntry[]> => {
@@ -2748,7 +2747,7 @@ async function main(): Promise<void> {
     }
 
     if (request.method === "GET" && subroute === "repository") {
-      jsonResponse(response, 200, await readSessionRepository(session, requestUrl.searchParams.get("edits") === "1"));
+      jsonResponse(response, 200, await readSessionRepository(session));
       return true;
     }
 

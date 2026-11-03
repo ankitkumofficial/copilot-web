@@ -562,8 +562,7 @@ export function initChangesPanel({
     renderHeader();
     try {
       if (session) {
-        // The edited repository replays the conversation's history, so only an open panel asks for it.
-        const repository = await api(`/api/sessions/${encodeURIComponent(session.sessionId)}/repository${s.open ? "?edits=1" : ""}`);
+        const repository = await api(`/api/sessions/${encodeURIComponent(session.sessionId)}/repository`);
         if (token !== s.sessionToken) {
           return;
         }
@@ -2010,7 +2009,7 @@ export function initChangesPanel({
       void refreshAll();
     },
     notifyToolCompletion(sessionId) {
-      if (!s.open || sessionId !== s.session?.sessionId) {
+      if (sessionId !== s.session?.sessionId) {
         return;
       }
       window.clearTimeout(s.toolRefreshTimer);
@@ -2021,11 +2020,7 @@ export function initChangesPanel({
         return;
       }
       window.clearTimeout(s.toolRefreshTimer);
-      if (s.open || !s.repository) {
-        void refreshAll();
-      } else {
-        refreshStatusAndRender();
-      }
+      void refreshAll();
     },
     forgetSession(sessionId) {
       writeStorage(`${repositoryStoragePrefix}${sessionId}`, null);

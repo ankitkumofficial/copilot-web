@@ -3967,32 +3967,13 @@ function appendFilePreviewToken(fragment, source, start, end, tokenType) {
   fragment.append(token);
 }
 
-function appendFilePreviewLineNumbers(element, source) {
-  let lineCount = 1;
-  for (let index = 0; index < source.length; index += 1) {
-    const characterCode = source.charCodeAt(index);
-    if (characterCode === 10 || characterCode === 13) {
-      lineCount += 1;
-      if (characterCode === 13 && source.charCodeAt(index + 1) === 10) {
-        index += 1;
-      }
-    }
-  }
-
-  const lineNumberChunkSize = 4096;
-  for (let firstLine = 1; firstLine <= lineCount; firstLine += lineNumberChunkSize) {
-    const lastLine = Math.min(firstLine + lineNumberChunkSize - 1, lineCount);
-    const chunk = [];
-    for (let lineNumber = firstLine; lineNumber <= lastLine; lineNumber += 1) {
-      chunk.push(String(lineNumber));
-    }
-    element.append(document.createTextNode(
-      `${firstLine === 1 ? "" : "\n"}${chunk.join("\n")}`
-    ));
-  }
+function appendFilePreviewLineNumbers(element, normalizedSource) {
+  const lineCount = normalizedSource.split("\n").length;
+  element.textContent = Array.from({ length: lineCount }, (_, index) => index + 1).join("\n");
 }
 
-function createHighlightedFilePreview(name, source) {
+function createHighlightedFilePreview(name, rawSource) {
+  const source = rawSource.replace(/\r\n?/g, "\n");
   const language = filePreviewLanguage(name);
   const keywords = filePreviewKeywordSets.get(language) ?? filePreviewKeywordSets.get("generic");
   const identifierPattern = language === "css"
