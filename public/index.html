@@ -430,6 +430,10 @@
       <form method="dialog" class="image-preview-content">
         <button class="image-preview-close" type="submit" value="close" aria-label="Close file preview" title="Close file preview">×</button>
         <h2 id="file-preview-title" class="file-preview-title" hidden></h2>
+        <div id="file-preview-view-toggle" class="file-preview-view-toggle" role="group" aria-label="File view" hidden>
+          <button id="file-preview-view-formatted" class="file-preview-view-option" type="button" aria-pressed="true">Formatted</button>
+          <button id="file-preview-view-raw" class="file-preview-view-option" type="button" aria-pressed="false">Raw</button>
+        </div>
         <img id="image-preview-image" class="image-preview-image" alt="">
         <div id="file-preview-content" class="file-preview-content" hidden></div>
       </form>

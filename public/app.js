@@ -834,6 +834,9 @@ const elements = {
   imagePreviewDialog: document.querySelector("#image-preview-dialog"),
   imagePreviewImage: document.querySelector("#image-preview-image"),
   filePreviewTitle: document.querySelector("#file-preview-title"),
+  filePreviewViewToggle: document.querySelector("#file-preview-view-toggle"),
+  filePreviewFormatted: document.querySelector("#file-preview-view-formatted"),
+  filePreviewRaw: document.querySelector("#file-preview-view-raw"),
   filePreviewContent: document.querySelector("#file-preview-content")
 };
 
@@ -1525,6 +1528,26 @@ function localFileReference(target) {
     : null;
 }
 
+function localFileLineRange(reference) {
+  const fragment = reference.split("#", 2)[1];
+  const match = fragment?.match(/^L(\d+)(?:-L?(\d+))?$/);
+  if (!match) {
+    return null;
+  }
+  const start = Number(match[1]);
+  const end = match[2] ? Number(match[2]) : start;
+  return start >= 1 && end >= start ? { start, end } : null;
+}
+
+function previewLineRangeFromUrl(url) {
+  const params = new URL(url, window.location.origin).searchParams;
+  const start = Number(params.get("line"));
+  const end = Number(params.get("lineEnd") ?? start);
+  return Number.isInteger(start) && start >= 1 && Number.isInteger(end) && end >= start
+    ? { start, end }
+    : null;
+}
+
 function localFilePreviewUrl(reference) {
   let filePath = reference;
   if (/^file:/i.test(reference)) {
@@ -1535,7 +1558,13 @@ function localFilePreviewUrl(reference) {
   } else {
     filePath = reference.split(/[?#]/, 1)[0] ?? reference;
   }
-  return `${localFilePreviewRoute}?${new URLSearchParams({ path: filePath })}`;
+  const params = new URLSearchParams({ path: filePath });
+  const lineRange = localFileLineRange(reference);
+  if (lineRange) {
+    params.set("line", String(lineRange.start));
+    params.set("lineEnd", String(lineRange.end));
+  }
+  return `${localFilePreviewRoute}?${params}`;
 }
 
 function safeLink(value) {
@@ -3813,6 +3842,7 @@ function scheduleMessagesRender(conversation = activeConversation(), message = n
 
 let filePreviewRequestSequence = 0;
 let filePreviewObjectUrl = null;
+let filePreviewTextView = null;
 
 function revokeFilePreviewObjectUrl() {
   if (filePreviewObjectUrl) {
@@ -3821,9 +3851,15 @@ function revokeFilePreviewObjectUrl() {
   }
 }
 
+function clearFilePreviewTextView() {
+  filePreviewTextView = null;
+  elements.filePreviewViewToggle.hidden = true;
+}
+
 function resetFilePreviewContent() {
   filePreviewRequestSequence += 1;
   revokeFilePreviewObjectUrl();
+  clearFilePreviewTextView();
   elements.imagePreviewImage.removeAttribute("src");
   elements.imagePreviewImage.alt = "";
   elements.imagePreviewImage.hidden = false;
@@ -3847,6 +3883,7 @@ function showFilePreviewDialog() {
 function openImagePreview(source, alt) {
   filePreviewRequestSequence += 1;
   revokeFilePreviewObjectUrl();
+  clearFilePreviewTextView();
   elements.filePreviewTitle.textContent = alt;
   elements.filePreviewTitle.hidden = !alt;
   elements.filePreviewContent.replaceChildren();
@@ -4136,9 +4173,63 @@ function createHighlightedFilePreview(name, rawSource) {
   return preview;
 }
 
+function createMarkdownFilePreview(text) {
+  const markdown = document.createElement("div");
+  markdown.className = "file-preview-markdown message-body";
+  markdown.innerHTML = renderMarkdown(text);
+  return markdown;
+}
+
+function highlightFilePreviewLines(preview, { start, end }, text) {
+  const lineCount = text.replace(/\r\n?/g, "\n").split("\n").length;
+  if (start > lineCount) {
+    return;
+  }
+  const lastLine = Math.min(end, lineCount);
+  const style = getComputedStyle(preview);
+  const lineHeight = parseFloat(style.lineHeight);
+  const highlight = document.createElement("div");
+  highlight.className = "file-preview-line-highlight";
+  highlight.dataset.lineStart = String(start);
+  highlight.dataset.lineEnd = String(lastLine);
+  highlight.style.top = `${parseFloat(style.paddingTop) + (start - 1) * lineHeight}px`;
+  highlight.style.height = `${(lastLine - start + 1) * lineHeight}px`;
+  highlight.style.width = `${preview.scrollWidth}px`;
+  preview.append(highlight);
+  highlight.scrollIntoView({ block: "center", inline: "nearest" });
+}
+
+function setFilePreviewViewMode(mode) {
+  const view = filePreviewTextView;
+  if (!view) {
+    return;
+  }
+  const formatted = view.markdown && mode === "formatted";
+  elements.filePreviewFormatted.setAttribute("aria-pressed", String(formatted));
+  elements.filePreviewRaw.setAttribute("aria-pressed", String(!formatted));
+  if (formatted) {
+    elements.filePreviewContent.replaceChildren(createMarkdownFilePreview(view.text));
+    return;
+  }
+  const preview = createHighlightedFilePreview(view.name, view.text);
+  elements.filePreviewContent.replaceChildren(preview);
+  if (view.lineRange) {
+    highlightFilePreviewLines(preview, view.lineRange, view.text);
+  }
+}
+
+function showTextFilePreview(name, text, lineRange) {
+  const markdown = /\.md$/i.test(name);
+  filePreviewTextView = { name, text, lineRange, markdown };
+  elements.filePreviewViewToggle.hidden = !markdown;
+  setFilePreviewViewMode(markdown && !lineRange ? "formatted" : "raw");
+}
+
 async function openLocalFilePreview(url, fallbackName) {
   const requestSequence = ++filePreviewRequestSequence;
+  const lineRange = previewLineRangeFromUrl(url);
   revokeFilePreviewObjectUrl();
+  clearFilePreviewTextView();
   elements.imagePreviewImage.removeAttribute("src");
   elements.imagePreviewImage.alt = "";
   elements.imagePreviewImage.hidden = true;
@@ -4166,9 +4257,7 @@ async function openLocalFilePreview(url, fallbackName) {
 
     elements.filePreviewTitle.textContent = preview.name;
     if (typeof preview.text === "string") {
-      elements.filePreviewContent.replaceChildren(
-        createHighlightedFilePreview(preview.name, preview.text)
-      );
+      showTextFilePreview(preview.name, preview.text, lineRange);
       return;
     }
     if (typeof preview.data !== "string") {
@@ -9003,6 +9092,29 @@ elements.messages.addEventListener("click", (event) => {
   }
 });
 elements.messages.addEventListener("scroll", updateScrollToBottomButton, { passive: true });
+elements.filePreviewFormatted.addEventListener("click", () => setFilePreviewViewMode("formatted"));
+elements.filePreviewRaw.addEventListener("click", () => setFilePreviewViewMode("raw"));
+elements.filePreviewContent.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+  const filePreviewLink = target.closest("a[data-local-file-preview]");
+  if (filePreviewLink instanceof HTMLAnchorElement) {
+    event.preventDefault();
+    void openLocalFilePreview(
+      filePreviewLink.href,
+      filePreviewLink.textContent?.trim() ?? "File preview"
+    );
+    return;
+  }
+  const button = target.closest("button.block-copy");
+  if (button?.classList.contains("code-copy")) {
+    void copyCodeBlock(button);
+  } else if (button?.classList.contains("table-copy")) {
+    void copyTable(button);
+  }
+});
 elements.messages.addEventListener("scroll", () => {
   const conversation = activeConversation();
   if (!conversation || conversation.loading) {
@@ -9142,7 +9254,9 @@ elements.imagePreviewDialog.addEventListener("click", (event) => {
   }
 });
 elements.imagePreviewDialog.addEventListener("close", () => {
-  resetFilePreviewContent();
+  if (!elements.imagePreviewDialog.open) {
+    resetFilePreviewContent();
+  }
 });
 function setMoreActionsOpen(open, { focusTrigger = false } = {}) {
   elements.moreActionsMenu.hidden = !open;

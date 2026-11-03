@@ -3684,6 +3684,134 @@ test("opens local file links from messages in a preview dialog", {
   assert.equal(await evaluate("location.href"), pageUrl);
 });
 
+test("highlights line hints and toggles formatted and raw markdown in file previews", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 30_000
+}, async (t) => {
+  const longFileText = `${Array.from(
+    { length: 300 },
+    (_, index) => `export const line${index + 1} = ${index + 1};`
+  ).join("\n")}\n`;
+  const rangeFileText = "const a = 1;\nconst b = 2;\nconst c = 3;\nconst d = 4;\nconst e = 5;\nconst f = 6;\n";
+  const markdownText = "# Notes\n\nSome **bold** text.\n\n- first item\n- second item\n\n```js\nconst value = 1;\n```\n";
+  const previewLinks = [
+    "[src/long.ts](src/long.ts#L150)",
+    "[src/range.ts](src/range.ts#L3-5)",
+    "[docs/notes.md](docs/notes.md)",
+    "[docs/notes.md](docs/notes.md#L2)"
+  ];
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: {
+      events: [
+        {
+          id: "persisted-user-event",
+          type: "user.message",
+          timestamp: "2026-10-13T12:00:00.000Z",
+          parentId: null,
+          data: { messageId: "native-user-1", content: "Show the files." }
+        },
+        {
+          id: "persisted-assistant-event",
+          type: "assistant.message",
+          timestamp: "2026-10-13T12:00:05.000Z",
+          parentId: "persisted-user-event",
+          data: { messageId: "native-assistant-1", content: `Open ${previewLinks.join(", ")}` }
+        }
+      ]
+    }
+  });
+  for (const [filePath, text] of [
+    ["src/long.ts", longFileText],
+    ["src/range.ts", rangeFileText],
+    ["docs/notes.md", markdownText]
+  ] as const) {
+    const absolutePath = path.join(server.projectsDirectory, filePath);
+    await mkdir(path.dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, text);
+  }
+
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`Boolean(document.querySelector(
+    ".message.assistant a[data-local-file-preview]"
+  ))`);
+
+  const openPreview = async (index: number) => {
+    await evaluate(`document.querySelectorAll(
+      ".message.assistant a[data-local-file-preview]"
+    )[${index}].click()`);
+    await waitFor(`document.querySelector("#image-preview-dialog").open &&
+      Boolean(document.querySelector("#file-preview-content .file-preview-text, #file-preview-content .file-preview-markdown"))`);
+  };
+  const closePreview = async () => {
+    await evaluate(`document.querySelector("#image-preview-dialog").close()`);
+    await waitFor(`!document.querySelector("#image-preview-dialog").open`);
+  };
+
+  await openPreview(0);
+  assert.equal(await evaluate(`document.querySelector("#file-preview-view-toggle").hidden`), true);
+  assert.equal(await evaluate(`document.querySelector(".file-preview-line-highlight")?.dataset.lineStart`), "150");
+  assert.equal(await evaluate(`document.querySelector(".file-preview-line-highlight").dataset.lineEnd`), "150");
+  assert.equal(await evaluate(`(() => {
+    const highlight = document.querySelector(".file-preview-line-highlight").getBoundingClientRect();
+    const container = document.querySelector("#file-preview-content").getBoundingClientRect();
+    const walker = document.createTreeWalker(document.querySelector(".file-preview-code"), NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node && !node.textContent.includes("line150")) {
+      node = walker.nextNode();
+    }
+    const offset = node.textContent.indexOf("line150");
+    const range = document.createRange();
+    range.setStart(node, offset);
+    range.setEnd(node, offset + "line150".length);
+    const text = range.getBoundingClientRect();
+    return highlight.top >= container.top &&
+      highlight.bottom <= container.bottom &&
+      Math.abs((text.top + text.bottom) / 2 - (highlight.top + highlight.bottom) / 2) < 4;
+  })()`), true);
+  await closePreview();
+
+  await openPreview(1);
+  assert.equal(await evaluate(`document.querySelector(".file-preview-line-highlight").dataset.lineStart`), "3");
+  assert.equal(await evaluate(`document.querySelector(".file-preview-line-highlight").dataset.lineEnd`), "5");
+  assert.equal(await evaluate(`(() => {
+    const lineHeight = parseFloat(getComputedStyle(document.querySelector(".file-preview-text")).lineHeight);
+    return Math.abs(document.querySelector(".file-preview-line-highlight").offsetHeight - lineHeight * 3) < 1;
+  })()`), true);
+  await closePreview();
+
+  await openPreview(2);
+  assert.equal(await evaluate(`document.querySelector("#file-preview-view-toggle").hidden`), false);
+  assert.equal(await evaluate(`document.querySelector("#file-preview-view-formatted").getAttribute("aria-pressed")`), "true");
+  assert.equal(await evaluate(`document.querySelector("#file-preview-view-raw").getAttribute("aria-pressed")`), "false");
+  assert.equal(await evaluate(`document.querySelector(".file-preview-markdown h1").textContent`), "Notes");
+  assert.equal(await evaluate(`document.querySelector(".file-preview-markdown strong").textContent`), "bold");
+  assert.equal(await evaluate(`Boolean(document.querySelector(".file-preview-markdown .code-block pre code"))`), true);
+  assert.equal(await evaluate(`document.querySelector(".file-preview-code")`), null);
+  await evaluate(`document.querySelector("#file-preview-view-raw").click()`);
+  await waitFor(`Boolean(document.querySelector(".file-preview-code"))`);
+  assert.equal(await evaluate(`document.querySelector(".file-preview-code").textContent`), markdownText);
+  assert.equal(await evaluate(`document.querySelector(".file-preview-markdown")`), null);
+  assert.equal(await evaluate(`document.querySelector("#file-preview-view-raw").getAttribute("aria-pressed")`), "true");
+  assert.equal(await evaluate(`document.querySelector(".file-preview-line-highlight")`), null);
+  await closePreview();
+
+  await openPreview(3);
+  assert.equal(await evaluate(`document.querySelector("#file-preview-view-raw").getAttribute("aria-pressed")`), "true");
+  assert.equal(await evaluate(`document.querySelector(".file-preview-line-highlight").dataset.lineStart`), "2");
+  await evaluate(`document.querySelector("#file-preview-view-formatted").click()`);
+  await waitFor(`Boolean(document.querySelector(".file-preview-markdown"))`);
+  assert.equal(await evaluate(`document.querySelector(".file-preview-line-highlight")`), null);
+  await closePreview();
+});
+
 test("renders native completion times outside message content through refresh", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 30_000
