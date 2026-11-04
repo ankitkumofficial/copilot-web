@@ -1209,6 +1209,17 @@ export class AcpConnectionManager {
     });
   }
 
+  // Reloads the conversation so Copilot works from another directory; the reload is queued like any other session operation.
+  public async changeSessionDirectory(session: SessionInfo, cwd: string): Promise<void> {
+    await this.withSessionOperation(session.sessionId, async () => {
+      await this.sessionConnections.get(session.sessionId)?.closeSession(session.sessionId);
+      await this.loadSessionInternal(
+        { ...session, cwd },
+        this.getSessionContext(session.sessionId) ?? "default"
+      );
+    });
+  }
+
   public forgetSession(sessionId: string): void {
     this.sessionConnections.delete(sessionId);
     const hadPreferences = this.sessionConfigPreferences.delete(sessionId);

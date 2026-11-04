@@ -12,6 +12,7 @@
   --accent-strong: #a79cff;
   --accent-foreground: #11121a;
   --danger: #f2788b;
+  --attention: #ffb547;
   --user: #272d48;
   --tool-label: #73c69b;
   --syntax-keyword: #c792ea;
@@ -43,6 +44,7 @@
   --accent-strong: #5544c9;
   --accent-foreground: #ffffff;
   --danger: #c23f59;
+  --attention: #c26b00;
   --user: #e8e7ff;
   --tool-label: #176b40;
   --syntax-keyword: #7d3fb0;
@@ -75,6 +77,7 @@
     --accent-strong: #5544c9;
     --accent-foreground: #ffffff;
     --danger: #c23f59;
+    --attention: #c26b00;
     --user: #e8e7ff;
     --tool-label: #176b40;
     --syntax-keyword: #7d3fb0;
@@ -2407,6 +2410,44 @@ button:disabled {
   color: var(--accent);
 }
 
+.changes-decision-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin-left: auto;
+  color: var(--attention);
+  animation: decision-pulse 1.8s ease-in-out infinite;
+}
+
+.changes-decision-icon[hidden] {
+  display: none;
+}
+
+.changes-decision-icon svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  stroke-linejoin: round;
+}
+
+.changes-decision-icon + .changes-toggle-badge {
+  margin-left: 4px;
+}
+
+@keyframes decision-pulse {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.18);
+    opacity: 0.75;
+  }
+}
+
 .changes-toggle-badge {
   min-width: 18px;
   margin-left: auto;
@@ -2437,6 +2478,36 @@ button:disabled {
   border-radius: 50%;
   background: var(--accent);
   content: "";
+}
+
+/* A repository decision is waiting: the message icon takes the change dot's place, in the same accent color. */
+.decision-badge {
+  display: none;
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 14px;
+  height: 14px;
+  color: var(--attention);
+  pointer-events: none;
+  animation: decision-pulse 1.8s ease-in-out infinite;
+}
+
+.decision-badge svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  stroke-linejoin: round;
+}
+
+#composer-more-button.has-decision .decision-badge {
+  display: block;
+}
+
+#composer-more-button.has-decision::after {
+  display: none;
 }
 
 .composer-actions .send-button {
@@ -2917,6 +2988,11 @@ button:disabled {
     animation: none;
     opacity: 0.5;
   }
+
+  .decision-badge,
+  .changes-decision-icon {
+    animation: none;
+  }
 }
 
 .changes-repository-row,
@@ -3134,6 +3210,34 @@ button:disabled {
   border-radius: 6px;
   background: var(--surface-hover);
   color: var(--muted);
+}
+
+.changes-suggestion {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 4px 14px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-hover);
+}
+
+.changes-suggestion[hidden] {
+  display: none;
+}
+
+.changes-suggestion p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.changes-suggestion-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .changes-list {

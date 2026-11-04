@@ -199,17 +199,29 @@ remote service.
   with the arrow keys. Repositories up to three levels deep are listed; folders
   inside a repository and hidden or `node_modules` folders are not searched. A
   repository you pick takes precedence over the automatic choice and is remembered
-  per conversation. In that conversation, a repository you
-  pick is also sent to Copilot as the first line of each message, replacing any
-  earlier pick; the transcript shows only your text, and slash commands are sent
-  unchanged. The panel refreshes after Copilot tool activity and prompt completion,
-  on window focus, and on demand (`R`). Inside the panel, `↑`/`↓` and `Enter` select and open
-  files, `N`/`P` move between hunks, `W` toggles wrapping, and `Escape` returns
-  to the list or closes the panel.
+  per conversation. A repository picked before a new conversation's first message
+  becomes that conversation's working directory, so Copilot starts there and the
+  message is sent unchanged. In a conversation that already has messages, picking a
+  repository reloads the conversation in that directory and shows a notice in the
+  transcript. The next normal message then tells Copilot once that its working
+  directory changed (slash commands wait for that message). The picker is locked
+  while a reply runs or the directory is changing, and messages wait during a
+  change. When Copilot edits files in another repository and the automatic choice
+  moves there, the panel offers **Use as working directory** and **Dismiss**, even
+  when you have picked a repository. The picker and the working directory never
+  change without your choice. While an offer is pending, the more-actions button
+  shows a message icon in the change dot's place, in the same color, and its label
+  says a repository decision is pending. Use or Dismiss clears it. The
+  transcript shows only your text, hiding the
+  working-directory note. The panel refreshes after Copilot tool activity and prompt
+  completion, on window focus, and on demand (`R`). Inside the panel, `↑`/`↓` and
+  `Enter` select and open files, `N`/`P` move between hunks, `W` toggles wrapping,
+  and `Escape` returns to the list or closes the panel.
 
-New sessions use `~/projects` as their starting directory. Copilot can then
-navigate to repositories below that directory when prompted. Resumed sessions
-use the working directory recorded with the original session.
+New conversations start in the repository picked before their first message, or
+in `~/projects` otherwise. Copilot can then navigate to repositories below
+`~/projects` when prompted. Resumed sessions use the working directory recorded
+with the original session.
 
 Once a conversation has started, the next click on **New conversation** reloads
 the Copilot CLI defaults from `$COPILOT_HOME/settings.json` (default:
@@ -345,7 +357,8 @@ http://127.0.0.1:8765
 ```
 
 New browser conversations stay out of session history until the first message is
-sent; the Copilot session then starts in `~/projects`. Existing ACP sessions are
+sent; the Copilot session then starts in the repository picked before the first
+message, or in `~/projects`. Existing ACP sessions are
 listed across all workspaces visible to the current Copilot CLI account and are
 loaded using their recorded working directory.
 
@@ -384,7 +397,7 @@ process. Keep the server bound to loopback and do not use this mode for a
 shared or untrusted environment.
 
 Set `COPILOT_WEB_USER` when starting the server to include your name in the
-browser title and application branding:
+browser title and the sidebar title:
 
 ```shell
 COPILOT_WEB_USER=YourName npm start
@@ -525,7 +538,7 @@ retrieve quota, the composer shows a warning in place of the numbers.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `COPILOT_WEB_USER` | unset | User name used to derive the browser title, sidebar brand, brand mark, and ACP client title |
+| `COPILOT_WEB_USER` | unset | User name used to derive the browser title and the sidebar title with its brand mark |
 | `PORT` | `8765` | Local HTTP port |
 | `COPILOT_HOME` | `~/.copilot` | Copilot CLI configuration directory; used to read `settings.json` |
 | `COPILOT_PROJECTS_DIR` | `~/projects` | Starting directory for new conversations |
