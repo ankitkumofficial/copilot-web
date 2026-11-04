@@ -258,6 +258,8 @@ export function initChangesPanel({
     // The automatic choice last seen for this conversation, and the repository offered as the working directory.
     automaticRoot: undefined,
     suggestedRoot: null,
+    // A repository edited in without a user pick, which becomes the working directory once no reply is running.
+    followRoot: null,
     repositoryMenuOpen: false,
     repositoryMenuActive: null,
     repositoryFoldersOpen: new Set(),
@@ -565,18 +567,22 @@ export function initChangesPanel({
     return s.projectRepositoriesPromise;
   }
 
-  // A repository picked in the panel stays in the picker; the latest edited repository is still tracked so that a move to another repository can be offered.
+  // A repository picked in the panel stays in the picker and, when edits land elsewhere, a move to another repository is offered. Without a pick, the picker and the working directory follow the first edited repository; after that move the repository counts as chosen.
   function chooseRepository() {
     const automatic = s.editedRoot ?? s.sessionRoot ?? null;
     if (automatic !== s.automaticRoot) {
       // The first choice seen for a conversation is its starting point, not a change caused by edits.
       const firstChoice = s.automaticRoot === undefined;
       s.automaticRoot = automatic;
-      if (!firstChoice && automatic && automatic !== s.sessionRoot) {
+      const explicit = s.repositoryChosen || s.repositoryFromStorage || Boolean(s.session && readRepositoryChoice(s.session.sessionId)?.explicit);
+      const moved = !firstChoice && Boolean(automatic) && automatic !== s.sessionRoot;
+      if (moved && explicit) {
         s.suggestedRoot = automatic;
+        s.followRoot = null;
         notify(`Copilot edited files in ${repositoryName(automatic)}. Use it as the working directory from the Repository panel.`);
       } else {
         s.suggestedRoot = null;
+        s.followRoot = moved ? automatic : null;
       }
     }
     if (s.repository && (s.repositoryFromStorage || s.repositoryChosen)) {
@@ -623,6 +629,7 @@ export function initChangesPanel({
         s.sessionName = repository.name ?? null;
       }
       chooseRepository();
+      void followPendingRepository();
       if (!s.repository && s.open && !s.projectRepositories) {
         await loadProjectRepositories();
       }
@@ -866,6 +873,43 @@ export function initChangesPanel({
     el.list.focus();
   }
 
+  // Moves the working directory to a repository edited in without a user pick, once no reply is running. Nothing is announced in the transcript; the move makes the repository the conversation's chosen one.
+  async function followPendingRepository() {
+    const root = s.followRoot;
+    if (!root || !s.session || s.replyBusy || s.switching) {
+      return;
+    }
+    s.followRoot = null;
+    if (root === s.sessionRoot || s.repositoryChosen || s.repositoryFromStorage) {
+      return;
+    }
+    const sessionId = s.session.sessionId;
+    // Once Copilot has moved the conversation, its repository counts as chosen, so later edits elsewhere are offered rather than moved to silently.
+    s.repositoryChosen = true;
+    saveRepositoryChoice(sessionId, root);
+    s.switching = true;
+    renderRepositoryRow();
+    try {
+      await changeWorkingDirectory(sessionId, root, { announce: false });
+      if (sessionId === (s.session?.sessionId ?? null)) {
+        s.sessionRoot = root;
+        // The name belongs to the previous root; the new root's basename is shown until the next refresh.
+        s.sessionName = null;
+      }
+    } catch (error) {
+      writeStorage(`${repositoryStoragePrefix}${sessionId}`, null);
+      if (sessionId === (s.session?.sessionId ?? null)) {
+        s.repositoryChosen = false;
+      }
+      notify(`Working directory not changed: ${describeError(error).message}`);
+    } finally {
+      s.switching = false;
+      renderRepositoryRow();
+      // A move requested while this one ran is applied now.
+      void followPendingRepository();
+    }
+  }
+
   async function selectRepository(root) {
     const switches = Boolean(s.session) && root !== s.sessionRoot;
     const explicit = s.repositoryChosen || s.repositoryFromStorage;
@@ -888,6 +932,7 @@ export function initChangesPanel({
       await changeWorkingDirectory(sessionId, root);
       if (sessionId === (s.session?.sessionId ?? null)) {
         s.sessionRoot = root;
+        s.sessionName = null;
       }
     } catch (error) {
       if (sessionId === (s.session?.sessionId ?? null)) {
@@ -906,6 +951,7 @@ export function initChangesPanel({
     s.repositoryChosen = true;
     s.repositoryFromStorage = false;
     s.suggestedRoot = null;
+    s.followRoot = null;
     setDecisionPending(false);
     s.repoToken += 1;
     s.status = null;
@@ -1049,7 +1095,7 @@ export function initChangesPanel({
     onDecisionChange(pending);
   }
 
-  // The suggestion is offered once per automatic change and stays until the user uses it, dismisses it, or the repository matches the working directory.
+  // For a repository the user picked, the suggestion is offered once per automatic change and stays until the user uses it, dismisses it, or the repository matches the working directory.
   function renderSuggestion() {
     const root = s.suggestedRoot;
     const visible = suggestionVisible();
@@ -2185,6 +2231,7 @@ export function initChangesPanel({
       s.replyBusy = busy === true;
       renderRepositoryRow();
       renderSuggestion();
+      void followPendingRepository();
     },
     setSession(session) {
       const sessionId = session?.sessionId ?? null;
@@ -2200,7 +2247,7 @@ export function initChangesPanel({
       window.clearTimeout(s.toolRefreshTimer);
       setRepositoryMenuOpen(false);
       if (s.session) {
-        sessionDecisions.set(s.session.sessionId, { automaticRoot: s.automaticRoot, suggestedRoot: s.suggestedRoot });
+        sessionDecisions.set(s.session.sessionId, { automaticRoot: s.automaticRoot, suggestedRoot: s.suggestedRoot, followRoot: s.followRoot });
       }
       const decision = sessionId ? sessionDecisions.get(sessionId) : undefined;
       s.session = session ? { sessionId, cwd: session.cwd ?? "" } : null;
@@ -2218,6 +2265,7 @@ export function initChangesPanel({
       s.repositoryFromStorage = false;
       s.automaticRoot = decision ? decision.automaticRoot : undefined;
       s.suggestedRoot = decision ? decision.suggestedRoot : null;
+      s.followRoot = decision ? decision.followRoot ?? null : null;
       setDecisionPending(suggestionVisible());
       s.activeKey = null;
       s.filter = "";
