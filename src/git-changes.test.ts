@@ -385,6 +385,31 @@ test("stages and unstages whole files through the index without touching the wor
   await assert.rejects(readFile(path.join(repo, "deleted.txt")), { code: "ENOENT" });
 });
 
+test("a scoped status lists only the scoped files and still counts the whole repository", { skip: skipWithoutGit }, async (t) => {
+  const repo = await temporaryRepository(t);
+  await writeFile(path.join(repo, "modified.txt"), "one\nTWO\nthree\n");
+  await writeFile(path.join(repo, "fresh.txt"), "fresh\n");
+  await rm(path.join(repo, "deleted.txt"));
+
+  const scoped = await readStatus(repo, new Set(["fresh.txt", "deleted.txt"]));
+  assert.deepEqual(entryKeys(scoped.files), ["unstaged:deleted.txt", "unstaged:fresh.txt"]);
+  assert.equal(scoped.totals.files, 2);
+  assert.deepEqual(scoped.repositoryTotals, { files: 3, truncated: false });
+  assert.deepEqual(entryKeys((await readStatus(repo, new Set())).files), []);
+  assert.deepEqual(entryKeys((await readStatus(repo)).files), [
+    "unstaged:deleted.txt", "unstaged:fresh.txt", "unstaged:modified.txt"
+  ]);
+});
+
+test("a scoped status keeps a rename when either of its paths is in scope", { skip: skipWithoutGit }, async (t) => {
+  const repo = await temporaryRepository(t);
+  git(repo, "mv", "mode.sh", "renamed.sh");
+
+  assert.deepEqual(entryKeys((await readStatus(repo, new Set(["mode.sh"]))).files), ["staged:renamed.sh"]);
+  assert.deepEqual(entryKeys((await readStatus(repo, new Set(["renamed.sh"]))).files), ["staged:renamed.sh"]);
+  assert.deepEqual(entryKeys((await readStatus(repo, new Set(["modified.txt"]))).files), []);
+});
+
 test("partially staged files appear in both sections with separate diffs and staging", { skip: skipWithoutGit }, async (t) => {
   const repo = await temporaryRepository(t);
   await writeFile(path.join(repo, "modified.txt"), "one\nTWO\nthree\n");

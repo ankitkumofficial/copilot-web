@@ -68,6 +68,18 @@ test("only the newest files are kept", () => {
   assert.equal(newest.includes("/work/app/file-0.ts"), false);
 });
 
+test("every edited file is kept for the conversation, even once the newest list has dropped it", () => {
+  const edits = new RecentFileEdits();
+  for (let index = 0; index <= maximumRecentFileEdits; index += 1) {
+    for (const event of editOf(`call-${index}`, `/work/app/file-${index}.ts`)) {
+      edits.observe(event);
+    }
+  }
+  const all = edits.allFiles();
+  assert.equal(all.length, maximumRecentFileEdits + 1);
+  assert.equal(all.includes("/work/app/file-0.ts"), true);
+});
+
 test("the persisted-event filter keeps only file-edit calls", () => {
   const include = fileEditEventFilter();
   const events: JsonObject[] = [

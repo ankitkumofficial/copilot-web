@@ -194,6 +194,7 @@ export function initChangesPanel({
     repositoryMenu: query("#changes-repository-menu"),
     branch: query("#changes-branch"),
     tabChanges: query("#repository-tab-changes"),
+    tabCurrentChanges: query("#repository-tab-current-changes"),
     tabTerminal: query("#repository-tab-terminal"),
     tabsRow: query(".repository-tabs"),
     changesTabpanel: query("#changes-tabpanel"),
@@ -237,9 +238,9 @@ export function initChangesPanel({
     width: Number.isFinite(storedWidth) && storedWidth >= minimumWidth ? storedWidth : defaultWidth,
     expanded: false,
     wrap: readStorage(wrapStorageKey) === "true",
-    // The terminal tab exists only when the server enables it; the tab resets to Changes when it does not.
+    // The terminal tab exists only when the server enables it; the tab resets to All changes when it does not.
     terminalEnabled: false,
-    tab: "changes",
+    tab: "all",
     editorUrlTemplate: null,
     session: null,
     sessionRoot: null,
@@ -284,6 +285,8 @@ export function initChangesPanel({
     mutations: 0,
     statusInFlight: new Map(),
     statusQueued: new Set(),
+    // The view and repository that the loaded status belongs to, so a response for another view is never shown.
+    statusKey: null,
     navigableItems: [],
     updatedAt: 0
   };
@@ -327,9 +330,14 @@ export function initChangesPanel({
   function applyTabs() {
     syncTerminalAction();
     const onChanges = s.tab !== "terminal" || !s.terminalEnabled;
+    const activeChangesTab = s.tab === "current" ? el.tabCurrentChanges : el.tabChanges;
     el.tabTerminal.hidden = !s.terminalEnabled;
-    el.tabChanges.setAttribute("aria-selected", String(onChanges));
-    el.tabChanges.tabIndex = onChanges ? 0 : -1;
+    for (const button of [el.tabChanges, el.tabCurrentChanges]) {
+      const selected = onChanges && button === activeChangesTab;
+      button.setAttribute("aria-selected", String(selected));
+      button.tabIndex = selected ? 0 : -1;
+    }
+    el.changesTabpanel.setAttribute("aria-labelledby", activeChangesTab.id);
     el.tabTerminal.setAttribute("aria-selected", String(!onChanges));
     el.tabTerminal.tabIndex = onChanges ? -1 : 0;
     el.changesTabpanel.hidden = !onChanges;
@@ -364,8 +372,17 @@ export function initChangesPanel({
       return;
     }
     if (s.tab !== tab) {
+      const previousTab = s.tab;
       s.tab = tab;
+      if (previousTab !== "terminal" && tab !== "terminal" && previousTab !== tab) {
+        // Each changes view lists different files, so an open diff and its highlight belong to the view they were opened in.
+        resetDiff();
+        s.activeKey = null;
+      }
       render();
+      if (tab !== "terminal" && s.open && !statusIsCurrent()) {
+        refreshStatusAndRender();
+      }
     }
     applyTabs();
     syncTerminal();
@@ -385,18 +402,18 @@ export function initChangesPanel({
   function setTerminalEnabled(enabled) {
     s.terminalEnabled = enabled === true;
     if (!s.terminalEnabled && s.tab === "terminal") {
-      s.tab = "changes";
+      s.tab = "all";
     }
     render();
   }
 
-  // The Repository action shows the Changes view. From the terminal view it switches there rather than closing.
+  // The Repository action shows the changes view it last showed. From the terminal view it switches there rather than closing.
   function openRepositoryView() {
-    if (s.open && s.tab === "changes") {
+    if (s.open && s.tab !== "terminal") {
       toggle(false);
       return;
     }
-    setTab("changes");
+    setTab(s.tab === "terminal" ? "all" : s.tab);
     if (!s.open) {
       toggle(true);
     }
@@ -413,16 +430,20 @@ export function initChangesPanel({
     void terminal.openRepository(s.repository);
   }
 
-  el.tabChanges.addEventListener("click", () => setTab("changes"));
+  el.tabChanges.addEventListener("click", () => setTab("all"));
+  el.tabCurrentChanges.addEventListener("click", () => setTab("current"));
   el.tabTerminal.addEventListener("click", () => setTab("terminal"));
   el.tabsRow.addEventListener("keydown", (event) => {
     if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") {
       return;
     }
     event.preventDefault();
-    const tab = s.tab === "terminal" ? "changes" : "terminal";
+    const tabs = s.terminalEnabled ? ["current", "all", "terminal"] : ["current", "all"];
+    const buttons = { all: el.tabChanges, current: el.tabCurrentChanges, terminal: el.tabTerminal };
+    const step = event.key === "ArrowRight" ? 1 : -1;
+    const tab = tabs[(Math.max(tabs.indexOf(s.tab), 0) + step + tabs.length) % tabs.length];
     setTab(tab);
-    (tab === "terminal" ? el.tabTerminal : el.tabChanges).focus();
+    buttons[tab].focus();
   });
 
   function toggle(force) {
@@ -630,28 +651,51 @@ export function initChangesPanel({
     }
   }
 
+  // "all" lists the repository's changes; "current" lists the files the open conversation edited.
+  function changesScopeKey() {
+    if (s.tab !== "current") {
+      return "all";
+    }
+    return s.session ? `current:${s.session.sessionId}` : "none";
+  }
+
+  function changesSessionId() {
+    return s.tab === "current" ? s.session?.sessionId ?? null : null;
+  }
+
+  function currentStatusKey() {
+    return s.repository ? `${s.repository}\n${changesScopeKey()}` : null;
+  }
+
+  function statusIsCurrent() {
+    return Boolean(s.status) && s.statusKey === currentStatusKey();
+  }
+
   function refreshStatus() {
     const repository = s.repository;
-    if (!repository) {
+    if (!repository || changesScopeKey() === "none") {
       return Promise.resolve();
     }
-    const existing = s.statusInFlight.get(repository);
+    const key = currentStatusKey();
+    const existing = s.statusInFlight.get(key);
     if (existing) {
-      s.statusQueued.add(repository);
+      s.statusQueued.add(key);
       return existing;
     }
     const repoToken = s.repoToken;
     const mutations = s.mutations;
+    const sessionId = changesSessionId();
     const pending = (async () => {
       try {
-        const status = await api(`/api/git/status?repo=${encodeURIComponent(repository)}`);
-        // A read that overlapped a stage or unstage may show the index from before the change.
-        if (repoToken !== s.repoToken || mutations !== s.mutations) {
+        const scope = sessionId ? `&sessionId=${encodeURIComponent(sessionId)}` : "";
+        const status = await api(`/api/git/status?repo=${encodeURIComponent(repository)}${scope}`);
+        // A read that overlapped a stage or unstage may show the index from before the change; a read for another view is not shown.
+        if (repoToken !== s.repoToken || mutations !== s.mutations || key !== currentStatusKey()) {
           return;
         }
-        applyStatus(status);
+        applyStatus(status, key);
       } catch (error) {
-        if (repoToken !== s.repoToken) {
+        if (repoToken !== s.repoToken || key !== currentStatusKey()) {
           return;
         }
         if (error?.code === "repository_not_allowed" && s.repositoryFromStorage && s.session) {
@@ -661,17 +705,17 @@ export function initChangesPanel({
           s.repoToken += 1;
           chooseRepository();
           if (s.repository && s.repository !== repository) {
-            s.statusInFlight.delete(repository);
+            s.statusInFlight.delete(key);
             await refreshStatus();
             return;
           }
         }
         throw error;
       } finally {
-        if (s.statusInFlight.get(repository) === pending) {
-          s.statusInFlight.delete(repository);
+        if (s.statusInFlight.get(key) === pending) {
+          s.statusInFlight.delete(key);
         }
-        if (s.statusQueued.delete(repository) && repository === s.repository) {
+        if (s.statusQueued.delete(key) && key === currentStatusKey()) {
           void refreshStatus().then(render, (error) => {
             s.error = describeError(error);
             render();
@@ -679,7 +723,7 @@ export function initChangesPanel({
         }
       }
     })();
-    s.statusInFlight.set(repository, pending);
+    s.statusInFlight.set(key, pending);
     return pending;
   }
 
@@ -693,9 +737,10 @@ export function initChangesPanel({
     });
   }
 
-  function applyStatus(status) {
+  function applyStatus(status, key = currentStatusKey()) {
     const previousOpen = openFileEntry();
     s.status = status;
+    s.statusKey = key;
     s.statusAt = Date.now();
     s.error = null;
     followOpenFile();
@@ -907,13 +952,20 @@ export function initChangesPanel({
   }
 
   function announceSummary() {
-    if (!s.status) {
+    if (!statusIsCurrent()) {
       return;
     }
     const count = s.status.totals?.files ?? 0;
+    const files = `file${count === 1 ? "" : "s"}`;
+    if (changesSessionId()) {
+      announce(count === 0
+        ? `No files changed in this conversation in ${s.status.name}`
+        : `${count} ${files} changed in this conversation in ${s.status.name}`);
+      return;
+    }
     announce(count === 0
       ? `No uncommitted changes in ${s.status.name}`
-      : `${count} uncommitted file${count === 1 ? "" : "s"} in ${s.status.name}`);
+      : `${count} uncommitted ${files} in ${s.status.name}`);
   }
 
   // Repositories below the projects folder show their path, so nested ones stay identifiable.
@@ -942,11 +994,13 @@ export function initChangesPanel({
 
   function renderToolbar() {
     const status = s.status && s.status.root === s.repository ? s.status : null;
-    const count = status?.totals?.files ?? 0;
+    // The badge counts the whole repository, so it does not change with the Current changes view.
+    const totals = status?.repositoryTotals ?? { files: 0, truncated: false };
+    const count = totals.files;
     el.badge.hidden = !status || count === 0;
-    el.badge.textContent = status ? badgeText(count, status.truncated) : "";
+    el.badge.textContent = status ? badgeText(count, totals.truncated) : "";
     const label = (status && count > 0
-      ? `Repository, ${badgeText(count, status.truncated)} uncommitted file${count === 1 ? "" : "s"}`
+      ? `Repository, ${badgeText(count, totals.truncated)} uncommitted file${count === 1 ? "" : "s"}`
       : "Repository") + (suggestionVisible() ? ", repository decision pending" : "");
     const location = s.session && s.repository
       ? [repositoryName(s.repository), branchText(status)].filter(Boolean).join(" · ")
@@ -1210,7 +1264,7 @@ export function initChangesPanel({
   }
 
   function buildListModel() {
-    const files = s.status && s.status.root === s.repository && Array.isArray(s.status.files) ? s.status.files : [];
+    const files = statusIsCurrent() && Array.isArray(s.status.files) ? s.status.files : [];
     const fileItem = (file) => ({
       kind: "file",
       key: `${file.section}:${file.path}`,
@@ -1332,6 +1386,12 @@ export function initChangesPanel({
       el.filter.hidden = true;
       return;
     }
+    if (changesScopeKey() === "none") {
+      el.list.append(emptyState("Files this conversation edits appear here."));
+      el.summary.textContent = "";
+      el.filter.hidden = true;
+      return;
+    }
     if (!s.repository) {
       el.list.append(emptyState(
         s.loading ? "Loading…" : "Choose a repository to see its uncommitted changes."
@@ -1340,7 +1400,7 @@ export function initChangesPanel({
       el.filter.hidden = true;
       return;
     }
-    if (!s.status || s.status.root !== s.repository) {
+    if (!statusIsCurrent()) {
       el.list.append(emptyState("Loading…"));
       el.summary.textContent = "";
       el.filter.hidden = true;
@@ -1359,7 +1419,10 @@ export function initChangesPanel({
       ));
     }
     if (model.files.length === 0) {
-      el.list.append(emptyState(`No uncommitted changes in ${status.name}.`));
+      const empty = changesSessionId()
+        ? `No files changed in this conversation in ${status.name}.`
+        : `No uncommitted changes in ${status.name}.`;
+      el.list.append(emptyState(empty));
     } else if (model.groups.every((group) => group.items.length === 0)) {
       el.list.append(emptyState("No files match the filter."));
     }
@@ -1618,6 +1681,23 @@ export function initChangesPanel({
     return file ? { key: file.key, path: file.path, section: file.section } : null;
   }
 
+  // After a stage, the preview moves to the first unstaged file, or closes when none is left.
+  function openFirstUnstaged(files) {
+    const next = files.find((file) => file.section === "unstaged");
+    if (!next) {
+      closeDiff();
+      return;
+    }
+    openItem({
+      key: `unstaged:${next.path}`,
+      path: next.path,
+      oldPath: next.oldPath,
+      status: next.status,
+      section: next.section,
+      selectable: true
+    });
+  }
+
   // Staging changes only the Git index; the worktree is never touched.
   async function setStaged(item) {
     if (!s.repository || !item || s.staging.has(item.key)) {
@@ -1626,6 +1706,7 @@ export function initChangesPanel({
     const action = item.section === "unstaged" ? "stage" : "unstage";
     const repository = s.repository;
     const repoToken = s.repoToken;
+    const statusKey = currentStatusKey();
     const focus = el.stage === document.activeElement ? "stage" : el.list.contains(document.activeElement) ? "list" : null;
     s.staging.add(item.key);
     if (s.openFile?.key === item.key) {
@@ -1635,15 +1716,24 @@ export function initChangesPanel({
     try {
       const status = await api("/api/git/stage", {
         method: "POST",
-        body: JSON.stringify({ repo: repository, path: item.path, action })
+        body: JSON.stringify({ repo: repository, path: item.path, action, sessionId: changesSessionId() })
       });
       if (repoToken === s.repoToken) {
         s.mutations += 1;
-        const movedKey = `${action === "stage" ? "staged" : "unstaged"}:${item.path}`;
-        const wasActive = s.activeKey === item.key;
-        applyStatus(status);
-        if (wasActive) {
-          s.activeKey = status.files.some((file) => `${file.section}:${file.path}` === movedKey) ? movedKey : null;
+        if (statusKey !== currentStatusKey()) {
+          refreshStatusAndRender();
+        } else if (action === "stage") {
+          // Clear the preview first so the staged file is not followed into the staged section.
+          resetDiff();
+          applyStatus(status);
+          openFirstUnstaged(status.files);
+        } else {
+          const movedKey = `unstaged:${item.path}`;
+          const wasActive = s.activeKey === item.key;
+          applyStatus(status);
+          if (wasActive) {
+            s.activeKey = status.files.some((file) => `${file.section}:${file.path}` === movedKey) ? movedKey : null;
+          }
         }
         announce(`${item.path} ${action === "stage" ? "staged" : "unstaged"}`);
       }
@@ -1658,7 +1748,7 @@ export function initChangesPanel({
     } finally {
       s.staging.delete(item.key);
       render();
-      if (focus === "stage" && !el.stage.disabled) {
+      if (focus === "stage" && s.openFile && !el.stage.disabled) {
         el.stage.focus();
       } else if (focus === "list") {
         el.list.focus();
@@ -1726,23 +1816,28 @@ export function initChangesPanel({
     if (!(await confirmReset(item)) || repoToken !== s.repoToken) {
       return;
     }
+    const statusKey = currentStatusKey();
     s.staging.add(item.key);
     render();
     try {
       const status = await api("/api/git/reset", {
         method: "POST",
-        body: JSON.stringify({ repo: repository, path: item.path })
+        body: JSON.stringify({ repo: repository, path: item.path, sessionId: changesSessionId() })
       });
       if (repoToken === s.repoToken) {
         s.mutations += 1;
-        const wasActive = s.activeKey === item.key;
-        applyStatus(status);
-        if (wasActive) {
-          // After a reset, only the staged part of the file, if any, is left to highlight.
-          const stagedKey = `staged:${item.path}`;
-          s.activeKey = status.files.some((file) => `${file.section}:${file.path}` === stagedKey) ? stagedKey : null;
+        if (statusKey !== currentStatusKey()) {
+          refreshStatusAndRender();
+        } else {
+          const wasActive = s.activeKey === item.key;
+          applyStatus(status);
+          if (wasActive) {
+            // After a reset, only the staged part of the file, if any, is left to highlight.
+            const stagedKey = `staged:${item.path}`;
+            s.activeKey = status.files.some((file) => `${file.section}:${file.path}` === stagedKey) ? stagedKey : null;
+          }
+          announce(isNewFile(item) ? `${item.path} deleted` : `${item.path} reset`);
         }
-        announce(isNewFile(item) ? `${item.path} deleted` : `${item.path} reset`);
       }
     } catch (error) {
       if (repoToken === s.repoToken) {

@@ -1421,6 +1421,63 @@ test("session repository follows live edits made while the conversation runs", {
   assert.equal((await readRepository()).editedRoot, repo);
 });
 
+test("current changes lists only the files the conversation edited, rebuilt from history after a restart", {
+  skip: gitAvailable ? false : "git is not on PATH"
+}, async (t) => {
+  const workspace = await mkdtemp(path.join(tmpdir(), "copilot-session-files-"));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const repo = await createTestRepository(path.join(workspace, "app"), {
+    "edited.txt": "edited\n", "untouched.txt": "untouched\n", "src/a.txt": "a\n"
+  });
+  await writeFile(path.join(repo, "edited.txt"), "edited, changed\n");
+  await writeFile(path.join(repo, "untouched.txt"), "untouched, changed\n");
+  await writeFile(path.join(repo, "src", "a.txt"), "a, changed\n");
+  const events = [
+    ...fileEditHistory("call-1", path.join(repo, "edited.txt"), true),
+    ...fileEditHistory("call-2", path.join(repo, "src", "a.txt"), true),
+    ...fileEditHistory("call-3", path.join(repo, "untouched.txt"), false)
+  ];
+  const statusKeys = async (baseUrl: string, headers: Record<string, string>, sessionId?: string): Promise<string[]> => {
+    const query = `repo=${encodeURIComponent(repo)}${sessionId ? `&sessionId=${sessionId}` : ""}`;
+    const response = await fetch(`${baseUrl}/api/git/status?${query}`, { headers });
+    assert.equal(response.status, 200);
+    const body = await response.json() as { files: Array<{ section: string; path: string }> };
+    return body.files.map((file) => `${file.section}:${file.path}`).sort();
+  };
+  const scopedKeys = ["unstaged:edited.txt", "unstaged:src/a.txt"];
+
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events } });
+  // Opening the conversation registers its edited repository as allowed, as the web client does.
+  await fetch(`${server.baseUrl}/api/sessions/session-1/repository`, { headers: server.headers });
+  assert.deepEqual(await statusKeys(server.baseUrl, server.headers), [
+    "unstaged:edited.txt", "unstaged:src/a.txt", "unstaged:untouched.txt"
+  ]);
+  assert.deepEqual(await statusKeys(server.baseUrl, server.headers, "session-1"), scopedKeys);
+  const scoped = await fetch(`${server.baseUrl}/api/git/status?repo=${encodeURIComponent(repo)}&sessionId=session-1`, {
+    headers: server.headers
+  });
+  assert.deepEqual((await scoped.json() as JsonObject).repositoryTotals, { files: 3, truncated: false });
+  assert.equal((await fetch(`${server.baseUrl}/api/git/status?repo=${encodeURIComponent(repo)}&sessionId=bad%20id`, {
+    headers: server.headers
+  })).status, 400);
+
+  const staged = await fetch(`${server.baseUrl}/api/git/stage`, {
+    method: "POST",
+    headers: { ...server.headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ repo, path: "edited.txt", action: "stage", sessionId: "session-1" })
+  });
+  assert.equal(staged.status, 200);
+  assert.deepEqual((await staged.json() as { files: Array<{ section: string; path: string }> }).files
+    .map((file) => `${file.section}:${file.path}`).sort(), ["staged:edited.txt", "unstaged:src/a.txt"]);
+
+  // A restarted server has no in-memory state; it rebuilds the same list from the conversation's history.
+  const restarted = await startTestServer(t, { existingSession: true, nativeHistory: { events } });
+  await fetch(`${restarted.baseUrl}/api/sessions/session-1/repository`, { headers: restarted.headers });
+  assert.deepEqual(await statusKeys(restarted.baseUrl, restarted.headers, "session-1"), [
+    "staged:edited.txt", "unstaged:src/a.txt"
+  ]);
+});
+
 test("rejects HTTP and WebSocket requests whose Host is not the local Copilot Web address", async (t) => {
   const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
   const statusWithHost = (host: string, requestPath: string, headers: Record<string, string> = {}) =>
@@ -4489,9 +4546,12 @@ test("changes view lists staged and unstaged files, stages and unstages them, re
   const key = (name: string) => evaluate(`document.querySelector("#changes-list").dispatchEvent(
     new KeyboardEvent("keydown", { key: ${JSON.stringify(name)}, bubbles: true, cancelable: true }))`);
   await key("s");
-  await waitFor(`Boolean(document.querySelector('.changes-group-staged [data-key="staged:src/a.txt"]'))`);
-  assert.equal(await evaluate(`document.querySelector('#changes-list [aria-selected="true"]').dataset.key`), "staged:src/a.txt");
-  assert.equal(await evaluate(`document.querySelector("#changes-diff-meta").textContent.startsWith("Staged")`), true);
+  // Staging moves the diff to the first unstaged file, so the highlight no longer stays on src/a.txt.
+  await waitFor(`document.querySelector("#changes-diff-title")?.textContent === "c.txt"`);
+  assert.equal(await evaluate(`document.querySelector('#changes-list [aria-selected="true"]').dataset.key`), "unstaged:c.txt");
+  assert.equal(await evaluate(`document.querySelector("#changes-diff-meta").textContent.startsWith("Unstaged")`), true);
+  await evaluate(`document.querySelector('[data-key="staged:src/a.txt"]').click()`);
+  await waitFor(`document.querySelector("#changes-diff-title")?.textContent === "src/a.txt"`);
   await key("S");
   await waitFor(`Boolean(document.querySelector('.changes-group-unstaged [data-key="unstaged:src/a.txt"]'))`);
   assert.equal(await evaluate(`document.querySelector('#changes-list [aria-selected="true"]').dataset.key`), "unstaged:src/a.txt");
@@ -11068,6 +11128,7 @@ test("terminal opens from More actions for the selected repository and keeps its
     document.querySelectorAll("#terminal-tabs [role=tab]").length === 1 &&
     Boolean(document.querySelector("#terminal-screen .xterm-rows")?.textContent.trim())`);
   assert.equal(await evaluate(`document.querySelector("#changes-tabpanel").hidden`), true);
+  assert.equal(await evaluate(`document.querySelector("#terminal-new").hidden`), false);
   assert.equal(await evaluate(`document.querySelector("#terminal-tabs [role=tab]").textContent`), "app");
   assert.equal(await evaluate(`document.querySelector("#repository-tab-terminal").getAttribute("aria-selected")`), "true");
 
@@ -11138,6 +11199,14 @@ test("an exited terminal offers restart and close, and closing it leaves the rep
   await waitFor(`document.querySelectorAll("#terminal-tabs [role=tab]").length === 0 &&
     document.querySelector("#terminal-empty-text").textContent === "No terminal is open in app."`);
   assert.equal(await evaluate(`document.querySelector("#terminal-empty-action").hidden`), false);
+  // With no terminal open, the plus button is hidden; the Open terminal button is the way to start one.
+  assert.equal(await evaluate(`document.querySelector("#terminal-new").hidden`), true);
+  // The message sits right below the Repository tabs, not in the middle of the panel.
+  assert.equal(await evaluate(`(() => {
+    const gap = document.querySelector("#terminal-empty").getBoundingClientRect().top -
+      document.querySelector(".repository-tabs").getBoundingClientRect().bottom;
+    return gap >= 0 && gap < 24;
+  })()`), true);
   assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
 });
 
@@ -11300,13 +11369,67 @@ test("closing a running terminal asks in a dialog that Cancel can keep open", {
   assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
 });
 
+test("current changes lists only the files this conversation edited, while all changes lists every change", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeMessages: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), {
+    "edited.txt": "e\n", "other.txt": "o\n"
+  });
+  await writeFile(path.join(repo, "edited.txt"), "e, changed\n");
+  await writeFile(path.join(repo, "other.txt"), "o, changed\n");
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "session-1"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+
+  // Only the edit tool's file counts as the conversation's change, so the other changed file stays out of Current changes.
+  const sendEdit = async (filePath: string) => {
+    const deadline = Date.now() + 5_000;
+    let response = await server.post("messages", { text: `edit-file:${filePath}`, clientPromptId: "current-edit" });
+    while (response.status === 409 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      response = await server.post("messages", { text: `edit-file:${filePath}`, clientPromptId: "current-edit" });
+    }
+    assert.equal(response.status, 200);
+  };
+  await sendEdit(path.join(repo, "edited.txt"));
+  await evaluate(`document.querySelector("#changes-refresh").click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "app"`);
+
+  const rowKeys = `Array.from(document.querySelectorAll("#changes-list [role=option]")).map((row) => row.dataset.key)`;
+  await waitFor(`${rowKeys}.length === 2`);
+  assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll(".repository-tab")).slice(0, 2).map((tab) => tab.textContent)`), [
+    "Current changes", "All changes"
+  ]);
+  assert.deepEqual(await evaluate(rowKeys), ["unstaged:edited.txt", "unstaged:other.txt"]);
+
+  await evaluate(`document.querySelector("#repository-tab-current-changes").click()`);
+  await waitFor(`${rowKeys}.length === 1`);
+  assert.deepEqual(await evaluate(rowKeys), ["unstaged:edited.txt"]);
+  assert.equal(await evaluate(`document.querySelector("#repository-tab-current-changes").getAttribute("aria-selected")`), "true");
+  assert.equal(await evaluate(`document.querySelector("#changes-summary-text").textContent`), "1 file");
+  // The toolbar badge still counts the whole repository.
+  assert.equal(await evaluate(`document.querySelector("#changes-badge").textContent`), "2");
+
+  await evaluate(`document.querySelector("#repository-tab-changes").click()`);
+  await waitFor(`${rowKeys}.length === 2`);
+  assert.deepEqual(await evaluate(rowKeys), ["unstaged:edited.txt", "unstaged:other.txt"]);
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+});
+
 test("the diff view has a close button that still works after the file is staged", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 60_000
 }, async (t) => {
   const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
-  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), { "a.txt": "one\n" });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), { "a.txt": "one\n", "b.txt": "two\n" });
   await writeFile(path.join(repo, "a.txt"), "one\ntwo\n");
+  await writeFile(path.join(repo, "b.txt"), "two\nthree\n");
   const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
 
   await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
@@ -11323,6 +11446,8 @@ test("the diff view has a close button that still works after the file is staged
   await waitFor(`document.querySelector("#changes-diff").hidden === false`);
   await evaluate(`document.querySelector("#changes-stage").click()`);
   await waitFor(`Boolean(document.querySelector('[data-key="staged:a.txt"]'))`);
+  // Staging moves the diff to the next unstaged file, so the diff stays open.
+  await waitFor(`document.querySelector("#changes-diff-title")?.textContent === "b.txt"`);
   assert.equal(await evaluate(`document.querySelector("#changes-diff").hidden`), false);
 
   await evaluate(`document.querySelector("#changes-diff-close").click()`);
