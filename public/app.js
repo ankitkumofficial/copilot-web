@@ -2832,6 +2832,9 @@ applyTheme(themePreference);
 applySidebarWidth(preferredSidebarWidth);
 applySidebarState(sidebarCollapsed);
 
+// The repository prefix is stripped from generated titles, which collapse it onto one line.
+const repositoryContextTitlePattern = /^Current repository: "[^"]*"\.?(?: Unless I say otherwise, my questions about files and changes refer to it\.?)?/;
+
 function cleanGeneratedConversationTitle(value) {
   if (typeof value !== "string") {
     return "";
@@ -2841,7 +2844,10 @@ function cleanGeneratedConversationTitle(value) {
     .replace(/\n {0,3}(?:`{3,}|~{3,})\s*$/, "")
     .replace(/^ {0,3}(?:`{3,}|~{3,})[ \t]*/, "")
     .replace(/[ \t]*(?:`{3,}|~{3,})$/, "");
-  return title.replace(/\s+/g, " ").trim();
+  return title
+    .replace(/\s+/g, " ")
+    .replace(repositoryContextTitlePattern, "")
+    .trim();
 }
 
 function conversationTitleForDisplay(session) {
