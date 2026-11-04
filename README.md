@@ -30,6 +30,11 @@ remote service.
 - Show each conversation's title, last activity, and working or queued status.
 - Rename conversations from the browser; custom titles are stored locally and
   survive browser and server restarts.
+- Archive conversations after confirmation. Archived conversations move to a
+  collapsed **Archived** section at the bottom of the list, where they can be
+  renamed, restored, or deleted. Archiving is local to Copilot Web and does not
+  change the Copilot CLI session; it is refused while a conversation is working
+  or has queued prompts.
 - Delete conversations in the background. Confirmation immediately opens a new
   conversation if you are viewing the one being deleted. Its sidebar row shows
   **Deleting** until deletion finishes, without blocking other conversations;
@@ -370,7 +375,8 @@ listed across all workspaces visible to the current Copilot CLI account and are
 loaded using their recorded working directory.
 
 Custom conversation titles are stored in
-`~/.copilot-web/session-titles.json`. Cumulative conversation AI-credit usage is
+`~/.copilot-web/session-titles.json`. Archived conversations are recorded in
+`~/.copilot-web/session-archive.json`. Cumulative conversation AI-credit usage is
 stored in `~/.copilot-web/session-usage.json`, and last-activity timestamps used
 for sidebar ordering are stored in `~/.copilot-web/session-activity.json`.
 Per-conversation context, model, and reasoning preferences are stored in

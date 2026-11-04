@@ -671,6 +671,8 @@ const state = {
   },
   selectedContext: readContextPreference(),
   deletingSessionIds: new Set(),
+  archivingSessionIds: new Set(),
+  archivedSectionExpanded: false,
   renamingSessionId: null,
   permissionDialogSessionId: null,
   connectionStatus: "connecting",
@@ -826,6 +828,8 @@ const elements = {
   deleteConfirm: document.querySelector("#delete-confirm"),
   deleteTitle: document.querySelector("#delete-title"),
   deleteDescription: document.querySelector("#delete-description"),
+  archiveDialog: document.querySelector("#archive-dialog"),
+  archiveTitle: document.querySelector("#archive-title"),
   renameDialog: document.querySelector("#rename-dialog"),
   renameForm: document.querySelector("#rename-form"),
   renameTitle: document.querySelector("#rename-title"),
@@ -2936,6 +2940,8 @@ function renderSessionList() {
       return String(sessionActivityAt(right) ?? "")
         .localeCompare(String(sessionActivityAt(left) ?? ""));
     });
+  const activeSessions = sessions.filter((session) => !session.archivedAt);
+  const archivedSessions = sessions.filter((session) => session.archivedAt);
 
   elements.sessionList.replaceChildren();
   if (sessions.length === 0) {
@@ -2946,74 +2952,144 @@ function renderSessionList() {
     return;
   }
 
-  for (const session of sessions) {
-    const row = document.createElement("div");
-    const conversation = conversationState(session.sessionId, false);
-    const title = conversationTitleForDisplay(session);
-    const working = session.busy === true ||
-      conversation?.busy ||
-      conversation?.recoveredPrompt;
-    const queued = conversation?.promptQueue?.length ?? 0;
-    const deleting = state.deletingSessionIds.has(session.sessionId);
-    const canDelete = state.capabilities.sessionCapabilities.delete;
-    row.className = "session-item-row has-actions";
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `session-item${session.sessionId === state.activeSessionId ? " active" : ""}`;
-    button.dataset.sessionId = session.sessionId;
-    button.disabled = deleting;
-    button.innerHTML = `
-      <span class="session-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
-      <span class="session-meta">${escapeHtml(relativeTime(sessionActivityAt(session)))}</span>
-      ${deleting
-        ? `<span class="session-status session-status-deleting" role="status">Deleting</span>`
-        : working
-          ? `<span class="session-status">Working${queued > 0 ? ` · ${queued} queued` : ""}</span>`
-          : queued > 0
-            ? `<span class="session-status">${queued} queued</span>`
-            : ""}
-    `;
-    row.append(button);
-
-    const renameButton = document.createElement("button");
-    renameButton.type = "button";
-    renameButton.className = "session-action session-rename";
-    renameButton.title = `Rename ${title}`;
-    renameButton.setAttribute(
-      "aria-label",
-      `Rename ${title}`
-    );
-    renameButton.disabled =
-      deleting ||
-      state.renamingSessionId !== null;
-    renameButton.innerHTML = renameSessionIconMarkup;
-    renameButton.addEventListener("click", (event) => {
-      event.stopPropagation();
-      void renameConversation(session.sessionId);
-    });
-    row.append(renameButton);
-
-    if (canDelete) {
-      const deleteButton = document.createElement("button");
-      deleteButton.type = "button";
-      deleteButton.className = "session-action session-delete";
-      deleteButton.disabled = conversationDeletionBlocked(session.sessionId);
-      deleteButton.title = deleteButton.disabled && working
-        ? "Can't delete while the conversation is in progress"
-        : `Delete ${title}`;
-      deleteButton.setAttribute(
-        "aria-label",
-        `Delete ${title}`
-      );
-      deleteButton.innerHTML = deleteSessionIconMarkup;
-      deleteButton.addEventListener("click", (event) => {
-        event.stopPropagation();
-        void deleteConversation(session.sessionId);
-      });
-      row.append(deleteButton);
-    }
-    elements.sessionList.append(row);
+  for (const session of activeSessions) {
+    elements.sessionList.append(createSessionRow(session));
   }
+  if (archivedSessions.length > 0) {
+    elements.sessionList.append(createArchivedSessionSection(archivedSessions));
+  }
+}
+
+function createArchivedSessionSection(sessions) {
+  const section = document.createElement("section");
+  section.className = "session-archive-section";
+  section.setAttribute("aria-label", "Archived conversations");
+  const expanded = state.archivedSectionExpanded;
+
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "session-archive-toggle";
+  toggle.setAttribute("aria-expanded", String(expanded));
+  toggle.setAttribute("aria-controls", "session-archive-list");
+  toggle.innerHTML = `
+    <span class="session-archive-chevron" aria-hidden="true">›</span>
+    <span class="session-archive-label">Archived</span>
+    <span class="session-archive-count">${sessions.length}</span>
+  `;
+  toggle.addEventListener("click", () => {
+    state.archivedSectionExpanded = !state.archivedSectionExpanded;
+    renderSessionList();
+    elements.sessionList.querySelector(".session-archive-toggle")?.focus();
+  });
+
+  const list = document.createElement("div");
+  list.id = "session-archive-list";
+  list.className = "session-archive-list";
+  list.hidden = !expanded;
+  if (expanded) {
+    for (const session of sessions) {
+      list.append(createSessionRow(session, { archived: true }));
+    }
+  }
+  section.append(toggle, list);
+  return section;
+}
+
+function createSessionRow(session, { archived = false } = {}) {
+  const row = document.createElement("div");
+  const conversation = conversationState(session.sessionId, false);
+  const title = conversationTitleForDisplay(session);
+  const working = session.busy === true ||
+    conversation?.busy ||
+    conversation?.recoveredPrompt;
+  const queued = conversation?.promptQueue?.length ?? 0;
+  const deleting = state.deletingSessionIds.has(session.sessionId);
+  const archiving = state.archivingSessionIds.has(session.sessionId);
+  const canDelete = state.capabilities.sessionCapabilities.delete;
+  row.className = "session-item-row has-actions";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `session-item${session.sessionId === state.activeSessionId ? " active" : ""}`;
+  button.dataset.sessionId = session.sessionId;
+  button.disabled = deleting;
+  button.innerHTML = `
+    <span class="session-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
+    <span class="session-meta">${escapeHtml(relativeTime(sessionActivityAt(session)))}</span>
+    ${deleting
+      ? `<span class="session-status session-status-deleting" role="status">Deleting</span>`
+      : working
+        ? `<span class="session-status">Working${queued > 0 ? ` · ${queued} queued` : ""}</span>`
+        : queued > 0
+          ? `<span class="session-status">${queued} queued</span>`
+          : ""}
+  `;
+  row.append(button);
+
+  const archiveButton = document.createElement("button");
+  archiveButton.type = "button";
+  if (archived) {
+    archiveButton.className = "session-action session-restore";
+    archiveButton.disabled = deleting || archiving;
+    archiveButton.title = `Restore ${title}`;
+    archiveButton.setAttribute("aria-label", `Restore ${title}`);
+    archiveButton.innerHTML = restoreSessionIconMarkup;
+    archiveButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void restoreConversation(session.sessionId);
+    });
+  } else {
+    archiveButton.className = "session-action session-archive";
+    archiveButton.disabled = conversationArchiveBlocked(session.sessionId);
+    archiveButton.title = archiveButton.disabled && !deleting && !archiving
+      ? "Can't archive while the conversation is in progress"
+      : `Archive ${title}`;
+    archiveButton.setAttribute("aria-label", `Archive ${title}`);
+    archiveButton.innerHTML = archiveSessionIconMarkup;
+    archiveButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void archiveConversation(session.sessionId);
+    });
+  }
+  row.append(archiveButton);
+
+  const renameButton = document.createElement("button");
+  renameButton.type = "button";
+  renameButton.className = "session-action session-rename";
+  renameButton.title = `Rename ${title}`;
+  renameButton.setAttribute(
+    "aria-label",
+    `Rename ${title}`
+  );
+  renameButton.disabled =
+    deleting ||
+    state.renamingSessionId !== null;
+  renameButton.innerHTML = renameSessionIconMarkup;
+  renameButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    void renameConversation(session.sessionId);
+  });
+  row.append(renameButton);
+
+  if (canDelete) {
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "session-action session-delete";
+    deleteButton.disabled = conversationDeletionBlocked(session.sessionId);
+    deleteButton.title = deleteButton.disabled && working
+      ? "Can't delete while the conversation is in progress"
+      : `Delete ${title}`;
+    deleteButton.setAttribute(
+      "aria-label",
+      `Delete ${title}`
+    );
+    deleteButton.innerHTML = deleteSessionIconMarkup;
+    deleteButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void deleteConversation(session.sessionId);
+    });
+    row.append(deleteButton);
+  }
+  return row;
 }
 
 function renderConversationControls() {
@@ -3061,6 +3137,19 @@ const copiedIconMarkup = `
 const deleteSessionIconMarkup = `
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7l1-3h4l1 3"></path>
+  </svg>
+`;
+const archiveSessionIconMarkup = `
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M3.5 7.5h17v-2a1 1 0 0 0-1-1h-15a1 1 0 0 0-1 1v2Z"></path>
+    <path d="M5 7.5V19a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19V7.5"></path>
+    <path d="M10 12h4"></path>
+  </svg>
+`;
+const restoreSessionIconMarkup = `
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M4 12a8 8 0 1 0 2.3-5.6"></path>
+    <path d="M4 4v4h4"></path>
   </svg>
 `;
 const renameSessionIconMarkup = `
@@ -7215,6 +7304,7 @@ function conversationDeletionBlocked(sessionId) {
   const session = state.sessions.find((item) => item.sessionId === sessionId);
   return Boolean(
     state.deletingSessionIds.has(sessionId) ||
+    state.archivingSessionIds.has(sessionId) ||
     state.renamingSessionId ||
     session?.busy ||
     conversation?.busy ||
@@ -7222,6 +7312,84 @@ function conversationDeletionBlocked(sessionId) {
     conversation?.loading ||
     conversation?.configurationBusy
   );
+}
+
+function conversationArchiveBlocked(sessionId) {
+  const conversation = conversationState(sessionId, false);
+  const session = state.sessions.find((item) => item.sessionId === sessionId);
+  return Boolean(
+    state.deletingSessionIds.has(sessionId) ||
+    state.archivingSessionIds.has(sessionId) ||
+    session?.busy ||
+    conversation?.busy ||
+    conversation?.recoveredPrompt ||
+    conversation?.loading ||
+    conversation?.configurationBusy ||
+    (conversation?.promptQueue?.length ?? 0) > 0
+  );
+}
+
+function confirmArchiveConversation(session) {
+  const title = conversationTitleForDisplay(session);
+  if (typeof elements.archiveDialog.showModal !== "function") {
+    return Promise.resolve(window.confirm(
+      `Archive "${title}"? You can restore it later from Archived.`
+    ));
+  }
+
+  elements.archiveTitle.textContent = `Archive "${title}"?`;
+  elements.archiveDialog.showModal();
+  return new Promise((resolve) => {
+    elements.archiveDialog.addEventListener("close", () => {
+      resolve(elements.archiveDialog.returnValue === "confirm");
+    }, { once: true });
+  });
+}
+
+async function archiveConversation(sessionId) {
+  if (conversationArchiveBlocked(sessionId)) {
+    return;
+  }
+  const session = state.sessions.find((item) => item.sessionId === sessionId);
+  if (!session || elements.archiveDialog.open || !(await confirmArchiveConversation(session))) {
+    return;
+  }
+  if (conversationArchiveBlocked(sessionId)) {
+    return;
+  }
+  await changeConversationArchive(sessionId, true);
+}
+
+function restoreConversation(sessionId) {
+  if (state.deletingSessionIds.has(sessionId) || state.archivingSessionIds.has(sessionId)) {
+    return Promise.resolve();
+  }
+  return changeConversationArchive(sessionId, false);
+}
+
+async function changeConversationArchive(sessionId, archived) {
+  state.archivingSessionIds.add(sessionId);
+  renderSessionList();
+  try {
+    const result = await api(
+      `/api/sessions/${encodeURIComponent(sessionId)}/${archived ? "archive" : "restore"}`,
+      { method: "POST" }
+    );
+    applySessionArchive(sessionId, typeof result.archivedAt === "string" ? result.archivedAt : null);
+  } catch (error) {
+    showError(error, conversationState(sessionId, false) ?? state.composer);
+  } finally {
+    state.archivingSessionIds.delete(sessionId);
+    renderSessionList();
+  }
+}
+
+function applySessionArchive(sessionId, archivedAt) {
+  const session = state.sessions.find((item) => item.sessionId === sessionId);
+  if (session) {
+    session.archivedAt = archivedAt;
+  }
+  renderSessionList();
 }
 
 async function deleteConversation(sessionId) {
@@ -7808,13 +7976,14 @@ function applySessionReplacement(result, previousSessionId) {
     applySessionSetup(result, result.context, conversation);
   }
   moveSelectionMessageMetadata(previousSessionId, session.sessionId);
+  const previousArchivedAt = state.sessions.find((item) => item.sessionId === previousSessionId)?.archivedAt;
   state.sessions = state.sessions.filter((item) => item.sessionId !== previousSessionId);
   pendingPromptCompletions.delete(previousSessionId);
   if (wasActive) {
     state.activeSessionId = session.sessionId;
     saveActiveSessionId(session.sessionId);
   }
-  upsertSession(session);
+  upsertSession(previousArchivedAt ? { ...session, archivedAt: previousArchivedAt } : session);
   renderConversationControls();
   if (Array.isArray(result.persistenceWarnings) && result.persistenceWarnings.length > 0) {
     showError(new Error(
@@ -9039,6 +9208,15 @@ function connectEvents() {
   source.addEventListener("session-created", (event) => {
     if (!upsertSession(JSON.parse(event.data))) {
       void refreshSessions().catch(showError);
+    }
+  });
+  source.addEventListener("session-archive-updated", (event) => {
+    const data = JSON.parse(event.data);
+    if (typeof data?.sessionId === "string") {
+      applySessionArchive(
+        data.sessionId,
+        typeof data.archivedAt === "string" ? data.archivedAt : null
+      );
     }
   });
   source.addEventListener("session-replaced", (event) => {
