@@ -219,10 +219,13 @@ remote service.
   transcript. The next normal message then tells Copilot once that its working
   directory changed (slash commands wait for that message). The picker is locked
   while a reply runs or the directory is changing, and messages wait during a
-  change. When Copilot edits files in another repository and the automatic choice
-  moves there, the panel offers **Use as working directory** and **Dismiss**, even
-  when you have picked a repository. The picker and the working directory never
-  change without your choice. While an offer is pending, the more-actions button
+  change. Until you pick a repository, the first edit in another repository moves
+  the working directory there silently, and the conversation then counts that
+  repository as chosen. From then on, when Copilot edits files in another
+  repository and the automatic choice moves there, the panel offers **Use as
+  working directory** and **Dismiss**, even when you have picked a repository.
+  After that, the picker and the working directory never change without your
+  choice. While an offer is pending, the more-actions button
   shows a message icon in the change dot's place, in the same color, and its label
   says a repository decision is pending. Use or Dismiss clears it. The
   transcript shows only your text, hiding the
