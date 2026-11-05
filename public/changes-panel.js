@@ -3,8 +3,6 @@ import { hunkText, parseUnifiedDiff, renderDiff } from "./diff-view.js";
 const openStorageKey = "copilot-web-changes-open";
 const widthStorageKey = "copilot-web-changes-width";
 const wrapStorageKey = "copilot-web-changes-wrap";
-const repositoryStoragePrefix = "copilot-web-changes-repo:";
-const maximumRepositoryChoices = 200;
 const defaultWidth = 480;
 const minimumWidth = 320;
 const initialRenderLines = 3_000;
@@ -47,45 +45,6 @@ function writeStorage(key, value) {
       window.localStorage.removeItem(key);
     } else {
       window.localStorage.setItem(key, value);
-    }
-  } catch {
-    // Preferences are optional.
-  }
-}
-
-function readRepositoryChoice(sessionId) {
-  const stored = readStorage(`${repositoryStoragePrefix}${sessionId}`);
-  if (!stored) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(stored);
-    return typeof parsed?.root === "string" ? { root: parsed.root, explicit: parsed.explicit !== false } : null;
-  } catch {
-    return null;
-  }
-}
-
-// Only choices made in the picker are remembered; otherwise the conversation's directory decides.
-function saveRepositoryChoice(sessionId, root) {
-  writeStorage(`${repositoryStoragePrefix}${sessionId}`, JSON.stringify({ root, savedAt: Date.now() }));
-  try {
-    const entries = [];
-    for (let index = 0; index < window.localStorage.length; index += 1) {
-      const key = window.localStorage.key(index);
-      if (key?.startsWith(repositoryStoragePrefix)) {
-        let savedAt = 0;
-        try {
-          savedAt = Number(JSON.parse(window.localStorage.getItem(key))?.savedAt) || 0;
-        } catch {
-          savedAt = 0;
-        }
-        entries.push({ key, savedAt });
-      }
-    }
-    entries.sort((left, right) => left.savedAt - right.savedAt);
-    for (const entry of entries.slice(0, Math.max(0, entries.length - maximumRepositoryChoices))) {
-      window.localStorage.removeItem(entry.key);
     }
   } catch {
     // Preferences are optional.
@@ -294,8 +253,60 @@ export function initChangesPanel({
   };
   // A repository chosen before its conversation existed, handed to the session created from it.
   let repositoryCarry = null;
-  // Repository suggestions still waiting for an answer, kept while the user works in other conversations.
-  const sessionDecisions = new Map();
+  // Each conversation's repository record (explicit pick and pending decision), mirrored from the server so it follows the user to any browser.
+  const repositoryRecords = new Map();
+  // Conversations whose record has been read from the server, and changes made before that read, merged in once it arrives.
+  const loadedRecords = new Set();
+  const unsavedRecordChanges = new Map();
+
+  function readRepositoryChoice(sessionId) {
+    const root = repositoryRecords.get(sessionId)?.choice;
+    return root ? { root, explicit: true } : null;
+  }
+
+  function storeRecord(sessionId, record) {
+    if (!record.choice && !record.suggestedRoot && !record.followRoot) {
+      repositoryRecords.delete(sessionId);
+    } else {
+      repositoryRecords.set(sessionId, record);
+    }
+  }
+
+  function saveRecord(sessionId) {
+    api(`/api/sessions/${encodeURIComponent(sessionId)}/repository-record`, {
+      method: "PUT",
+      body: JSON.stringify(repositoryRecords.get(sessionId) ?? {})
+    }).catch((error) => notify(`Repository choice not saved: ${describeError(error).message}`));
+  }
+
+  function updateRecord(sessionId, changes) {
+    storeRecord(sessionId, { ...(repositoryRecords.get(sessionId) ?? {}), ...changes });
+    if (!loadedRecords.has(sessionId)) {
+      unsavedRecordChanges.set(sessionId, { ...(unsavedRecordChanges.get(sessionId) ?? {}), ...changes });
+      return;
+    }
+    saveRecord(sessionId);
+  }
+
+  // Takes the server's record for a conversation; changes made before it arrived take precedence and are saved.
+  function loadRecord(sessionId, serverRecord) {
+    loadedRecords.add(sessionId);
+    const changes = unsavedRecordChanges.get(sessionId);
+    unsavedRecordChanges.delete(sessionId);
+    storeRecord(sessionId, { ...(serverRecord ?? {}), ...(changes ?? {}) });
+    if (changes) {
+      saveRecord(sessionId);
+    }
+    return repositoryRecords.get(sessionId) ?? {};
+  }
+
+  // Puts a conversation's pending decision into the panel's state.
+  function applyDecision(record) {
+    s.automaticRoot = record.automaticRoot;
+    s.suggestedRoot = record.suggestedRoot ?? null;
+    s.followRoot = record.followRoot ?? null;
+    setDecisionPending(suggestionVisible());
+  }
 
   // ---- layout ----------------------------------------------------------
 
@@ -567,6 +578,14 @@ export function initChangesPanel({
     return s.projectRepositoriesPromise;
   }
 
+  // Repository suggestions still waiting for an answer are stored per conversation, so they survive switching and reloads.
+  function persistDecision() {
+    if (!s.session) {
+      return;
+    }
+    updateRecord(s.session.sessionId, { automaticRoot: s.automaticRoot, suggestedRoot: s.suggestedRoot, followRoot: s.followRoot });
+  }
+
   // A repository picked in the panel stays in the picker and, when edits land elsewhere, a move to another repository is offered. Without a pick, the picker and the working directory follow the first edited repository; after that move the repository counts as chosen.
   function chooseRepository() {
     const automatic = s.editedRoot ?? s.sessionRoot ?? null;
@@ -584,6 +603,7 @@ export function initChangesPanel({
         s.suggestedRoot = null;
         s.followRoot = moved ? automatic : null;
       }
+      persistDecision();
     }
     if (s.repository && (s.repositoryFromStorage || s.repositoryChosen)) {
       setDecisionPending(suggestionVisible());
@@ -627,6 +647,9 @@ export function initChangesPanel({
           s.editedRoot = repository.editedRoot;
         }
         s.sessionName = repository.name ?? null;
+        if (!loadedRecords.has(session.sessionId)) {
+          applyDecision(loadRecord(session.sessionId, repository.record));
+        }
       }
       chooseRepository();
       void followPendingRepository();
@@ -706,7 +729,7 @@ export function initChangesPanel({
           return;
         }
         if (error?.code === "repository_not_allowed" && s.repositoryFromStorage && s.session) {
-          writeStorage(`${repositoryStoragePrefix}${s.session.sessionId}`, null);
+          updateRecord(s.session.sessionId, { choice: null });
           s.repositoryFromStorage = false;
           s.repository = null;
           s.repoToken += 1;
@@ -880,13 +903,14 @@ export function initChangesPanel({
       return;
     }
     s.followRoot = null;
+    persistDecision();
     if (root === s.sessionRoot || s.repositoryChosen || s.repositoryFromStorage) {
       return;
     }
     const sessionId = s.session.sessionId;
     // Once Copilot has moved the conversation, its repository counts as chosen, so later edits elsewhere are offered rather than moved to silently.
     s.repositoryChosen = true;
-    saveRepositoryChoice(sessionId, root);
+    updateRecord(sessionId, { choice: root });
     s.switching = true;
     renderRepositoryRow();
     try {
@@ -897,7 +921,7 @@ export function initChangesPanel({
         s.sessionName = null;
       }
     } catch (error) {
-      writeStorage(`${repositoryStoragePrefix}${sessionId}`, null);
+      updateRecord(sessionId, { choice: null });
       if (sessionId === (s.session?.sessionId ?? null)) {
         s.repositoryChosen = false;
       }
@@ -952,6 +976,7 @@ export function initChangesPanel({
     s.repositoryFromStorage = false;
     s.suggestedRoot = null;
     s.followRoot = null;
+    persistDecision();
     setDecisionPending(false);
     s.repoToken += 1;
     s.status = null;
@@ -959,7 +984,7 @@ export function initChangesPanel({
     resetDiff();
     el.panel.dataset.view = "list";
     if (s.session) {
-      saveRepositoryChoice(s.session.sessionId, root);
+      updateRecord(s.session.sessionId, { choice: root });
     }
     render();
     s.loading = true;
@@ -981,7 +1006,7 @@ export function initChangesPanel({
       return;
     }
     if (s.session) {
-      writeStorage(`${repositoryStoragePrefix}${s.session.sessionId}`, null);
+      updateRecord(s.session.sessionId, { choice: null });
     }
     s.repositoryChosen = false;
     s.repositoryFromStorage = false;
@@ -1966,6 +1991,7 @@ export function initChangesPanel({
   });
   el.suggestionDismiss.addEventListener("click", () => {
     s.suggestedRoot = null;
+    persistDecision();
     renderSuggestion();
   });
   el.repository.addEventListener("click", () => setRepositoryMenuOpen(!s.repositoryMenuOpen, { returnFocus: true }));
@@ -2246,10 +2272,7 @@ export function initChangesPanel({
       repositoryCarry = null;
       window.clearTimeout(s.toolRefreshTimer);
       setRepositoryMenuOpen(false);
-      if (s.session) {
-        sessionDecisions.set(s.session.sessionId, { automaticRoot: s.automaticRoot, suggestedRoot: s.suggestedRoot, followRoot: s.followRoot });
-      }
-      const decision = sessionId ? sessionDecisions.get(sessionId) : undefined;
+      const record = sessionId ? repositoryRecords.get(sessionId) : undefined;
       s.session = session ? { sessionId, cwd: session.cwd ?? "" } : null;
       s.sessionToken += 1;
       s.repoToken += 1;
@@ -2263,9 +2286,9 @@ export function initChangesPanel({
       s.repository = null;
       s.repositoryChosen = false;
       s.repositoryFromStorage = false;
-      s.automaticRoot = decision ? decision.automaticRoot : undefined;
-      s.suggestedRoot = decision ? decision.suggestedRoot : null;
-      s.followRoot = decision ? decision.followRoot ?? null : null;
+      s.automaticRoot = record?.automaticRoot;
+      s.suggestedRoot = record?.suggestedRoot ?? null;
+      s.followRoot = record?.followRoot ?? null;
       setDecisionPending(suggestionVisible());
       s.activeKey = null;
       s.filter = "";
@@ -2275,7 +2298,7 @@ export function initChangesPanel({
       if (carried?.sessionId === sessionId) {
         setRepository(carried.root);
         s.repositoryChosen = true;
-        saveRepositoryChoice(sessionId, carried.root);
+        updateRecord(sessionId, { choice: carried.root });
       }
       render();
       void refreshAll();
@@ -2295,8 +2318,9 @@ export function initChangesPanel({
       void refreshAll();
     },
     forgetSession(sessionId) {
-      sessionDecisions.delete(sessionId);
-      writeStorage(`${repositoryStoragePrefix}${sessionId}`, null);
+      repositoryRecords.delete(sessionId);
+      loadedRecords.delete(sessionId);
+      unsavedRecordChanges.delete(sessionId);
     },
     // Before a conversation exists, an explicit choice becomes its working directory; automatic choices never do.
     repositoryForPrompt(sessionId) {

@@ -380,7 +380,12 @@ Custom conversation titles are stored in
 stored in `~/.copilot-web/session-usage.json`, and last-activity timestamps used
 for sidebar ordering are stored in `~/.copilot-web/session-activity.json`.
 Per-conversation context, model, and reasoning preferences are stored in
-`~/.copilot-web/session-preferences.json`.
+`~/.copilot-web/session-preferences.json`. The repository picked for a
+conversation and any pending repository suggestion are stored in
+`~/.copilot-web/repository-records.json`, so they follow the conversation across
+browsers and server restarts. The picked repository is the conversation's
+working directory: it is applied when the conversation loads, because the
+Copilot CLI does not keep a changed working directory.
 These are web-interface metadata and do not modify the underlying Copilot
 session transcript. Selecting or loading a conversation does not update its
 last-activity timestamp or move it to the top of the sidebar, including after
