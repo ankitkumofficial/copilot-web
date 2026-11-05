@@ -2933,8 +2933,32 @@ button:disabled {
   grid-template-columns: minmax(0, 1fr) 9px var(--changes-width);
 }
 
-.workspace.changes-open.changes-expanded .workspace-body {
-  grid-template-columns: minmax(0, 1fr) 9px 70%;
+/* Expanded Repository panel: the sidebar and conversation hide, and the panel takes the full width. */
+.app-shell.repository-expanded,
+.app-shell.repository-expanded.sidebar-collapsed {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.app-shell.repository-expanded .sidebar,
+.app-shell.repository-expanded .sidebar-resizer {
+  display: none;
+}
+
+.app-shell.repository-expanded .workspace {
+  grid-column: 1;
+}
+
+.workspace.changes-expanded .workspace-body {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.workspace.changes-expanded .conversation,
+.workspace.changes-expanded .changes-resizer {
+  display: none;
+}
+
+.workspace.changes-expanded .changes-panel {
+  grid-column: 1;
 }
 
 .workspace.changes-resizing,
@@ -2984,17 +3008,12 @@ button:disabled {
   display: none;
 }
 
-.changes-header {
+.changes-header-actions {
   display: flex;
+  flex: none;
   align-items: center;
   gap: 4px;
-  padding: 8px 10px 4px 14px;
-}
-
-.changes-header h2 {
-  flex: 1;
-  margin: 0;
-  font-size: 0.95rem;
+  margin-inline-start: auto;
 }
 
 .changes-icon-button {
@@ -3056,6 +3075,10 @@ button:disabled {
   align-items: center;
   gap: 8px;
   padding: 4px 14px;
+}
+
+.changes-repository-row {
+  padding: 8px 10px 4px 14px;
 }
 
 .changes-repository-picker {
@@ -3515,6 +3538,108 @@ button:disabled {
   display: none;
 }
 
+/* Expanded panel: the file list on the left with Unstaged above Staged, and the diff on the right. */
+.changes-diff-empty {
+  display: none;
+}
+
+@media (min-width: 701px) {
+  .workspace.changes-expanded .changes-tabpanel:not([hidden]) {
+    display: grid;
+    grid-template-columns: var(--changes-list-width, 38%) 9px minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
+  .workspace.changes-expanded .changes-summary {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .workspace.changes-expanded .changes-warnings {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .workspace.changes-expanded .changes-list {
+    grid-column: 1;
+    grid-row: 3;
+    display: flex;
+    flex-direction: column;
+    height: auto;
+    max-height: none;
+    overflow: hidden;
+  }
+
+  .workspace.changes-expanded .changes-group {
+    display: block;
+    flex: 1 1 0;
+    min-height: 0;
+    margin-top: 0;
+    overflow-y: auto;
+  }
+
+  .workspace.changes-expanded .changes-group-unstaged {
+    flex: 0 0 var(--changes-unstaged-height, 50%);
+  }
+
+  .workspace.changes-expanded .changes-group-title {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--surface);
+  }
+
+  .workspace.changes-expanded .changes-group-empty {
+    margin: 0;
+    padding: 4px 8px;
+    color: var(--muted);
+    font-size: 0.78rem;
+  }
+
+  .workspace.changes-expanded .changes-group-divider {
+    display: block;
+    flex: 0 0 9px;
+    height: 9px;
+    border-top: 1px solid var(--border);
+    cursor: row-resize;
+    touch-action: none;
+  }
+
+  .workspace.changes-expanded .changes-group-divider:hover {
+    border-top-color: var(--accent);
+  }
+
+  .workspace.changes-expanded .changes-split-resizer {
+    grid-column: 2;
+    grid-row: 1 / -1;
+    width: 9px;
+    height: auto;
+    border-top: 0;
+    border-left: 1px solid var(--border);
+    cursor: col-resize;
+  }
+
+  .workspace.changes-expanded .changes-split-resizer:hover {
+    border-top-color: transparent;
+    border-left-color: var(--accent);
+  }
+
+  .workspace.changes-expanded .changes-diff,
+  .workspace.changes-expanded .changes-diff-empty {
+    grid-column: 3;
+    grid-row: 1 / -1;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .workspace.changes-expanded .changes-panel:not(.has-diff) .changes-diff-empty {
+    display: grid;
+    place-items: center;
+    margin: 0;
+    color: var(--muted);
+  }
+}
+
 .changes-diff {
   display: flex;
   flex: 1 1 auto;
@@ -3747,7 +3872,7 @@ button:disabled {
   }
 
   .workspace.changes-expanded .changes-panel {
-    width: 92%;
+    width: 100%;
   }
 }
 
