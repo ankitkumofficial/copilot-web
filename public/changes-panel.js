@@ -197,9 +197,9 @@ export function initChangesPanel({
     width: Number.isFinite(storedWidth) && storedWidth >= minimumWidth ? storedWidth : defaultWidth,
     expanded: false,
     wrap: readStorage(wrapStorageKey) === "true",
-    // The terminal tab exists only when the server enables it; the tab resets to All changes when it does not.
+    // The terminal tab exists only when the server enables it; the tab resets to Current changes when it does not.
     terminalEnabled: false,
-    tab: "all",
+    tab: "current",
     editorUrlTemplate: null,
     session: null,
     sessionRoot: null,
@@ -415,7 +415,7 @@ export function initChangesPanel({
   function setTerminalEnabled(enabled) {
     s.terminalEnabled = enabled === true;
     if (!s.terminalEnabled && s.tab === "terminal") {
-      s.tab = "all";
+      s.tab = "current";
     }
     render();
   }
@@ -426,7 +426,7 @@ export function initChangesPanel({
       toggle(false);
       return;
     }
-    setTab(s.tab === "terminal" ? "all" : s.tab);
+    setTab(s.tab === "terminal" ? "current" : s.tab);
     if (!s.open) {
       toggle(true);
     }
