@@ -232,6 +232,7 @@ remote service.
   working-directory note. The panel refreshes after Copilot tool activity and prompt
   completion, on window focus, and on demand (`R`). Inside the panel, `↑`/`↓` and
   `Enter` select and open files, `N`/`P` move between hunks, `W` toggles wrapping,
+  `⌘J` resets the highlighted file (with the same confirmation as its **Reset** button),
   and `Escape` returns to the list or closes the panel. **Expand** in the panel
   header fills the window with the panel by hiding the sidebar and conversation;
   Ask and Attach restore the previous width, since they insert into the composer.
