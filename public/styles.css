@@ -3043,6 +3043,11 @@ button:disabled {
   color: var(--accent-strong);
 }
 
+#changes-expand[aria-pressed="true"] .changes-icon-expand,
+#changes-expand:not([aria-pressed="true"]) .changes-icon-collapse {
+  display: none;
+}
+
 .changes-back {
   display: none;
 }
