@@ -3221,6 +3221,25 @@ test("deletes conversations in the background while navigating and sending new p
     !document.querySelector("#send-prompt").disabled`);
   // Deletion is refused while the conversation is still loading, so wait for the transcript to settle first.
   await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  const actionOrder = await evaluate(`(() => {
+    const row = ${originalRow};
+    const label = (button) => button.classList.contains("session-rename")
+      ? "edit"
+      : button.classList.contains("session-archive")
+        ? "archive"
+        : "delete";
+    const actions = [...row.querySelectorAll(".session-action")];
+    return {
+      dom: actions.map(label),
+      visual: [...actions]
+        .sort((left, right) => left.getBoundingClientRect().left - right.getBoundingClientRect().left)
+        .map(label)
+    };
+  })()`);
+  assert.deepEqual(actionOrder, {
+    dom: ["edit", "archive", "delete"],
+    visual: ["edit", "archive", "delete"]
+  });
   await evaluate(`${originalRow}.querySelector(".session-delete").click()`);
   await waitFor(`document.querySelector("#delete-dialog").open`);
   await evaluate(`document.querySelector("#delete-dialog").close("cancel")`);
@@ -3303,6 +3322,9 @@ test("archives conversations behind a confirmation and restores them from the co
 
   await evaluate(`${originalRow}.querySelector(".session-archive").click()`);
   await waitFor(`document.querySelector("#archive-dialog").open`);
+  assert.equal(await evaluate(
+    `getComputedStyle(document.querySelector("#archive-confirm")).backgroundColor !== "rgba(0, 0, 0, 0)"`
+  ), true);
   await evaluate(`document.querySelector("#archive-dialog").close("cancel")`);
   await waitFor(`!document.querySelector("#archive-dialog").open`);
   assert.equal(await evaluate(`document.querySelector(".session-archive-section") === null`), true);
@@ -11778,14 +11800,19 @@ test("current changes lists only the files this conversation edited, while all c
   assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
 });
 
-test("the diff view has a close button that still works after the file is staged", {
+test("staging advances an open diff but leaves the diff closed when staging from the list", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 60_000
 }, async (t) => {
   const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
-  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), { "a.txt": "one\n", "b.txt": "two\n" });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), {
+    "a.txt": "one\n",
+    "b.txt": "two\n",
+    "c.txt": "three\n"
+  });
   await writeFile(path.join(repo, "a.txt"), "one\ntwo\n");
   await writeFile(path.join(repo, "b.txt"), "two\nthree\n");
+  await writeFile(path.join(repo, "c.txt"), "three\nfour\n");
   const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
 
   await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
@@ -11809,6 +11836,11 @@ test("the diff view has a close button that still works after the file is staged
 
   await evaluate(`document.querySelector("#changes-diff-close").click()`);
   await waitFor(`document.querySelector("#changes-diff").hidden === true`);
+
+  await evaluate(`document.querySelector('[data-key="unstaged:b.txt"] [aria-label="Stage b.txt"]').click()`);
+  await waitFor(`Boolean(document.querySelector('[data-key="staged:b.txt"]'))`);
+  await waitFor(`Boolean(document.querySelector('[data-key="unstaged:c.txt"]'))`);
+  assert.equal(await evaluate(`document.querySelector("#changes-diff").hidden`), true);
   assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
 });
 });

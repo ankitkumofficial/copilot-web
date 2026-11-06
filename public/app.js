@@ -3050,8 +3050,6 @@ function createSessionRow(session, { archived = false } = {}) {
       void archiveConversation(session.sessionId);
     });
   }
-  row.append(archiveButton);
-
   const renameButton = document.createElement("button");
   renameButton.type = "button";
   renameButton.className = "session-action session-rename";
@@ -3069,6 +3067,7 @@ function createSessionRow(session, { archived = false } = {}) {
     void renameConversation(session.sessionId);
   });
   row.append(renameButton);
+  row.append(archiveButton);
 
   if (canDelete) {
     const deleteButton = document.createElement("button");

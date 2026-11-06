@@ -1850,7 +1850,7 @@ export function initChangesPanel({
     return file ? { key: file.key, path: file.path, section: file.section } : null;
   }
 
-  // After a stage, the preview moves to the first unstaged file, or closes when none is left.
+  // After staging the visible file, move its preview to the first unstaged file, or close when none is left.
   function openFirstUnstaged(files) {
     const next = files.find((file) => file.section === "unstaged");
     if (!next) {
@@ -1873,6 +1873,7 @@ export function initChangesPanel({
       return;
     }
     const action = item.section === "unstaged" ? "stage" : "unstage";
+    const advanceDiff = action === "stage" && s.openFile?.path === item.path;
     const repository = s.repository;
     const repoToken = s.repoToken;
     const statusKey = currentStatusKey();
@@ -1892,10 +1893,14 @@ export function initChangesPanel({
         if (statusKey !== currentStatusKey()) {
           refreshStatusAndRender();
         } else if (action === "stage") {
-          // Clear the preview first so the staged file is not followed into the staged section.
-          resetDiff();
+          if (advanceDiff) {
+            // Clear the preview first so the staged file is not followed into the staged section.
+            resetDiff();
+          }
           applyStatus(status);
-          openFirstUnstaged(status.files);
+          if (advanceDiff) {
+            openFirstUnstaged(status.files);
+          }
         } else {
           const movedKey = `unstaged:${item.path}`;
           const wasActive = s.activeKey === item.key;
