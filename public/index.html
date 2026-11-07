@@ -207,6 +207,9 @@
                     <circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"></circle>
                     <circle cx="19" cy="12" r="1.5" fill="currentColor" stroke="none"></circle>
                   </svg>
+                  <span id="decision-badge" class="decision-badge" aria-hidden="true">
+                    <svg viewBox="0 0 24 24"><path d="M3 4a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H9l-4 4v-4H5a2 2 0 0 1-2-2z"></path></svg>
+                  </span>
                 </button>
                 <div id="composer-more-menu" class="composer-more-menu" hidden>
                   <button id="reconnect-tools" class="composer-more-item" type="button" aria-label="Reconnect tools" title="Reload MCP connections without rerunning your prompt" disabled>
@@ -235,6 +238,7 @@
                       <path d="M6 3v12m0 0a3 3 0 1 0 0 6 3 3 0 0 0 0-6Zm12-6a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm0 0c0 5-6 4-12 9"></path>
                     </svg>
                     <span>Repository</span>
+                    <span id="changes-decision" class="changes-decision-icon" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H9l-4 4v-4H5a2 2 0 0 1-2-2z"></path></svg></span>
                     <span id="changes-badge" class="changes-toggle-badge" aria-hidden="true" hidden></span>
                   </button>
                 </div>
@@ -298,6 +302,13 @@
                 <div id="changes-repository-menu" class="changes-repository-menu" role="tree" aria-label="Repositories" tabindex="-1" hidden></div>
               </div>
               <span id="changes-branch" class="changes-branch"></span>
+            </div>
+            <div id="changes-suggestion" class="changes-suggestion" role="status" hidden>
+              <p id="changes-suggestion-text"></p>
+              <div class="changes-suggestion-actions">
+                <button id="changes-suggestion-use" class="changes-action" type="button">Use as working directory</button>
+                <button id="changes-suggestion-dismiss" class="changes-action" type="button">Dismiss</button>
+              </div>
             </div>
             <div class="repository-tabs" role="tablist" aria-label="Repository views">
               <button id="repository-tab-changes" class="repository-tab" type="button" role="tab" aria-selected="true" aria-controls="changes-tabpanel">Changes</button>

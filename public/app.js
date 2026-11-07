@@ -553,7 +553,7 @@ function restoreSelectionMessageMetadata(message, conversation) {
     return;
   }
   const promptText = message.rawSelectionPromptText ?? message.text;
-  const { hasRepositoryContext, text: unprefixedText } = splitRepositoryContext(promptText);
+  const { hasWorkingDirectoryNote, text: unprefixedText } = splitWorkingDirectoryNote(promptText);
   const storedEntries = selectionMessageMetadata[conversation.sessionId] ?? [];
   const recoveredPrompt = parseSelectionPrompt(unprefixedText);
   const identified = storedEntries.find((entry) => (
@@ -584,7 +584,7 @@ function restoreSelectionMessageMetadata(message, conversation) {
 
   const recovered = recoveredPrompt;
   if (!recovered) {
-    if (hasRepositoryContext) {
+    if (hasWorkingDirectoryNote) {
       message.text = unprefixedText;
     }
     return;
@@ -1220,6 +1220,62 @@ function saveContextPreference(preference) {
   } catch {
     setStatus("Context preference could not be saved");
   }
+}
+
+const workingDirectoryNoteStorageKey = (sessionId) => `copilot-web:working-directory-note:${sessionId}`;
+
+// Conversations whose working directory is changing; their messages wait until the change finishes.
+const workingDirectoryChangesInFlight = new Set();
+
+function pendingWorkingDirectoryNote(sessionId) {
+  try {
+    return window.localStorage.getItem(workingDirectoryNoteStorageKey(sessionId));
+  } catch {
+    return null;
+  }
+}
+
+function savePendingWorkingDirectoryNote(sessionId, directory) {
+  try {
+    window.localStorage.setItem(workingDirectoryNoteStorageKey(sessionId), directory);
+  } catch {
+    setStatus("The working directory change could not be saved, so Copilot may not learn about it");
+  }
+}
+
+function clearPendingWorkingDirectoryNote(sessionId) {
+  try {
+    window.localStorage.removeItem(workingDirectoryNoteStorageKey(sessionId));
+  } catch {
+    // Without storage no note was saved, so there is nothing to clear.
+  }
+}
+
+// Reloads the conversation in another directory; the next normal message tells Copilot about the change once.
+async function changeWorkingDirectory(sessionId, directory) {
+  workingDirectoryChangesInFlight.add(sessionId);
+  let result;
+  try {
+    result = await api(`/api/sessions/${encodeURIComponent(sessionId)}/working-directory`, {
+      method: "POST",
+      body: JSON.stringify({ repository: directory })
+    });
+  } finally {
+    workingDirectoryChangesInFlight.delete(sessionId);
+  }
+  upsertSession(result.session);
+  savePendingWorkingDirectoryNote(sessionId, result.session.cwd);
+  const conversation = activeConversation();
+  if (conversation?.sessionId === sessionId) {
+    addMessage(
+      "system",
+      `Working directory changed to ${result.session.cwd}. Relative paths and shell commands now run there. Copilot will be told in your next message, and files outside this directory may require permission.`,
+      null,
+      [],
+      conversation
+    );
+  }
+  return result.session;
 }
 
 function findConfigOption(ids, category, conversation = activeConversation() ?? state.composer) {
@@ -1897,6 +1953,11 @@ function setConnection(status, label) {
 
 function promptIsActive(conversation = activeConversation()) {
   return Boolean(conversation && (conversation.busy || conversation.recoveredPrompt));
+}
+
+// The working directory cannot change while a conversation loads or a reply runs.
+function conversationIsReplying(conversation = activeConversation()) {
+  return Boolean(conversation) && (conversation.loading === true || promptIsActive(conversation));
 }
 
 function updateSendPromptAction(conversation = activeConversation()) {
@@ -2832,9 +2893,6 @@ applyTheme(themePreference);
 applySidebarWidth(preferredSidebarWidth);
 applySidebarState(sidebarCollapsed);
 
-// The repository prefix is stripped from generated titles, which collapse it onto one line.
-const repositoryContextTitlePattern = /^Current repository: "[^"]*"\.?(?: Unless I say otherwise, my questions about files and changes refer to it\.?)?/;
-
 function cleanGeneratedConversationTitle(value) {
   if (typeof value !== "string") {
     return "";
@@ -2846,7 +2904,6 @@ function cleanGeneratedConversationTitle(value) {
     .replace(/[ \t]*(?:`{3,}|~{3,})$/, "");
   return title
     .replace(/\s+/g, " ")
-    .replace(repositoryContextTitlePattern, "")
     .trim();
 }
 
@@ -2972,6 +3029,7 @@ function syncChangesPanelSession() {
   changesPanel.setSession(sessionId
     ? { sessionId, cwd: selectedSession()?.cwd ?? state.projectsDirectory }
     : null);
+  changesPanel.setReplyBusy(conversationIsReplying(activeConversation()));
 }
 
 function insertIntoComposer(text) {
@@ -5246,22 +5304,18 @@ function promptWithSelections(text, selections) {
   return `${question}\n\nSelected passages from the conversation:\n${excerpts}`;
 }
 
-// The repository chosen in the Repository panel reaches Copilot as this first line; the transcript shows only the message.
-const repositoryContextPattern = /^Current repository: ("(?:[^"\\]|\\.)*")\. Unless I say otherwise, my questions about files and changes refer to it\.\n\n/;
+// A working-directory change reaches Copilot once, as the first line of the next message; the transcript shows only the typed text.
+const workingDirectoryNotePattern = /^Your working directory changed to [^\n]+?\. Relative paths and shell commands now run there\. Files outside it may require permission\.\n\n/;
 
-function promptWithRepository(text, repositoryRoot) {
-  // Slash commands are sent unchanged because Copilot reads them only at the start of a prompt.
-  if (!repositoryRoot || text.trimStart().startsWith("/")) {
-    return text;
-  }
-  return `Current repository: ${JSON.stringify(repositoryRoot)}. Unless I say otherwise, my questions about files and changes refer to it.\n\n${text}`;
+function workingDirectoryNote(directory) {
+  return `Your working directory changed to ${directory}. Relative paths and shell commands now run there. Files outside it may require permission.`;
 }
 
-function splitRepositoryContext(text) {
-  const match = repositoryContextPattern.exec(text);
+function splitWorkingDirectoryNote(text) {
+  const match = workingDirectoryNotePattern.exec(text);
   return match
-    ? { hasRepositoryContext: true, text: text.slice(match[0].length) }
-    : { hasRepositoryContext: false, text };
+    ? { hasWorkingDirectoryNote: true, text: text.slice(match[0].length) }
+    : { hasWorkingDirectoryNote: false, text };
 }
 
 function messagesAreAtBottom() {
@@ -5560,9 +5614,7 @@ function createMessageArticle(message, index) {
       ? "Thinking"
       : Array.isArray(message.plan)
         ? "Plan"
-        : message.role === "system"
-          ? state.brandName
-          : "Copilot";
+        : "Copilot";
   header.append(label);
   if (message.role === "user" || message.role === "assistant") {
     const copy = document.createElement("button");
@@ -6007,7 +6059,7 @@ function addMessage(
 
   const message = {
     role,
-    text: role === "user" ? splitRepositoryContext(text).text : text,
+    text: role === "user" ? splitWorkingDirectoryNote(text).text : text,
     attachments: [...attachments],
     displayKey: key ?? nextSyntheticMessageKey(role, conversation)
   };
@@ -6341,7 +6393,7 @@ function ingestNativeMessage(record, conversation) {
   }
   if (record.role === "user") {
     message.rawSelectionPromptText = content;
-    message.text = splitRepositoryContext(content).text;
+    message.text = splitWorkingDirectoryNote(content).text;
   }
   index = conversation.messages.length;
   conversation.messages.push(message);
@@ -7573,7 +7625,7 @@ function applyFallbackConversationTitle(queuedPrompt, conversation) {
     .filter((attachment) => typeof attachment.name === "string")
     .map((attachment) => attachment.name);
   const source = queuedPrompt.displayText.trim() ||
-    splitRepositoryContext(queuedPrompt.text).text.trim() ||
+    splitWorkingDirectoryNote(queuedPrompt.text).text.trim() ||
     (attachmentNames.length > 0 ? attachmentNames.join(", ") : "");
   const compact = cleanGeneratedConversationTitle(source);
   if (!compact) {
@@ -7615,6 +7667,8 @@ async function createServerConversationInternal(sourceConversation) {
   const context = state.selectedContext;
   // Replacing an existing conversation is a new creation, not a retry of the original one.
   const creationRequest = promoteComposer ? sourceConversation.creationRequest : null;
+  // Replacing an empty conversation keeps the repository picked for it.
+  const repository = promoteComposer ? null : changesPanel?.repositoryForPrompt(previousSessionId) ?? null;
   try {
     const result = await api("/api/sessions", {
       method: "POST",
@@ -7623,7 +7677,8 @@ async function createServerConversationInternal(sourceConversation) {
       } : {}),
       body: JSON.stringify(creationRequest?.body ?? {
         context,
-        configOverrides
+        configOverrides,
+        ...(repository ? { repository } : {})
       })
     });
     sourceConversation.creationRequest = null;
@@ -8577,10 +8632,11 @@ async function submitPrompt() {
   ) {
     return;
   }
-  const promptText = promptWithRepository(
-    promptWithSelections(text, selections),
-    changesPanel?.repositoryForPrompt(conversation.sessionId ?? null) ?? null
-  );
+  if (conversation.sessionId && workingDirectoryChangesInFlight.has(conversation.sessionId)) {
+    setStatus("Wait for the working directory to change before sending", conversation);
+    return;
+  }
+  const repositoryRoot = changesPanel?.repositoryForPrompt(null) ?? null;
   const displayText = text.trim()
     ? text
     : selections.length > 0
@@ -8619,9 +8675,19 @@ async function submitPrompt() {
         id: crypto.randomUUID(),
         body: {
           context: state.selectedContext,
-          configOverrides: selectedNewSessionConfigOverrides(conversation)
+          configOverrides: selectedNewSessionConfigOverrides(conversation),
+          ...(repositoryRoot ? { repository: repositoryRoot } : {})
         }
       };
+    }
+    // A pending working-directory note goes with the first normal message after a change, never with a slash command.
+    const pendingDirectory = conversation.sessionId ? pendingWorkingDirectoryNote(conversation.sessionId) : null;
+    const attachNote = Boolean(pendingDirectory) && !text.trimStart().startsWith("/");
+    const promptText = attachNote
+      ? `${workingDirectoryNote(pendingDirectory)}\n\n${promptWithSelections(text, selections)}`
+      : promptWithSelections(text, selections);
+    if (attachNote) {
+      clearPendingWorkingDirectoryNote(conversation.sessionId);
     }
     pendingSend = {
       id: crypto.randomUUID(),
@@ -8991,6 +9057,7 @@ function connectEvents() {
     if (typeof data?.sessionId === "string") {
       applyServerPromptState(data.sessionId, { busy: false });
       changesPanel?.forgetSession(data.sessionId);
+      clearPendingWorkingDirectoryNote(data.sessionId);
       renderConversationControls();
     }
     void refreshSessions().catch(showError);
@@ -9274,6 +9341,14 @@ function setMoreActionsOpen(open, { focusTrigger = false } = {}) {
   }
 }
 
+// The more-actions button signals a repository decision that is waiting in the Repository panel.
+function setMoreActionsDecisionAttention(pending) {
+  const label = pending ? "More actions, repository decision pending" : "More actions";
+  elements.moreActions.classList.toggle("has-decision", pending);
+  elements.moreActions.setAttribute("aria-label", label);
+  elements.moreActions.title = label;
+}
+
 elements.moreActions.addEventListener("click", () => {
   setMoreActionsOpen(elements.moreActionsMenu.hidden);
 });
@@ -9450,6 +9525,8 @@ changesPanel = initChangesPanel({
   api,
   terminal: terminalPanel,
   insertIntoComposer,
+  changeWorkingDirectory,
+  onDecisionChange: setMoreActionsDecisionAttention,
   attachFiles: async (files) => {
     const conversation = currentComposerConversation();
     const before = conversation.attachments.length;

@@ -240,6 +240,7 @@ input.on("line", (line) => {
     method: request.method,
     text: request.params?.prompt?.[0]?.text,
     ...(profiles || nativeMessages ? { sessionId: request.params?.sessionId } : {}),
+    ...(request.method === "session/new" || request.method === "session/load" ? { cwd: request.params?.cwd } : {}),
     ...(profiles ? { model: startupModel, context } : {}),
     ...(request.params?.prompt?.length > 1 ? { prompt: request.params.prompt } : {})
   }) + "\\n");
@@ -872,6 +873,7 @@ async function startTestServer(t: TestContext, options: {
   historyText?: string;
   context?: "default" | "long_context";
   allowAll?: boolean;
+  webUser?: string;
   nativeSessionDelete?: boolean;
   quotaCommand?: "success" | "failure" | "missing";
   aicUsageEvents?: number;
@@ -934,6 +936,7 @@ async function startTestServer(t: TestContext, options: {
         ? path.join(directory, "gh-not-installed")
         : fakeGitHubCommand,
       COPILOT_ALLOW_ALL: String(options.allowAll ?? false),
+      COPILOT_WEB_USER: options.webUser ?? "",
       COPILOT_SDK_PATH: options.nativeHistory
         ? path.join(copilotSdk, "index.js")
         : "",
@@ -4584,12 +4587,15 @@ test("changes view follows the repository of the latest edit until a repository 
   await editWith(path.join(edited, "a.txt"), "edit-first");
   await refreshPanel();
   await waitFor(`document.querySelector("#changes-repository-label").textContent === "edited"`);
+  // The picker unlocks once the browser sees the reply finish.
+  await waitFor(`document.querySelector("#changes-repository").disabled === false`);
 
   await evaluate(`document.querySelector("#changes-repository").click()`);
   await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
   await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
     .find((option) => option.dataset.root === ${JSON.stringify(picked)}).click()`);
   await waitFor(`document.querySelector("#changes-repository-label").textContent === "picked"`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Working directory changed to")`);
 
   // A later edit must not override the repository picked in the panel.
   await editWith(path.join(edited, "b.txt"), "edit-second");
@@ -4782,9 +4788,46 @@ test("changes view resets unstaged files only after confirmation, deleting new f
   assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
 });
 
-// The first line Copilot receives for a message sent while a repository is picked in the Repository panel.
-const repositoryContextPrompt = (repository: string, text: string): string => (
-  `Current repository: ${JSON.stringify(repository)}. Unless I say otherwise, my questions about files and changes refer to it.\n\n${text}`
+test("a repository chosen when a conversation is created becomes its working directory", {
+  skip: gitAvailable ? false : "git is not on PATH"
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "chosen-app"), { "a.txt": "a\n" });
+  const plain = path.join(server.projectsDirectory, "plain-folder");
+  await mkdir(plain);
+  const create = (body: JsonObject) => fetch(`${server.baseUrl}/api/sessions`, {
+    method: "POST",
+    headers: server.headers,
+    body: JSON.stringify({ context: "default", ...body })
+  });
+  const sessionCreations = async () => (await server.requests())
+    .filter((request) => request.method === "session/new")
+    .map((request) => request.cwd);
+  const creationsBefore = (await sessionCreations()).length;
+
+  const withRepository = await create({ repository: repo });
+  assert.equal(withRepository.status, 201);
+  const created: unknown = await withRepository.json();
+  assert.ok(isRecord(created) && isRecord(created.session));
+  assert.equal(created.session.cwd, repo);
+  assert.equal((await create({})).status, 201);
+
+  const rejected = [
+    { repository: "chosen-app", status: 400, code: "invalid_repository" },
+    { repository: plain, status: 403, code: "repository_not_allowed" },
+    { repository: path.dirname(server.projectsDirectory), status: 403, code: "repository_not_allowed" }
+  ];
+  for (const { repository, status, code } of rejected) {
+    const response = await create({ repository });
+    assert.equal(response.status, status);
+    assert.equal(((await response.json()) as JsonObject).code, code);
+  }
+  assert.deepEqual((await sessionCreations()).slice(creationsBefore), [repo, server.projectsDirectory]);
+});
+
+// The first line Copilot receives after the working directory changes, sent once with the next normal message.
+const workingDirectoryNotePrompt = (directory: string, text: string): string => (
+  `Your working directory changed to ${directory}. Relative paths and shell commands now run there. Files outside it may require permission.\n\n${text}`
 );
 
 async function sentPromptTexts(server: { requests(): Promise<JsonObject[]> }, count: number): Promise<string[]> {
@@ -4800,18 +4843,21 @@ async function sentPromptTexts(server: { requests(): Promise<JsonObject[]> }, co
   }
 }
 
-test("a repository picked in the Repository panel reaches Copilot with each message, while the transcript shows only the typed text", {
+test("picking a repository after messages switches the working directory and tells Copilot in the next message", {
   skip: !existsSync(chromePath)
     ? "Chrome is not installed; set CHROME_BIN to run browser tests"
     : gitAvailable ? false : "git is not on PATH",
   timeout: 60_000
 }, async (t) => {
-  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] }, promptDelayMs: 1_000 });
   const repo = await createTestRepository(path.join(server.projectsDirectory, "picked-app"), { "a.txt": "a\n" });
   const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
   await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
   await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
   await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
 
   const send = async (text: string, sent: number) => {
     await waitFor(`!document.querySelector("#prompt-input").disabled`);
@@ -4821,42 +4867,287 @@ test("a repository picked in the Repository panel reaches Copilot with each mess
     await waitFor(`!document.querySelector("#prompt-input").disabled`);
   };
 
-  // Nothing is picked yet, so the message is sent unchanged.
-  await send("before pick", 1);
-  await evaluate(`document.querySelector("#changes-toggle").click()`);
-  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
-    .some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  // The picker is locked while the reply runs.
+  await evaluate(`document.querySelector("#prompt-input").value = "before pick";
+    document.querySelector("#composer").requestSubmit();`);
+  await waitFor(`document.querySelector("#changes-repository").disabled === true`);
+  await waitFor(`!document.querySelector("#prompt-input").disabled`);
+  await waitFor(`document.querySelector("#changes-repository").disabled === false`);
+  assert.deepEqual(await sentPromptTexts(server, 1), ["before pick"]);
+
+  // Choosing a repository switches the working directory before the next message is sent.
   await evaluate(`document.querySelector("#changes-repository").click()`);
   await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
   await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
     .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
   await waitFor(`document.querySelector("#changes-repository-label").textContent === "picked-app"`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Working directory changed to")`);
+  assert.ok((await server.requests()).some((request) => request.method === "session/load" && request.cwd === repo));
 
   await send("first question", 2);
   await send("second question", 3);
-  // Slash commands must start the prompt, so they are sent exactly as typed.
-  await send("/status check", 4);
-  await send("third question", 5);
-  assert.deepEqual(await sentPromptTexts(server, 5), [
+  assert.deepEqual(await sentPromptTexts(server, 3), [
     "before pick",
-    repositoryContextPrompt(repo, "first question"),
-    repositoryContextPrompt(repo, "second question"),
-    "/status check",
-    repositoryContextPrompt(repo, "third question")
+    workingDirectoryNotePrompt(repo, "first question"),
+    "second question"
   ]);
-  assert.doesNotMatch(String(await evaluate(`document.querySelector("#messages").textContent`)), /Current repository/);
-
-  // The restored transcript hides the repository line too, and the choice survives the reload.
-  await evaluate(`location.reload()`);
-  await waitFor(`document.querySelector("#messages")?.getAttribute("aria-busy") === "false" &&
-    document.querySelector("#messages")?.textContent.includes("third question")`);
-  assert.match(String(await evaluate(`document.querySelector("#messages").textContent`)), /first question/);
-  assert.doesNotMatch(String(await evaluate(`document.querySelector("#messages").textContent`)), /Current repository/);
-  await waitFor(`document.querySelector("#changes-repository-label").textContent === "picked-app"`);
+  const transcript = String(await evaluate(`document.querySelector("#messages").textContent`));
+  assert.match(transcript, /first question/);
+  assert.doesNotMatch(transcript, /Your working directory changed/);
   assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
 });
 
-test("a repository picked for a new conversation travels with its first message and the messages after it", {
+test("copilot edits in another repository offer it as the working directory, and Use switches to it", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeMessages: true, nativeHistory: { events: [] } });
+  const edited = await createTestRepository(path.join(server.projectsDirectory, "edited"), { "a.txt": "a\n", "b.txt": "b\n" });
+  const picked = await createTestRepository(path.join(server.projectsDirectory, "picked"), { "c.txt": "c\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "session-1"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "Choose a repository"`);
+  // The first repository fetch must finish before an edit, or that edit would be taken as the conversation's starting point.
+  await waitFor(`performance.getEntriesByType("resource").some((entry) => entry.name.endsWith("/api/sessions/session-1/repository"))`);
+
+  // The edit is sent through the API so the test controls its timing.
+  const editWith = async (filePath: string, clientPromptId: string) => {
+    const deadline = Date.now() + 5_000;
+    let response = await server.post("messages", { text: `edit-file:${filePath}`, clientPromptId });
+    while (response.status === 409 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      response = await server.post("messages", { text: `edit-file:${filePath}`, clientPromptId });
+    }
+    assert.equal(response.status, 200);
+  };
+  const refreshPanel = () => evaluate(`document.querySelector("#changes-refresh").click()`);
+
+  await editWith(path.join(edited, "a.txt"), "edit-first");
+  await refreshPanel();
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "edited"`);
+  await waitFor(`!document.querySelector("#changes-suggestion").hidden`);
+  // The suggestion's button unlocks once the browser sees the reply finish.
+  await waitFor(`document.querySelector("#changes-suggestion-use").disabled === false`);
+  assert.match(String(await evaluate(`document.querySelector("#changes-suggestion-text").textContent`)),
+    /Copilot edited files in edited\. The working directory is still the projects folder\./);
+  // The message icon takes the change dot's place while the offer is pending, and stays with the panel closed.
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector("#decision-badge")).display`), "block");
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector("#changes-decision")).display`), "flex");
+  await evaluate(`document.querySelector("#changes-close").click()`);
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector("#decision-badge")).display`), "block");
+  assert.equal(await evaluate(`document.querySelector("#composer-more-button").getAttribute("aria-label")`), "More actions, repository decision pending");
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`!document.querySelector("#changes-suggestion").hidden`);
+
+  await evaluate(`document.querySelector("#changes-suggestion-use").click()`);
+  await waitFor(`document.querySelector("#changes-suggestion").hidden === true`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Working directory changed to")`);
+  assert.ok((await server.requests()).some((request) => request.method === "session/load" && request.cwd === edited));
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector("#decision-badge")).display`), "none");
+  assert.equal(await evaluate(`document.querySelector("#composer-more-button").getAttribute("aria-label")`), "More actions");
+
+  // A later edit in another repository is offered, while the picked repository stays until the user chooses.
+  await editWith(path.join(picked, "c.txt"), "edit-picked");
+  await refreshPanel();
+  await waitFor(`!document.querySelector("#changes-suggestion").hidden`);
+  assert.match(String(await evaluate(`document.querySelector("#changes-suggestion-text").textContent`)),
+    /Copilot edited files in picked\./);
+  assert.equal(await evaluate(`document.querySelector("#changes-repository-label").textContent`), "edited");
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("a later edit in another repository is offered after a manual pick, and the picker moves only when the user agrees", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeMessages: true, nativeHistory: { events: [] } });
+  const picked = await createTestRepository(path.join(server.projectsDirectory, "picked"), { "c.txt": "c\n" });
+  const edited = await createTestRepository(path.join(server.projectsDirectory, "edited"), { "a.txt": "a\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "session-1"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .some((option) => option.dataset.root === ${JSON.stringify(picked)})`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(picked)}).click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "picked"`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Working directory changed to")`);
+
+  // The edit is sent through the API so the test controls its timing.
+  const deadline = Date.now() + 5_000;
+  let response = await server.post("messages", { text: `edit-file:${path.join(edited, "a.txt")}`, clientPromptId: "manual-pick-edit" });
+  while (response.status === 409 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    response = await server.post("messages", { text: `edit-file:${path.join(edited, "a.txt")}`, clientPromptId: "manual-pick-edit" });
+  }
+  assert.equal(response.status, 200);
+  await evaluate(`document.querySelector("#changes-refresh").click()`);
+
+  await waitFor(`!document.querySelector("#changes-suggestion").hidden`);
+  await waitFor(`document.querySelector("#changes-suggestion-use").disabled === false`);
+  assert.match(String(await evaluate(`document.querySelector("#changes-suggestion-text").textContent`)),
+    /Copilot edited files in edited\. The working directory is still picked\./);
+  assert.equal(await evaluate(`document.querySelector("#changes-repository-label").textContent`), "picked");
+  assert.equal((await server.requests()).some((request) => request.method === "session/load" && request.cwd === edited), false);
+
+  await evaluate(`document.querySelector("#changes-suggestion-use").click()`);
+  await waitFor(`document.querySelector("#changes-suggestion").hidden === true`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "edited"`);
+  await waitFor(`document.querySelector("#messages").textContent.includes(${JSON.stringify(`Working directory changed to ${edited}`)})`);
+  assert.ok((await server.requests()).some((request) => request.method === "session/load" && request.cwd === edited));
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("a pending repository suggestion waits in its conversation when the user switches away and back", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeMessages: true, nativeHistory: { events: [] } });
+  const edited = await createTestRepository(path.join(server.projectsDirectory, "edited"), { "a.txt": "a\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "session-1"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "Choose a repository"`);
+  // The first repository fetch must finish before an edit, or that edit would be taken as the conversation's starting point.
+  await waitFor(`performance.getEntriesByType("resource").some((entry) => entry.name.endsWith("/api/sessions/session-1/repository"))`);
+
+  const deadline = Date.now() + 5_000;
+  let response = await server.post("messages", { text: `edit-file:${path.join(edited, "a.txt")}`, clientPromptId: "switch-away-edit" });
+  while (response.status === 409 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    response = await server.post("messages", { text: `edit-file:${path.join(edited, "a.txt")}`, clientPromptId: "switch-away-edit" });
+  }
+  assert.equal(response.status, 200);
+  await evaluate(`document.querySelector("#changes-refresh").click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "edited"`);
+  await waitFor(`!document.querySelector("#changes-suggestion").hidden`);
+  await waitFor(`document.querySelector("#changes-suggestion-use").disabled === false`);
+
+  await evaluate(`document.querySelector("#new-chat").click()`);
+  await waitFor(`!document.querySelector("#prompt-input").disabled`);
+  await evaluate(`document.querySelector("#prompt-input").value = "another conversation";
+    document.querySelector("#composer").requestSubmit();`);
+  await sentPromptTexts(server, 1);
+  await waitFor(`Boolean(document.querySelector(".session-item.active")) &&
+    document.querySelector(".session-item.active").dataset.sessionId !== "session-1"`);
+  await waitFor(`!document.querySelector("#prompt-input").disabled`);
+  assert.equal(await evaluate(`document.querySelector("#changes-suggestion").hidden`), true);
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector("#changes-decision")).display`), "none");
+
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "session-1"`);
+  await waitFor(`!document.querySelector("#changes-suggestion").hidden`);
+  await waitFor(`document.querySelector("#changes-suggestion-use").disabled === false`);
+  assert.match(String(await evaluate(`document.querySelector("#changes-suggestion-text").textContent`)),
+    /Copilot edited files in edited\./);
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector("#decision-badge")).display`), "block");
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector("#changes-decision")).display`), "flex");
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "edited"`);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("a dismissed suggestion returns when Copilot's edits move to another repository", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeMessages: true, nativeHistory: { events: [] } });
+  const edited = await createTestRepository(path.join(server.projectsDirectory, "edited"), { "a.txt": "a\n", "b.txt": "b\n" });
+  const picked = await createTestRepository(path.join(server.projectsDirectory, "picked"), { "c.txt": "c\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "session-1"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "Choose a repository"`);
+  // The first repository fetch must finish before an edit, or that edit would be taken as the conversation's starting point.
+  await waitFor(`performance.getEntriesByType("resource").some((entry) => entry.name.endsWith("/api/sessions/session-1/repository"))`);
+
+  const editWith = async (filePath: string, clientPromptId: string) => {
+    const deadline = Date.now() + 5_000;
+    let response = await server.post("messages", { text: `edit-file:${filePath}`, clientPromptId });
+    while (response.status === 409 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      response = await server.post("messages", { text: `edit-file:${filePath}`, clientPromptId });
+    }
+    assert.equal(response.status, 200);
+  };
+  const refreshPanel = () => evaluate(`document.querySelector("#changes-refresh").click()`);
+  const suggestionHidden = () => evaluate(`document.querySelector("#changes-suggestion").hidden`);
+
+  await editWith(path.join(edited, "a.txt"), "dismiss-first");
+  await refreshPanel();
+  await waitFor(`!document.querySelector("#changes-suggestion").hidden`);
+  await evaluate(`document.querySelector("#changes-suggestion-dismiss").click()`);
+  await waitFor(`document.querySelector("#changes-suggestion").hidden === true`);
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector("#decision-badge")).display`), "none");
+
+  // Edits in the same repository are not a change of repository, so nothing is offered again.
+  await editWith(path.join(edited, "b.txt"), "dismiss-second");
+  await refreshPanel();
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  assert.equal(await suggestionHidden(), true);
+
+  // Edits that move to another repository offer it again.
+  await editWith(path.join(picked, "c.txt"), "dismiss-third");
+  await refreshPanel();
+  await waitFor(`!document.querySelector("#changes-suggestion").hidden`);
+  assert.match(String(await evaluate(`document.querySelector("#changes-suggestion-text").textContent`)),
+    /Copilot edited files in picked\./);
+  assert.equal((await server.requests()).some((request) => request.method === "session/load" && request.cwd === picked), false);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("the working-directory route reloads a conversation in a repository and refuses busy or invalid targets", {
+  skip: gitAvailable ? false : "git is not on PATH"
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeMessages: true, nativeHistory: { events: [] }, promptDelayMs: 1_000 });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "moved-app"), { "a.txt": "a\n" });
+  const plain = path.join(server.projectsDirectory, "plain-folder");
+  await mkdir(plain);
+  const move = (repository: string) => server.post("working-directory", { repository });
+
+  assert.equal((await move("moved-app")).status, 400);
+  assert.equal((await move(plain)).status, 403);
+  // A reply that ran before the switch does not block it once it has finished.
+  assert.equal((await server.post("messages", { text: `edit-file:${path.join(repo, "a.txt")}` })).status, 200);
+  assert.equal((await move(repo)).status, 200);
+
+  // A running reply blocks the switch until it finishes.
+  const busy = server.post("messages", { text: "busy turn" });
+  await server.waitForPrompt("busy turn");
+  assert.equal((await move(repo)).status, 409);
+  assert.equal((await busy).status, 200);
+
+  const moved = await move(repo);
+  assert.equal(moved.status, 200);
+  const body: unknown = await moved.json();
+  assert.ok(isRecord(body) && isRecord(body.session));
+  assert.equal(body.session.cwd, repo);
+  assert.equal((await server.requests()).filter((request) => request.method === "session/load" && request.cwd === repo).length, 1);
+
+  // The reloaded conversation keeps working.
+  assert.equal((await server.post("messages", { text: "after move" })).status, 200);
+  await server.waitForPrompt("after move");
+});
+
+test("a repository picked for a new conversation becomes its working directory and is not repeated in its messages", {
   skip: !existsSync(chromePath)
     ? "Chrome is not installed; set CHROME_BIN to run browser tests"
     : gitAvailable ? false : "git is not on PATH",
@@ -4878,7 +5169,7 @@ test("a repository picked for a new conversation travels with its first message 
     .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
   await waitFor(`document.querySelector("#changes-repository-label").textContent === "draft-app"`);
 
-  // The first message creates the conversation; the picked repository carries over to it.
+  // The first message creates the conversation in the picked repository; the choice carries over to it.
   await evaluate(`document.querySelector("#prompt-input").value = "draft first";
     document.querySelector("#composer").requestSubmit();`);
   await sentPromptTexts(server, 1);
@@ -4887,16 +5178,95 @@ test("a repository picked for a new conversation travels with its first message 
 
   await evaluate(`document.querySelector("#prompt-input").value = "draft second";
     document.querySelector("#composer").requestSubmit();`);
-  assert.deepEqual(await sentPromptTexts(server, 2), [
-    repositoryContextPrompt(repo, "draft first"),
-    repositoryContextPrompt(repo, "draft second")
-  ]);
+  assert.deepEqual(await sentPromptTexts(server, 2), ["draft first", "draft second"]);
+  assert.equal((await server.requests())
+    .filter((request) => request.method === "session/new" && request.cwd === repo).length, 1);
   await waitFor(`!document.querySelector("#prompt-input").disabled`);
-  assert.doesNotMatch(String(await evaluate(`document.querySelector("#messages").textContent`)), /Current repository/);
+  assert.doesNotMatch(String(await evaluate(`document.querySelector("#messages").textContent`)), /Your working directory changed/);
   assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
 });
 
-test("restored native history hides the repository line from user messages", {
+test("a repository picked for a new conversation stays its working directory when the context changes before the first message", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "context-app"), { "a.txt": "a\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      if (resource === "/api/sessions" && init?.method === "POST" && !window.creationHeld) {
+        window.creationHeld = true;
+        await new Promise((resolve) => { window.releaseCreation = resolve; });
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector("#new-chat").click()`);
+  await waitFor(`!document.querySelector("#prompt-input").disabled`);
+
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "context-app"`);
+
+  // The creation is held while the context changes, so the conversation is replaced before its first message is sent.
+  const prompt = "Question after a context change";
+  await evaluate(`document.querySelector("#prompt-input").value = ${JSON.stringify(prompt)};
+    document.querySelector("#composer").requestSubmit();`);
+  await waitFor(`typeof window.releaseCreation === "function"`);
+  await evaluate(`
+    const context = document.querySelector("#context-select");
+    context.value = "long_context";
+    context.dispatchEvent(new Event("change"));
+  `);
+  await evaluate(`window.releaseCreation()`);
+  assert.deepEqual(await sentPromptTexts(server, 1), [prompt]);
+  await waitFor(`document.querySelector("#messages")?.textContent.includes("Done.")`);
+  const creationCwds = (await server.requests())
+    .filter((request) => request.method === "session/new" && request.cwd === repo);
+  assert.equal(creationCwds.length, 2);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("the user name appears only in the browser title and sidebar title, not in Copilot's own messages", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] }, webUser: "Ankit" });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "branded-app"), { "a.txt": "a\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Working directory changed to")`);
+
+  assert.equal(await evaluate(`document.querySelector("#brand-name").textContent`), "Ankit's Copilot Web");
+  assert.equal(await evaluate(`document.title`), "Ankit's Copilot Web");
+  assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll("#messages article"))
+    .filter((article) => article.textContent.includes("Working directory changed to"))
+    .map((article) => article.querySelector(".message-label")?.textContent)`), ["Copilot"]);
+  assert.doesNotMatch(String(await evaluate(`document.querySelector("#messages").textContent`)), /Ankit/);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("restored native history hides the working-directory note from user messages", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 30_000
 }, async (t) => {
@@ -4905,7 +5275,7 @@ test("restored native history hides the repository line from user messages", {
     existingSession: true,
     nativeHistory: {
       events: [
-        nativeTranscriptEvent("user.message", "repo-user", repositoryContextPrompt(repository, "native question"), 0),
+        nativeTranscriptEvent("user.message", "repo-user", workingDirectoryNotePrompt(repository, "native question"), 0),
         nativeTranscriptEvent("assistant.message", "repo-assistant", "Native answer", 1)
       ]
     }
@@ -4917,7 +5287,130 @@ test("restored native history hides the repository line from user messages", {
     document.querySelector("#messages").textContent.includes("Native answer")`);
   const transcript = String(await evaluate(`document.querySelector("#messages").textContent`));
   assert.match(transcript, /native question/);
-  assert.doesNotMatch(transcript, /Current repository/);
+  assert.doesNotMatch(transcript, /Your working directory changed/);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("refreshing on a new conversation keeps the new conversation instead of reopening the previous one", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`localStorage.getItem("copilot-web-active-session") === "session-1"`);
+
+  await evaluate(`document.querySelector("#new-chat").click()`);
+  await waitFor(`localStorage.getItem("copilot-web-active-session") === null && !document.querySelector("#prompt-input").disabled`);
+
+  await evaluate(`location.reload()`);
+  await waitFor(`document.querySelector("#messages")?.getAttribute("aria-busy") === "false"`);
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  assert.equal(await evaluate(`localStorage.getItem("copilot-web-active-session")`), null);
+  assert.equal(await evaluate(`Boolean(document.querySelector(".session-item.active"))`), false);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("refreshing after a working-directory switch and New conversation keeps the new conversation", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "reload-app"), { "a.txt": "a\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`localStorage.getItem("copilot-web-active-session") === "session-1"`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Working directory changed to")`);
+
+  await evaluate(`document.querySelector("#new-chat").click()`);
+  await waitFor(`localStorage.getItem("copilot-web-active-session") === null && !document.querySelector("#prompt-input").disabled`);
+
+  await evaluate(`location.reload()`);
+  await waitFor(`document.querySelector("#messages")?.getAttribute("aria-busy") === "false"`);
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  assert.equal(await evaluate(`localStorage.getItem("copilot-web-active-session")`), null);
+  assert.equal(await evaluate(`Boolean(document.querySelector(".session-item.active"))`), false);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("refreshing after sending in a new conversation and starting another keeps the new composer", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 40_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+
+  await evaluate(`document.querySelector("#new-chat").click()`);
+
+  await waitFor(`!document.querySelector("#prompt-input").disabled`);
+
+  await evaluate(`document.querySelector("#prompt-input").value = "first in new conversation";
+    document.querySelector("#composer").requestSubmit();`);
+
+  await waitFor(`document.querySelector("#messages").textContent.includes("Done.")`);
+
+  await waitFor(`!document.querySelector("#prompt-input").disabled`);
+  const created = await evaluate(`localStorage.getItem("copilot-web-active-session")`);
+
+  assert.ok(typeof created === "string" && created.length > 0);
+
+
+  await evaluate(`document.querySelector("#new-chat").click()`);
+
+  await waitFor(`localStorage.getItem("copilot-web-active-session") === null && !document.querySelector("#prompt-input").disabled`);
+
+
+  await evaluate(`location.reload()`);
+
+  await waitFor(`document.querySelector("#messages")?.getAttribute("aria-busy") === "false"`);
+
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+
+  assert.equal(await evaluate(`localStorage.getItem("copilot-web-active-session")`), null);
+
+  assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes("first in new conversation")`), false);
+
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("clicking New while a reply runs in another conversation keeps the new composer after refresh", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 40_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] }, promptDelayMs: 1_500 });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`localStorage.getItem("copilot-web-active-session") === "session-1"`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+
+  await evaluate(`document.querySelector("#prompt-input").value = "question while new is clicked";
+    document.querySelector("#composer").requestSubmit();`);
+  await server.waitForPrompt("question while new is clicked");
+  await evaluate(`document.querySelector("#new-chat").click()`);
+  await waitFor(`localStorage.getItem("copilot-web-active-session") === null && !document.querySelector("#prompt-input").disabled`);
+  await new Promise((resolve) => setTimeout(resolve, 3_000));
+
+  await evaluate(`location.reload()`);
+  await waitFor(`document.querySelector("#messages")?.getAttribute("aria-busy") === "false"`);
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  assert.equal(await evaluate(`localStorage.getItem("copilot-web-active-session")`), null);
+  assert.equal(await evaluate(`Boolean(document.querySelector(".session-item.active"))`), false);
   assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
 });
 

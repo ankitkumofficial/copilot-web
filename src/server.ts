@@ -1245,7 +1245,6 @@ async function main(): Promise<void> {
     command: copilotCommand,
     cwd: projectsDirectory,
     clientVersion: applicationVersion,
-    clientTitle: branding.brandName,
     allowAll,
     preferencesPath: sessionPreferencesPath
   });
@@ -2518,16 +2517,20 @@ async function main(): Promise<void> {
             fallbackConfigIds.delete(configId);
           }
         }
+        // A repository chosen before the first message becomes the conversation's working directory.
+        const directory = body.repository === undefined || body.repository === null
+          ? projectsDirectory
+          : await resolveAllowedRepository(typeof body.repository === "string" ? body.repository : null);
         const createdAt = new Date().toISOString();
         const setup = await acp.newSession(
-          projectsDirectory,
+          directory,
           context,
           Object.keys(configOverrides).length > 0 ? configOverrides : undefined,
           fallbackConfigIds
         );
         const session: SessionInfo = {
           sessionId: setup.sessionId,
-          cwd: projectsDirectory,
+          cwd: directory,
           title: "New conversation",
           updatedAt: createdAt
         };
@@ -3307,6 +3310,31 @@ async function main(): Promise<void> {
       return true;
     }
 
+    if (request.method === "POST" && subroute === "working-directory") {
+      if (busySessions.has(sessionId)) {
+        throw new HttpError(409, "Conversation is currently processing a prompt");
+      }
+      const body = await readJsonBody(request);
+      const directory = await resolveAllowedRepository(
+        typeof body.repository === "string" ? body.repository : null
+      );
+      if (directory !== session.cwd) {
+        const current = session;
+        session = await withSessionOperation(sessionId, async () => {
+          if (busySessions.has(sessionId)) {
+            throw new HttpError(409, "Conversation is currently processing a prompt");
+          }
+          await acp.changeSessionDirectory(current, directory);
+          const moved: SessionInfo = { ...current, cwd: directory };
+          sessionCache.set(sessionId, moved);
+          return moved;
+        });
+      }
+      ensureSessionAvailable(sessionId);
+      jsonResponse(response, 200, { session });
+      return true;
+    }
+
     if (request.method === "POST" && subroute === "permissions") {
       const body = await readJsonBody(request);
       const requestId = body.requestId;
@@ -3404,7 +3432,7 @@ async function main(): Promise<void> {
   heartbeat.unref();
 
   const shutdown = async (signal: string): Promise<void> => {
-    console.log(`\nReceived ${signal}; stopping ${branding.brandName}`);
+    console.log(`\nReceived ${signal}; stopping ${defaultBrandName}`);
     clearInterval(heartbeat);
     for (const client of sseClients) {
       client.response.end();
@@ -3442,7 +3470,7 @@ async function main(): Promise<void> {
     server.listen(port, "127.0.0.1", () => resolve());
   });
 
-  console.log(`${branding.brandName} is running at http://127.0.0.1:${port}`);
+  console.log(`${defaultBrandName} is running at http://127.0.0.1:${port}`);
   console.log(`New conversations start in ${projectsDirectory}`);
   console.log(`Available context tiers: ${contextTiers.join(", ")}`);
   console.log(`Copilot allow-all permissions: ${allowAll ? "enabled" : "disabled"}`);
