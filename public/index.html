@@ -311,7 +311,8 @@
               </div>
             </div>
             <div class="repository-tabs" role="tablist" aria-label="Repository views">
-              <button id="repository-tab-changes" class="repository-tab" type="button" role="tab" aria-selected="true" aria-controls="changes-tabpanel">Changes</button>
+              <button id="repository-tab-current-changes" class="repository-tab" type="button" role="tab" aria-selected="false" aria-controls="changes-tabpanel" tabindex="-1">Current changes</button>
+              <button id="repository-tab-changes" class="repository-tab" type="button" role="tab" aria-selected="true" aria-controls="changes-tabpanel">All changes</button>
               <button id="repository-tab-terminal" class="repository-tab" type="button" role="tab" aria-selected="false" aria-controls="terminal-tabpanel" tabindex="-1" hidden>Terminal</button>
             </div>
             <div id="changes-tabpanel" class="repository-tabpanel changes-tabpanel" role="tabpanel" aria-labelledby="repository-tab-changes">
@@ -359,6 +360,10 @@
             </section>
             </div>
             <section id="terminal-tabpanel" class="repository-tabpanel terminal-tabpanel" role="tabpanel" aria-labelledby="repository-tab-terminal" hidden>
+              <div id="terminal-empty" class="terminal-empty">
+                <p id="terminal-empty-text"></p>
+                <button id="terminal-empty-action" class="secondary-button" type="button" hidden>Open terminal</button>
+              </div>
               <div class="terminal-toolbar">
                 <div id="terminal-tabs" class="terminal-tabs" role="tablist" aria-label="Terminals in this repository"></div>
                 <button id="terminal-new" class="changes-icon-button" type="button" aria-label="New terminal in this repository" title="New terminal in this repository" disabled>
@@ -367,10 +372,6 @@
               </div>
               <p id="terminal-notice" class="terminal-notice" role="status" aria-live="polite" hidden></p>
               <div id="terminal-screen" class="terminal-screen" hidden></div>
-              <div id="terminal-empty" class="terminal-empty">
-                <p id="terminal-empty-text"></p>
-                <button id="terminal-empty-action" class="secondary-button" type="button" hidden>Open terminal</button>
-              </div>
               <div id="terminal-footer" class="terminal-footer" hidden>
                 <span id="terminal-footer-status"></span>
                 <button id="terminal-restart" class="changes-action" type="button">Restart</button>

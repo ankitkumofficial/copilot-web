@@ -1408,6 +1408,33 @@ async function main(): Promise<void> {
     return root ?? null;
   };
 
+  // Files the conversation has edited, relative to the repository, for the Current changes view.
+  const conversationFilesIn = async (sessionId: string, repo: string): Promise<Set<string>> => {
+    const state = fileEditsFor(sessionId);
+    await state.replayed;
+    const files = new Set<string>();
+    for (const filePath of state.edits.allFiles()) {
+      // The repository root is resolved, so resolve the edited path's directory the same way (/var is /private/var on macOS).
+      const directory = await realpath(path.dirname(filePath)).catch(() => path.dirname(filePath));
+      const relative = path.relative(repo, path.join(directory, path.basename(filePath)));
+      if (relative && !path.isAbsolute(relative) && relative.split(path.sep)[0] !== "..") {
+        files.add(relative.split(path.sep).join("/"));
+      }
+    }
+    return files;
+  };
+
+  // Without a conversation, the request covers every changed file in the repository.
+  const conversationScope = async (sessionId: unknown, repo: string): Promise<Set<string> | undefined> => {
+    if (sessionId === undefined || sessionId === null || sessionId === "") {
+      return undefined;
+    }
+    if (typeof sessionId !== "string" || !validSessionId(sessionId)) {
+      throw new HttpError(400, "Session identifier is invalid", "invalid_session");
+    }
+    return conversationFilesIn(sessionId, repo);
+  };
+
   const readSessionRepository = async (session: SessionInfo): Promise<JsonObject> => {
     const root = session.cwd ? await cachedToplevel(session.cwd) : undefined;
     if (root) {
@@ -2570,7 +2597,8 @@ async function main(): Promise<void> {
 
     if (request.method === "GET" && requestUrl.pathname === "/api/git/status") {
       const repo = await resolveAllowedRepository(requestUrl.searchParams.get("repo"));
-      jsonResponse(response, 200, await readStatus(repo));
+      const scope = await conversationScope(requestUrl.searchParams.get("sessionId"), repo);
+      jsonResponse(response, 200, await readStatus(repo, scope));
       return true;
     }
 
@@ -2603,8 +2631,9 @@ async function main(): Promise<void> {
         throw new HttpError(400, "Action must be stage or unstage", "invalid_action");
       }
       const action = body.action;
+      const scope = await conversationScope(body.sessionId, repo);
       await gitIndexWrites.enqueue(() => setChangeStaged(repo, filePath, action));
-      jsonResponse(response, 200, await computeStatus(repo));
+      jsonResponse(response, 200, await computeStatus(repo, scope));
       return true;
     }
 
@@ -2612,8 +2641,9 @@ async function main(): Promise<void> {
       const body = await readJsonBody(request);
       const repo = await resolveAllowedRepository(typeof body.repo === "string" ? body.repo : null);
       const filePath = await validateRelativePath(repo, body.path);
+      const scope = await conversationScope(body.sessionId, repo);
       await gitIndexWrites.enqueue(() => resetChangedFile(repo, filePath));
-      jsonResponse(response, 200, await computeStatus(repo));
+      jsonResponse(response, 200, await computeStatus(repo, scope));
       return true;
     }
 

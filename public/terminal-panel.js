@@ -478,6 +478,8 @@ export function initTerminalPanel({ api }) {
     const terminals = rootTerminals();
     const active = terminals.find((terminal) => terminal.id === s.activeId) ?? null;
     el.newButton.disabled = !root || s.creating;
+    // With no terminal open, the empty state's Open terminal button is the way to start one.
+    el.newButton.hidden = terminals.length === 0;
     el.tabs.replaceChildren(...terminals.map(tabFor));
     el.screen.hidden = !active;
     el.empty.hidden = Boolean(active);

@@ -179,14 +179,21 @@ remote service.
 - Collapse or expand the conversation sidebar; its state is remembered in the
   browser.
 - Open an interactive terminal for the selected repository from
-  **More actions** → **Terminal**, next to the Repository panel's **Changes**
-  tab; see [Interactive terminal](#interactive-terminal).
+  **More actions** → **Terminal**, next to the Repository panel's tabs; see
+  [Interactive terminal](#interactive-terminal).
 - Review uncommitted changes in the **Repository** panel (**More actions** (⋯)
-  menu in the message bar, or `Ctrl+Shift+G`). Staged and unstaged files are
+  menu in the message bar, or `Ctrl+Shift+G`). **All changes** lists every
+  uncommitted file in the repository. **Current changes** lists only the files
+  this conversation has edited with `edit`, `create`, or `apply_patch`; changes
+  made by shell commands are not included. Its list is read from the
+  conversation's history, so it survives server restarts and resumed
+  conversations. If Copilot's history is unavailable, it covers only edits seen
+  since the server started. Staged and unstaged files are
   listed in separate sections; a file with both kinds of change appears in each.
   Stage or unstage a file with its row button, the diff's **Stage** or
-  **Unstage** button, or `S` on the highlighted row. An unstaged file's row also
-  has a **Reset** button: after confirmation it discards that file's unstaged
+  **Unstage** button, or `S` on the highlighted row. After staging, the diff
+  moves to the first unstaged file, or closes when none is left. An unstaged
+  file's row also has a **Reset** button: after confirmation it discards that file's unstaged
   changes, or deletes the file if Git doesn't track it yet. The panel shows status,
   line counts, renames, and renders unified diffs with line numbers. It offers
   **Ask Copilot** (inserts a reference into the message without sending),
@@ -413,7 +420,7 @@ The terminal is on by default; `npm start` is all it needs. Choose
 **More actions** → **Terminal** to open a shell in the selected repository, or
 in your projects folder when none is selected. Nothing starts until you choose
 it: selecting a repository never starts a terminal. **More actions** →
-**Repository** shows the Changes view. Each terminal is a real login shell
+**Repository** shows the changes view you last used. Each terminal is a real login shell
 (`$SHELL -l`) with a PTY, so
 `mvn`, `git add -p`, `vim`, `Ctrl+C`, and job control behave as in Terminal.app.
 Reloading the page restores the screen of a running terminal.

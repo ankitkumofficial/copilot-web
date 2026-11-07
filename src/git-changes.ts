@@ -290,6 +290,8 @@ export interface RepositoryStatus {
   behind: number;
   files: ChangedFile[];
   totals: { files: number; additions: number; deletions: number };
+  // The whole repository's file count, even when files is limited to a scope, so badges stay repository-wide.
+  repositoryTotals: { files: number; truncated: boolean };
   truncated: boolean;
 }
 
@@ -561,8 +563,13 @@ async function readParsedStatus(repo: string, pathspec: readonly string[] = []):
   return parsePorcelainStatus(statusResult.stdout.toString("utf8"));
 }
 
-export async function computeStatus(repo: string): Promise<RepositoryStatus> {
+export async function computeStatus(repo: string, scope?: ReadonlySet<string>): Promise<RepositoryStatus> {
   const parsed = await readParsedStatus(repo);
+  const repositoryFiles = new Set(parsed.files.map((file) => file.path)).size;
+  if (scope) {
+    // A rename stays listed when either of its paths is in scope, so a moved file's source is not lost.
+    parsed.files = parsed.files.filter((file) => scope.has(file.path) || (file.oldPath !== null && scope.has(file.oldPath)));
+  }
   const hasCommits = parsed.oid !== null && parsed.oid !== "(initial)";
   const base = hasCommits ? "HEAD" : emptyTreeObject;
   const staged = parsed.files.filter((file) => file.section === "staged");
@@ -609,13 +616,17 @@ export async function computeStatus(repo: string): Promise<RepositoryStatus> {
     behind: parsed.behind,
     files: parsed.files,
     totals,
+    repositoryTotals: { files: repositoryFiles, truncated: parsed.truncated },
     truncated: parsed.truncated
   };
 }
 
 const inFlightStatus = new Map<string, Promise<RepositoryStatus>>();
 
-export function readStatus(repo: string): Promise<RepositoryStatus> {
+export function readStatus(repo: string, scope?: ReadonlySet<string>): Promise<RepositoryStatus> {
+  if (scope) {
+    return computeStatus(repo, scope);
+  }
   const existing = inFlightStatus.get(repo);
   if (existing) {
     return existing;

@@ -64,6 +64,8 @@ export function observeToolUpdate(edits: RecentFileEdits, update: JsonObject): v
 export class RecentFileEdits {
   // Insertion order is recency: a file moves to the end each time a successful edit touches it.
   private readonly files = new Set<string>();
+  // Every edited file, without the recency cap, so the Current changes view lists a whole conversation.
+  private readonly editedFiles = new Set<string>();
   private readonly pendingFiles = new Map<string, string[]>();
   private readonly countedCalls = new Set<string>();
 
@@ -107,7 +109,12 @@ export class RecentFileEdits {
     return [...this.files].reverse();
   }
 
+  public allFiles(): string[] {
+    return [...this.editedFiles];
+  }
+
   private touch(filePath: string): void {
+    this.editedFiles.add(filePath);
     this.files.delete(filePath);
     this.files.add(filePath);
     if (this.files.size > maximumRecentFileEdits) {
