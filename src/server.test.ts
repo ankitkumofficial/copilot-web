@@ -1599,6 +1599,74 @@ test("updates empty-session IDs through the API and preserves metadata and selec
   assert.equal((await server.requests()).some((request) => request.method === "session/load"), false);
 });
 
+test("archives and restores conversations through the API and persists the archive", async (t) => {
+  const server = await startTestServer(t, { existingSession: true });
+  const listedSession = async () => {
+    const response = await fetch(`${server.baseUrl}/api/sessions`, { headers: server.headers });
+    const list: unknown = await response.json();
+    assert.ok(isRecord(list) && Array.isArray(list.sessions));
+    const session = list.sessions.filter(isRecord).find((item) => item.sessionId === server.sessionId);
+    assert.ok(session);
+    return session;
+  };
+
+  const archiveResponse = await server.post("archive", {});
+  assert.equal(archiveResponse.status, 200);
+  const archived: unknown = await archiveResponse.json();
+  assert.ok(isRecord(archived) && typeof archived.archivedAt === "string");
+  assert.deepEqual(await server.metadata("session-archive.json"), {
+    [server.sessionId]: archived.archivedAt
+  });
+  assert.equal((await listedSession()).archivedAt, archived.archivedAt);
+
+  const repeated: unknown = await (await server.post("archive", {})).json();
+  assert.ok(isRecord(repeated));
+  assert.equal(repeated.archivedAt, archived.archivedAt);
+
+  const restoreResponse = await server.post("restore", {});
+  assert.equal(restoreResponse.status, 200);
+  assert.deepEqual(await restoreResponse.json(), { sessionId: server.sessionId, archivedAt: null });
+  assert.deepEqual(await server.metadata("session-archive.json"), {});
+  assert.equal((await listedSession()).archivedAt, undefined);
+  assert.equal((await server.post("restore", {})).status, 200);
+});
+
+test("refuses to archive a conversation while it processes a prompt", async (t) => {
+  const server = await startTestServer(t, { profileSessions: true, promptDelayMs: 1_000 });
+  const working = server.post("messages", { text: "working" });
+  await server.waitForPrompt("working");
+
+  const response = await server.post("archive", {});
+  assert.equal(response.status, 409);
+  assert.equal(await server.metadata("session-archive.json").catch(() => undefined), undefined);
+  assert.equal((await working).status, 200);
+});
+
+test("keeps archived state with replaced empty conversations and forgets it when deleted", async (t) => {
+  const server = await startTestServer(t, { profileSessions: true, nativeSessionDelete: true });
+  const archiveResponse = await server.post("archive", {});
+  assert.equal(archiveResponse.status, 200);
+  const archived: unknown = await archiveResponse.json();
+  assert.ok(isRecord(archived) && typeof archived.archivedAt === "string");
+
+  const configuredResponse = await server.post("config", { configId: "model", value: "claude-opus-5.5" });
+  assert.equal(configuredResponse.status, 200);
+   const configured: unknown = await configuredResponse.json();
+   assert.ok(isRecord(configured) && isRecord(configured.session));
+   const replacementId = String(configured.session.sessionId);
+  assert.notEqual(replacementId, server.sessionId);
+  assert.deepEqual(await server.metadata("session-archive.json"), {
+    [replacementId]: archived.archivedAt
+  });
+
+  const deleteResponse = await fetch(`${server.baseUrl}/api/sessions/${replacementId}`, {
+    method: "DELETE",
+    headers: server.headers
+  });
+  assert.equal(deleteResponse.status, 200);
+  assert.deepEqual(await server.metadata("session-archive.json"), {});
+});
+
 test("reloads a conversation with its own persisted context unless a context is requested", async (t) => {
   const server = await startTestServer(t, { profileSessions: true, context: "long_context" });
   assert.equal((await server.post("config", { configId: "reasoning_effort", value: "medium" })).status, 200);
@@ -2877,7 +2945,8 @@ async function startTestBrowser(t: TestContext, baseUrl: string, preloadScript?:
     return isRecord(result.result) ? result.result.value : undefined;
   };
   const waitFor = async (expression: string): Promise<void> => {
-    const deadline = Date.now() + 5_000;
+    // Full-suite runs share CPU with parallel test files; 5s was too tight for slow browser updates.
+    const deadline = Date.now() + 10_000;
     while (await evaluate(expression) !== true) {
       if (Date.now() >= deadline) {
         const details = await evaluate(`({
@@ -3141,6 +3210,43 @@ test("deletes conversations in the background while navigating and sending new p
     assert.equal(await evaluate(`document.querySelector(".session-item.active").dataset.sessionId`), activeId);
     assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes("New prompt 2")`), true);
   }
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+});
+
+test("archives conversations behind a confirmation and restores them from the collapsed Archived section", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  const originalRow = `document.querySelector('.session-item[data-session-id="session-1"]').closest(".session-item-row")`;
+  await waitFor(`Boolean(document.querySelector('.session-item[data-session-id="session-1"]'))`);
+
+  await evaluate(`${originalRow}.querySelector(".session-archive").click()`);
+  await waitFor(`document.querySelector("#archive-dialog").open`);
+  await evaluate(`document.querySelector("#archive-dialog").close("cancel")`);
+  await waitFor(`!document.querySelector("#archive-dialog").open`);
+  assert.equal(await evaluate(`document.querySelector(".session-archive-section") === null`), true);
+  assert.equal(await server.metadata("session-archive.json").catch(() => undefined), undefined);
+
+  await evaluate(`${originalRow}.querySelector(".session-archive").click()`);
+  await waitFor(`document.querySelector("#archive-dialog").open`);
+  await evaluate(`document.querySelector("#archive-confirm").click()`);
+  await waitFor(`Boolean(document.querySelector(".session-archive-toggle"))`);
+  const archive = await server.metadata("session-archive.json");
+  assert.ok(isRecord(archive) && typeof archive["session-1"] === "string");
+  assert.equal(await evaluate(`document.querySelector('.session-item[data-session-id="session-1"]') === null`), true);
+  assert.equal(await evaluate(`document.querySelector(".session-archive-toggle").getAttribute("aria-expanded")`), "false");
+  assert.equal(await evaluate(`document.querySelector("#session-archive-list").hidden`), true);
+  assert.equal(await evaluate(`document.querySelector(".session-archive-count").textContent`), "1");
+
+  await evaluate(`document.querySelector(".session-archive-toggle").click()`);
+  await waitFor(`Boolean(document.querySelector('#session-archive-list .session-item[data-session-id="session-1"]'))`);
+  assert.equal(await evaluate(`document.querySelector("#session-archive-list").hidden`), false);
+  assert.equal(await evaluate(`document.activeElement.classList.contains("session-archive-toggle")`), true);
+  await evaluate(`document.querySelector("#session-archive-list .session-restore").click()`);
+  await waitFor(`!document.querySelector(".session-archive-section")`);
+  await waitFor(`Boolean(document.querySelector('.session-item[data-session-id="session-1"]'))`);
   assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
 });
 

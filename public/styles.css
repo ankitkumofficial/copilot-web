@@ -405,6 +405,11 @@ button:disabled {
   right: 30px;
 }
 
+.session-archive,
+.session-restore {
+  right: 56px;
+}
+
 .session-delete {
   right: 4px;
 }
@@ -430,14 +435,16 @@ button:disabled {
 }
 
 .session-item-row.has-actions:is(:hover, :focus-within) .session-item {
-  padding-right: 60px;
+  padding-right: 88px;
 }
 
 .session-item-row.has-actions:is(:hover, :focus-within) .session-meta {
   display: none;
 }
 
-.session-rename:hover:not(:disabled) {
+.session-rename:hover:not(:disabled),
+.session-archive:hover:not(:disabled),
+.session-restore:hover:not(:disabled) {
   border-color: rgba(139, 124, 255, 0.35);
   background: rgba(139, 124, 255, 0.1);
   color: var(--accent-strong);
@@ -520,6 +527,54 @@ button:disabled {
   color: var(--muted);
   font-size: 0.82rem;
   line-height: 1.5;
+}
+
+.session-archive-section {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.session-archive-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-align: left;
+}
+
+.session-archive-toggle:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.session-archive-chevron {
+  display: inline-block;
+  width: 10px;
+  transition: transform 140ms ease;
+}
+
+.session-archive-toggle[aria-expanded="true"] .session-archive-chevron {
+  transform: rotate(90deg);
+}
+
+.session-archive-count {
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  font-size: 0.7rem;
+}
+
+.session-archive-list[hidden] {
+  display: none;
 }
 
 .sidebar-footer {

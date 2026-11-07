@@ -200,6 +200,7 @@ interface GitHubQuota {
 
 type SessionTitleOverrides = Map<string, string>;
 type SessionActivityCache = Map<string, string>;
+type SessionArchive = Map<string, string>;
 
 class HttpError extends Error {
   public readonly status: number;
@@ -841,6 +842,42 @@ async function saveSessionActivity(
   await rename(temporaryPath, filePath);
 }
 
+async function loadSessionArchive(filePath: string): Promise<SessionArchive> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(filePath, "utf8")) as unknown;
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") {
+      return new Map();
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to read session archive at ${filePath}: ${message}`);
+  }
+  if (!isRecord(parsed)) {
+    throw new Error(`Session archive at ${filePath} is not a JSON object`);
+  }
+
+  const archive: SessionArchive = new Map();
+  for (const [sessionId, value] of Object.entries(parsed)) {
+    if (!validSessionId(sessionId)) {
+      throw new Error(`Session archive at ${filePath} contains an invalid session id`);
+    }
+    archive.set(
+      sessionId,
+      parsePersistedSessionActivity(value, filePath, sessionId)
+    );
+  }
+  return archive;
+}
+
+async function saveSessionArchive(filePath: string, archive: SessionArchive): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const serialized = JSON.stringify(Object.fromEntries(archive), null, 2) + "\n";
+  const temporaryPath = `${filePath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  await writeFile(temporaryPath, serialized, "utf8");
+  await rename(temporaryPath, filePath);
+}
+
 function parseOptionalPromptId(value: unknown, fieldName: string): string | undefined {
   if (value === undefined) {
     return undefined;
@@ -1229,6 +1266,11 @@ async function main(): Promise<void> {
     ".copilot-web",
     "session-activity.json"
   );
+  const sessionArchivePath = path.join(
+    os.homedir(),
+    ".copilot-web",
+    "session-archive.json"
+  );
   const sessionPreferencesPath = path.join(
     os.homedir(),
     ".copilot-web",
@@ -1237,6 +1279,7 @@ async function main(): Promise<void> {
   const sessionTitleOverrides = await loadSessionTitleOverrides(sessionTitlesPath);
   const sessionUsageCache = await loadSessionUsage(sessionUsagePath);
   const sessionActivityCache = await loadSessionActivity(sessionActivityPath);
+  const sessionArchive = await loadSessionArchive(sessionArchivePath);
   const attachmentStore = new AttachmentStore(
     path.join(os.homedir(), ".copilot-web", "attachments")
   );
@@ -1280,6 +1323,7 @@ async function main(): Promise<void> {
   const sessionTitleWrites = new SerialTaskQueue();
   const sessionUsageWrites = new SerialTaskQueue();
   const sessionActivityWrites = new SerialTaskQueue();
+  const sessionArchiveWrites = new SerialTaskQueue();
   const gitIndexWrites = new SerialTaskQueue();
   const replayingSessions = new Map<string, JsonObject[]>();
   const fallbackReplayTails = new Map<string, JsonObject[]>();
@@ -1852,6 +1896,24 @@ async function main(): Promise<void> {
     });
   };
 
+  const persistSessionArchive = (
+    sessionId: string,
+    archivedAt: string | undefined
+  ): Promise<void> => sessionArchiveWrites.enqueue(async () => {
+    const snapshot = new Map(sessionArchive);
+    if (archivedAt === undefined) {
+      snapshot.delete(sessionId);
+    } else {
+      snapshot.set(sessionId, archivedAt);
+    }
+    await saveSessionArchive(sessionArchivePath, snapshot);
+    if (archivedAt === undefined) {
+      sessionArchive.delete(sessionId);
+    } else {
+      sessionArchive.set(sessionId, archivedAt);
+    }
+  });
+
   const persistSessionTitleOverride = (
     sessionId: string,
     title: string | undefined,
@@ -2047,9 +2109,21 @@ async function main(): Promise<void> {
         sessionTitleOverrides.set(setup.sessionId, title);
       }
     });
-    const labels = ["session titles", "session usage", "session activity"];
+    const archiveSave = sessionArchiveWrites.enqueue(async () => {
+      const snapshot = new Map(sessionArchive);
+      const archivedAt = snapshot.get(previousSessionId);
+      if (archivedAt === undefined) {
+        return;
+      }
+      snapshot.delete(previousSessionId);
+      snapshot.set(setup.sessionId, archivedAt);
+      await saveSessionArchive(sessionArchivePath, snapshot);
+      sessionArchive.delete(previousSessionId);
+      sessionArchive.set(setup.sessionId, archivedAt);
+    });
+    const labels = ["session titles", "session usage", "session activity", "session archive"];
     const saved = await Promise.allSettled([
-      titleSave, queueSessionUsageSave(), queueSessionActivitySave()
+      titleSave, queueSessionUsageSave(), queueSessionActivitySave(), archiveSave
     ]);
     const persistenceWarnings: string[] = [];
     saved.forEach((result, index) => {
@@ -2499,9 +2573,11 @@ async function main(): Promise<void> {
             const busyPrompt = busySessions.get(session.sessionId);
             const lastActivityAt = sessionActivityCache.get(session.sessionId) ??
               cachedSession.updatedAt;
+            const archivedAt = sessionArchive.get(session.sessionId);
             return {
               ...cachedSession,
               ...(lastActivityAt ? { lastActivityAt } : {}),
+              ...(archivedAt ? { archivedAt } : {}),
               ...(context ? { context } : {}),
               busy: busyPrompt !== undefined,
               ...(busyPrompt ? { promptId: busyPrompt.promptId } : {})
@@ -2719,12 +2795,13 @@ async function main(): Promise<void> {
         sessionActivityCache.delete(sessionId);
         sessionUsageCache.delete(sessionId);
 
-        const cleanupLabels = ["session usage", "session activity", "custom titles", "attachments"];
+        const cleanupLabels = ["session usage", "session activity", "custom titles", "attachments", "session archive"];
         const cleanupResults = await Promise.allSettled([
           queueSessionUsageSave(),
           queueSessionActivitySave(),
           persistSessionTitleOverride(sessionId, undefined, false, true),
-          attachmentStore.deleteSession(sessionId)
+          attachmentStore.deleteSession(sessionId),
+          persistSessionArchive(sessionId, undefined)
         ]);
         const persistenceWarnings: string[] = [];
         cleanupResults.forEach((result, index) => {
@@ -2749,6 +2826,19 @@ async function main(): Promise<void> {
       } finally {
         deletingSessions.delete(sessionId);
       }
+    }
+
+    if (request.method === "POST" && (subroute === "archive" || subroute === "restore")) {
+      if (subroute === "archive" && busySessions.has(sessionId)) {
+        throw new HttpError(409, "Cannot archive a conversation while it is processing a prompt");
+      }
+      const archivedAt = subroute === "archive"
+        ? sessionArchive.get(sessionId) ?? new Date().toISOString()
+        : undefined;
+      await withSessionOperation(sessionId, () => persistSessionArchive(sessionId, archivedAt));
+      publish("session-archive-updated", { sessionId, archivedAt: archivedAt ?? null }, sessionId);
+      jsonResponse(response, 200, { sessionId, archivedAt: archivedAt ?? null });
+      return true;
     }
 
     if (request.method === "POST" && subroute === "title") {
