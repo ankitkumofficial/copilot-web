@@ -402,12 +402,12 @@ button:disabled {
 }
 
 .session-rename {
-  right: 30px;
+  right: 56px;
 }
 
 .session-archive,
 .session-restore {
-  right: 56px;
+  right: 30px;
 }
 
 .session-delete {
