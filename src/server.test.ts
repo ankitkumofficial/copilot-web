@@ -868,6 +868,8 @@ async function startTestServer(t: TestContext, options: {
   loadDelayMs?: number;
   failRecoveryLoads?: boolean;
   profileSessions?: boolean;
+  // Starts a restarted server on an earlier server's directory, keeping its home and projects.
+  reuseDirectory?: string;
   promptDelayMs?: number;
   reloadDelayMs?: number;
   historyText?: string;
@@ -892,7 +894,7 @@ async function startTestServer(t: TestContext, options: {
   };
   terminalMaximum?: number;
 } = {}) {
-  const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-server-reconnect-test-"));
+  const directory = options.reuseDirectory ?? await mkdtemp(path.join(tmpdir(), "copilot-web-server-reconnect-test-"));
   const home = path.join(directory, "home");
   const projects = path.join(directory, "projects");
   const copilotHome = path.join(home, ".copilot");
@@ -901,9 +903,9 @@ async function startTestServer(t: TestContext, options: {
   const fakeGitHubCommand = path.join(directory, "gh-fake");
   const githubCliLogPath = path.join(projects, "gh-requests.log");
   const port = await unusedPort();
-  await mkdir(home);
-  await mkdir(projects);
-  await mkdir(copilotHome);
+  await mkdir(home, { recursive: true });
+  await mkdir(projects, { recursive: true });
+  await mkdir(copilotHome, { recursive: true });
   if (options.sessionActivity) {
     await mkdir(path.join(home, ".copilot-web"));
     await writeFile(path.join(home, ".copilot-web", "session-activity.json"),
@@ -914,7 +916,7 @@ async function startTestServer(t: TestContext, options: {
   await writeFile(fakeGitHubCommand, fakeGitHubCli);
   await chmod(fakeGitHubCommand, 0o700);
   if (options.nativeHistory) {
-    await mkdir(copilotSdk);
+    await mkdir(copilotSdk, { recursive: true });
     await writeFile(path.join(copilotSdk, "package.json"), JSON.stringify({ type: "module" }));
     await writeFile(path.join(copilotSdk, "index.js"), fakeCopilotSdk);
     await writeFile(
@@ -1021,6 +1023,7 @@ async function startTestServer(t: TestContext, options: {
   return {
     baseUrl,
     headers,
+    directory,
     projectsDirectory: projects,
     sessionId,
     createSession,
@@ -1354,10 +1357,10 @@ test("session repository resolves the conversation's working-tree root once it i
   const readRepository = async () => (await fetch(repositoryUrl, { headers: server.headers })).json();
 
   // The fixture conversation runs in the projects directory, which is not a repository yet.
-  assert.deepEqual(await readRepository(), { root: null, name: null, editedRoot: null });
+  assert.deepEqual(await readRepository(), { root: null, name: null, editedRoot: null, record: null });
   testGit(server.projectsDirectory, "init", "-q");
   const root = await realpath(server.projectsDirectory);
-  assert.deepEqual(await readRepository(), { root, name: path.basename(root), editedRoot: null });
+  assert.deepEqual(await readRepository(), { root, name: path.basename(root), editedRoot: null, record: null });
   const status = await fetch(`${server.baseUrl}/api/git/status?repo=${encodeURIComponent(root)}`, { headers: server.headers });
   assert.equal(status.status, 200);
   assert.equal((await status.json() as JsonObject).hasCommits, false);
@@ -1399,7 +1402,7 @@ test("session repository follows the newest successful edit inside a repository 
 
   // The newest successful edit inside a repository wins; the failed edit and the scratch file outside repositories are skipped.
   const response = await fetch(`${server.baseUrl}/api/sessions/session-1/repository`, { headers: server.headers });
-  assert.deepEqual(await response.json(), { root: null, name: null, editedRoot: other });
+  assert.deepEqual(await response.json(), { root: null, name: null, editedRoot: other, record: null });
   const status = await fetch(`${server.baseUrl}/api/git/status?repo=${encodeURIComponent(other)}`, { headers: server.headers });
   assert.equal(status.status, 200);
 });
@@ -1665,6 +1668,58 @@ test("keeps archived state with replaced empty conversations and forgets it when
   });
   assert.equal(deleteResponse.status, 200);
   assert.deepEqual(await server.metadata("session-archive.json"), {});
+});
+
+test("stores the repository record on the server, rejects relative paths, and forgets it when deleted", async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeSessionDelete: true });
+  const putRecord = (body: JsonObject) => fetch(`${server.baseUrl}/api/sessions/session-1/repository-record`, {
+    method: "PUT",
+    headers: { ...server.headers, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const repositoryRecords = () => server.metadata("repository-records.json").catch(() => ({}));
+
+  assert.equal((await putRecord({ choice: "relative/picked" })).status, 400);
+  assert.deepEqual(await repositoryRecords(), {});
+
+  const record = { choice: "/repos/picked", automaticRoot: "/repos/edited", suggestedRoot: "/repos/edited", followRoot: null };
+  assert.equal((await putRecord(record)).status, 200);
+  assert.deepEqual(await repositoryRecords(), { "session-1": record });
+  const listed = await (await fetch(`${server.baseUrl}/api/sessions/session-1/repository`, { headers: server.headers })).json();
+  assert.deepEqual((listed as JsonObject).record, record);
+
+  // A record without a pick or a pending move is not kept.
+  assert.equal((await putRecord({ choice: null, automaticRoot: "/repos/edited", suggestedRoot: null, followRoot: null })).status, 200);
+  assert.deepEqual(await repositoryRecords(), {});
+
+  assert.equal((await putRecord(record)).status, 200);
+  const deleteResponse = await fetch(`${server.baseUrl}/api/sessions/session-1`, {
+    method: "DELETE",
+    headers: server.headers
+  });
+  assert.equal(deleteResponse.status, 200);
+  assert.deepEqual(await repositoryRecords(), {});
+});
+
+test("a conversation keeps its picked repository as its working directory, including after a server restart", async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const picked = await createTestRepository(path.join(server.projectsDirectory, "picked"), { "c.txt": "c\n" });
+  assert.equal((await server.post("working-directory", { repository: picked })).status, 200);
+  const records = await server.metadata("repository-records.json") as JsonObject;
+  assert.equal(isRecord(records["session-1"]) && records["session-1"].choice, picked);
+
+  const restarted = await startTestServer(t, {
+    existingSession: true,
+    nativeHistory: { events: [] },
+    reuseDirectory: server.directory
+  });
+  const list: unknown = await (await fetch(`${restarted.baseUrl}/api/sessions`, { headers: restarted.headers })).json();
+  assert.ok(isRecord(list) && Array.isArray(list.sessions));
+  const listed = list.sessions.filter(isRecord).find((item) => item.sessionId === "session-1");
+  assert.equal(listed?.cwd, picked);
+
+  assert.equal((await restarted.post("load", {})).status, 200);
+  assert.ok((await restarted.requests()).some((request) => request.method === "session/load" && request.cwd === picked));
 });
 
 test("reloads a conversation with its own persisted context unless a context is requested", async (t) => {
@@ -5125,6 +5180,135 @@ test("copilot edits in another repository offer it as the working directory, and
     /Copilot edited files in picked\./);
   assert.equal(await evaluate(`document.querySelector("#changes-repository-label").textContent`), "edited");
   assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("a pending repository suggestion survives a page reload until the user answers it", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeMessages: true, nativeHistory: { events: [] } });
+  const picked = await createTestRepository(path.join(server.projectsDirectory, "picked"), { "c.txt": "c\n" });
+  const edited = await createTestRepository(path.join(server.projectsDirectory, "edited"), { "a.txt": "a\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "session-1"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .some((option) => option.dataset.root === ${JSON.stringify(picked)})`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(picked)}).click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Working directory changed to")`);
+
+  const deadline = Date.now() + 5_000;
+  let response = await server.post("messages", { text: `edit-file:${path.join(edited, "a.txt")}`, clientPromptId: "reload-edit" });
+  while (response.status === 409 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    response = await server.post("messages", { text: `edit-file:${path.join(edited, "a.txt")}`, clientPromptId: "reload-edit" });
+  }
+  assert.equal(response.status, 200);
+  await evaluate(`document.querySelector("#changes-refresh").click()`);
+  await waitFor(`!document.querySelector("#changes-suggestion").hidden`);
+  await waitFor(`document.querySelector("#composer-more-button").getAttribute("aria-label") === "More actions, repository decision pending"`);
+
+  await evaluate(`location.reload()`);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await waitFor(`document.querySelector("#composer-more-button").getAttribute("aria-label") === "More actions, repository decision pending"`);
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector("#decision-badge")).display`), "block");
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "session-1"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`!document.querySelector("#changes-suggestion").hidden`);
+  assert.match(String(await evaluate(`document.querySelector("#changes-suggestion-text").textContent`)),
+    /Copilot edited files in edited\./);
+  await waitFor(`document.querySelector("#changes-suggestion-use").disabled === false`);
+  await evaluate(`document.querySelector("#changes-suggestion-use").click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes(${JSON.stringify(`Working directory changed to ${edited}`)})`);
+
+  // Once answered, a reload leaves nothing pending.
+  await evaluate(`location.reload()`);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await waitFor(`document.querySelector("#composer-more-button").getAttribute("aria-label") === "More actions"`);
+  assert.equal(await evaluate(`getComputedStyle(document.querySelector("#decision-badge")).display`), "none");
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("a pending repository decision and the explicit pick follow the conversation to another browser and across a server restart", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 90_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeMessages: true, nativeHistory: { events: [] } });
+  const picked = await createTestRepository(path.join(server.projectsDirectory, "picked"), { "c.txt": "c\n" });
+  const edited = await createTestRepository(path.join(server.projectsDirectory, "edited"), { "a.txt": "a\n" });
+  const first = await startTestBrowser(t, server.baseUrl);
+  await first.waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await first.evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await first.waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "session-1"`);
+  await first.evaluate(`document.querySelector("#changes-toggle").click()`);
+  await first.waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .some((option) => option.dataset.root === ${JSON.stringify(picked)})`);
+  await first.evaluate(`document.querySelector("#changes-repository").click()`);
+  await first.waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await first.evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(picked)}).click()`);
+  await first.waitFor(`document.querySelector("#messages").textContent.includes("Working directory changed to")`);
+
+  const deadline = Date.now() + 5_000;
+  let response = await server.post("messages", { text: `edit-file:${path.join(edited, "a.txt")}`, clientPromptId: "record-edit" });
+  while (response.status === 409 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    response = await server.post("messages", { text: `edit-file:${path.join(edited, "a.txt")}`, clientPromptId: "record-edit" });
+  }
+  assert.equal(response.status, 200);
+  await first.evaluate(`document.querySelector("#changes-refresh").click()`);
+  await first.waitFor(`!document.querySelector("#changes-suggestion").hidden`);
+
+  // The pick and the pending suggestion are written to the server's record for the conversation.
+  const recordDeadline = Date.now() + 5_000;
+  let record: JsonObject | undefined;
+  while (Date.now() < recordDeadline) {
+    const records = await server.metadata("repository-records.json").catch(() => ({})) as JsonObject;
+    record = records["session-1"] as JsonObject | undefined;
+    if (record?.suggestedRoot === edited) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(record?.choice, picked);
+  assert.equal(record?.suggestedRoot, edited);
+
+  const expectPendingIn = async (browser: Awaited<ReturnType<typeof startTestBrowser>>) => {
+    await browser.waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+    await browser.evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+    await browser.waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "session-1"`);
+    await browser.waitFor(`document.querySelector("#composer-more-button").getAttribute("aria-label") === "More actions, repository decision pending"`);
+    await browser.evaluate(`document.querySelector("#changes-toggle").click()`);
+    await browser.waitFor(`document.querySelector("#changes-repository-label").textContent === "picked"`);
+    await browser.waitFor(`!document.querySelector("#changes-suggestion").hidden`);
+    assert.match(String(await browser.evaluate(`document.querySelector("#changes-suggestion-text").textContent`)),
+      /Copilot edited files in edited\./);
+    assert.deepEqual(await browser.evaluate(`window.testBrowserErrors`), []);
+  };
+
+  // A different browser profile sees the same pick and offer.
+  await expectPendingIn(await startTestBrowser(t, server.baseUrl));
+
+  // A restarted server, with the edit still in the conversation's history, shows them again.
+  const restarted = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    nativeHistory: { events: fileEditHistory("record-edit", path.join(edited, "a.txt"), true) },
+    reuseDirectory: server.directory
+  });
+  await expectPendingIn(await startTestBrowser(t, restarted.baseUrl));
 });
 
 test("a later edit in another repository is offered after a manual pick, and the picker moves only when the user agrees", {

@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import {
   access,
@@ -878,6 +879,70 @@ async function saveSessionArchive(filePath: string, archive: SessionArchive): Pr
   await rename(temporaryPath, filePath);
 }
 
+const repositoryRecordFields = ["choice", "automaticRoot", "suggestedRoot", "followRoot"] as const;
+type RepositoryRecord = Partial<Record<(typeof repositoryRecordFields)[number], string | null>>;
+type RepositoryRecords = Map<string, RepositoryRecord>;
+
+function isRepositoryPath(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 4096 && path.isAbsolute(value);
+}
+
+// The explicit repository pick and any pending repository decision. A record without a pick or a pending move is not kept.
+function repositoryRecordFrom(value: unknown): RepositoryRecord | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const record: RepositoryRecord = {};
+  for (const field of repositoryRecordFields) {
+    const fieldValue = value[field];
+    if (fieldValue === undefined) {
+      continue;
+    }
+    if (fieldValue !== null && !isRepositoryPath(fieldValue)) {
+      return undefined;
+    }
+    record[field] = fieldValue;
+  }
+  return record.choice || record.suggestedRoot || record.followRoot ? record : undefined;
+}
+
+async function loadRepositoryRecords(filePath: string): Promise<RepositoryRecords> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(filePath, "utf8")) as unknown;
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") {
+      return new Map();
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to read repository records at ${filePath}: ${message}`);
+  }
+  if (!isRecord(parsed)) {
+    throw new Error(`Repository records at ${filePath} are not a JSON object`);
+  }
+
+  const records: RepositoryRecords = new Map();
+  for (const [sessionId, value] of Object.entries(parsed)) {
+    if (!validSessionId(sessionId)) {
+      throw new Error(`Repository records at ${filePath} contain an invalid session id`);
+    }
+    const record = repositoryRecordFrom(value);
+    if (!record) {
+      throw new Error(`Repository records at ${filePath} contain an invalid entry for ${sessionId}`);
+    }
+    records.set(sessionId, record);
+  }
+  return records;
+}
+
+async function saveRepositoryRecords(filePath: string, records: RepositoryRecords): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const serialized = JSON.stringify(Object.fromEntries(records), null, 2) + "\n";
+  const temporaryPath = `${filePath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  await writeFile(temporaryPath, serialized, "utf8");
+  await rename(temporaryPath, filePath);
+}
+
 function parseOptionalPromptId(value: unknown, fieldName: string): string | undefined {
   if (value === undefined) {
     return undefined;
@@ -1280,6 +1345,8 @@ async function main(): Promise<void> {
   const sessionUsageCache = await loadSessionUsage(sessionUsagePath);
   const sessionActivityCache = await loadSessionActivity(sessionActivityPath);
   const sessionArchive = await loadSessionArchive(sessionArchivePath);
+  const repositoryRecordsPath = path.join(os.homedir(), ".copilot-web", "repository-records.json");
+  const repositoryRecords = await loadRepositoryRecords(repositoryRecordsPath);
   const attachmentStore = new AttachmentStore(
     path.join(os.homedir(), ".copilot-web", "attachments")
   );
@@ -1324,6 +1391,7 @@ async function main(): Promise<void> {
   const sessionUsageWrites = new SerialTaskQueue();
   const sessionActivityWrites = new SerialTaskQueue();
   const sessionArchiveWrites = new SerialTaskQueue();
+  const repositoryRecordWrites = new SerialTaskQueue();
   const gitIndexWrites = new SerialTaskQueue();
   const replayingSessions = new Map<string, JsonObject[]>();
   const fallbackReplayTails = new Map<string, JsonObject[]>();
@@ -1487,7 +1555,8 @@ async function main(): Promise<void> {
     return {
       root: root ?? null,
       name: root ? path.basename(root) : null,
-      editedRoot: await readEditedRepository(session.sessionId)
+      editedRoot: await readEditedRepository(session.sessionId),
+      record: repositoryRecords.get(session.sessionId) ?? null
     };
   };
 
@@ -1914,6 +1983,33 @@ async function main(): Promise<void> {
     }
   });
 
+  const persistRepositoryRecord = (
+    sessionId: string,
+    record: RepositoryRecord | undefined
+  ): Promise<void> => repositoryRecordWrites.enqueue(async () => {
+    if (record === undefined && !repositoryRecords.has(sessionId)) {
+      return;
+    }
+    const snapshot = new Map(repositoryRecords);
+    if (record === undefined) {
+      snapshot.delete(sessionId);
+    } else {
+      snapshot.set(sessionId, record);
+    }
+    await saveRepositoryRecords(repositoryRecordsPath, snapshot);
+    if (record === undefined) {
+      repositoryRecords.delete(sessionId);
+    } else {
+      repositoryRecords.set(sessionId, record);
+    }
+  });
+
+  // The picked repository is the conversation's working directory, so it replaces the directory the CLI reports for it.
+  const recordedDirectory = (sessionId: string): string | undefined => {
+    const choice = repositoryRecords.get(sessionId)?.choice;
+    return choice && statSync(choice, { throwIfNoEntry: false })?.isDirectory() ? choice : undefined;
+  };
+
   const persistSessionTitleOverride = (
     sessionId: string,
     title: string | undefined,
@@ -2023,11 +2119,13 @@ async function main(): Promise<void> {
         activityChanged = true;
       }
       const customTitle = sessionTitleOverrides.get(session.sessionId);
+      const recorded = recordedDirectory(session.sessionId);
+      const listed = recorded === undefined || recorded === session.cwd ? session : { ...session, cwd: recorded };
       sessionCache.set(
         session.sessionId,
         customTitle === undefined
-          ? session
-          : { ...session, title: customTitle, customTitle }
+          ? listed
+          : { ...listed, title: customTitle, customTitle }
       );
     }
     if (activityChanged) {
@@ -2795,13 +2893,14 @@ async function main(): Promise<void> {
         sessionActivityCache.delete(sessionId);
         sessionUsageCache.delete(sessionId);
 
-        const cleanupLabels = ["session usage", "session activity", "custom titles", "attachments", "session archive"];
+        const cleanupLabels = ["session usage", "session activity", "custom titles", "attachments", "session archive", "repository records"];
         const cleanupResults = await Promise.allSettled([
           queueSessionUsageSave(),
           queueSessionActivitySave(),
           persistSessionTitleOverride(sessionId, undefined, false, true),
           attachmentStore.deleteSession(sessionId),
-          persistSessionArchive(sessionId, undefined)
+          persistSessionArchive(sessionId, undefined),
+          persistRepositoryRecord(sessionId, undefined)
         ]);
         const persistenceWarnings: string[] = [];
         cleanupResults.forEach((result, index) => {
@@ -2826,6 +2925,19 @@ async function main(): Promise<void> {
       } finally {
         deletingSessions.delete(sessionId);
       }
+    }
+
+    if (request.method === "PUT" && subroute === "repository-record") {
+      const body = await readJsonBody(request);
+      for (const field of repositoryRecordFields) {
+        const value = body[field];
+        if (value !== undefined && value !== null && !isRepositoryPath(value)) {
+          throw new HttpError(400, `${field} must be an absolute repository path`);
+        }
+      }
+      await persistRepositoryRecord(sessionId, repositoryRecordFrom(body));
+      jsonResponse(response, 200, { record: repositoryRecords.get(sessionId) ?? null });
+      return true;
     }
 
     if (request.method === "POST" && (subroute === "archive" || subroute === "restore")) {
@@ -3451,6 +3563,10 @@ async function main(): Promise<void> {
         });
       }
       ensureSessionAvailable(sessionId);
+      await persistRepositoryRecord(
+        sessionId,
+        repositoryRecordFrom({ ...repositoryRecords.get(sessionId), choice: directory })
+      );
       jsonResponse(response, 200, { session });
       return true;
     }
