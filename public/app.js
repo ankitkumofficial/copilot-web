@@ -1256,7 +1256,7 @@ function clearPendingWorkingDirectoryNote(sessionId) {
 }
 
 // Reloads the conversation in another directory; the next normal message tells Copilot about the change once.
-async function changeWorkingDirectory(sessionId, directory) {
+async function changeWorkingDirectory(sessionId, directory, { announce = true } = {}) {
   workingDirectoryChangesInFlight.add(sessionId);
   let result;
   try {
@@ -1270,7 +1270,7 @@ async function changeWorkingDirectory(sessionId, directory) {
   upsertSession(result.session);
   savePendingWorkingDirectoryNote(sessionId, result.session.cwd);
   const conversation = activeConversation();
-  if (conversation?.sessionId === sessionId) {
+  if (announce && conversation?.sessionId === sessionId) {
     addMessage(
       "system",
       `Working directory changed to ${result.session.cwd}. Relative paths and shell commands now run there. Copilot will be told in your next message, and files outside this directory may require permission.`,
