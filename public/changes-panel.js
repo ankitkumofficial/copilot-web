@@ -5,6 +5,10 @@ const widthStorageKey = "copilot-web-changes-width";
 const wrapStorageKey = "copilot-web-changes-wrap";
 const defaultWidth = 480;
 const minimumWidth = 320;
+const minimumListWidth = 220;
+const minimumDiffWidth = 240;
+const minimumGroupHeight = 48;
+const splitterWidth = 9;
 const initialRenderLines = 3_000;
 const toolRefreshDelayMs = 750;
 const focusRefreshAgeMs = 2_000;
@@ -258,6 +262,11 @@ export function initChangesPanel({
   // Conversations whose record has been read from the server, and changes made before that read, merged in once it arrives.
   const loadedRecords = new Set();
   const unsavedRecordChanges = new Map();
+  // Expanded view lists both sections, even when empty, with a draggable divider between Unstaged and Staged.
+  let listExpanded = false;
+  const groupDivider = element("div", "changes-group-divider");
+  groupDivider.setAttribute("aria-hidden", "true");
+  groupDivider.title = "Drag to resize the Unstaged and Staged sections";
 
   function readRepositoryChoice(sessionId) {
     const root = repositoryRecords.get(sessionId)?.choice;
@@ -328,6 +337,13 @@ export function initChangesPanel({
   function applyOpen() {
     el.workspace.classList.toggle("changes-open", s.open);
     el.workspace.classList.toggle("changes-expanded", s.open && s.expanded);
+    el.workspace.closest(".app-shell")?.classList.toggle("repository-expanded", s.open && s.expanded);
+    const expanded = s.open && s.expanded;
+    if (expanded !== listExpanded) {
+      listExpanded = expanded;
+      renderList();
+    }
+    syncSplitResizer();
     el.panel.hidden = !s.open;
     el.resizer.hidden = !s.open;
     el.toggle.setAttribute("aria-pressed", String(s.open));
@@ -528,12 +544,19 @@ export function initChangesPanel({
       return;
     }
     event.preventDefault();
-    splitStart = { pointerId: event.pointerId, y: event.clientY, height: el.list.getBoundingClientRect().height };
+    const rect = el.list.getBoundingClientRect();
+    splitStart = listExpanded
+      ? { pointerId: event.pointerId, position: event.clientX, size: rect.width }
+      : { pointerId: event.pointerId, position: event.clientY, size: rect.height };
     el.splitResizer.setPointerCapture(event.pointerId);
   });
   el.splitResizer.addEventListener("pointermove", (event) => {
     if (splitStart && event.pointerId === splitStart.pointerId) {
-      setListHeight(splitStart.height + event.clientY - splitStart.y);
+      if (listExpanded) {
+        setListWidth(splitStart.size + event.clientX - splitStart.position);
+      } else {
+        setListHeight(splitStart.size + event.clientY - splitStart.position);
+      }
     }
   });
   const finishSplit = () => {
@@ -542,6 +565,15 @@ export function initChangesPanel({
   el.splitResizer.addEventListener("pointerup", finishSplit);
   el.splitResizer.addEventListener("pointercancel", finishSplit);
   el.splitResizer.addEventListener("keydown", (event) => {
+    if (listExpanded) {
+      const width = el.list.getBoundingClientRect().width;
+      const step = event.key === "ArrowLeft" ? -24 : event.key === "ArrowRight" ? 24 : 0;
+      if (step) {
+        event.preventDefault();
+        setListWidth(width + step);
+      }
+      return;
+    }
     const current = el.list.getBoundingClientRect().height;
     const step = event.key === "ArrowUp" ? -24 : event.key === "ArrowDown" ? 24 : 0;
     if (step) {
@@ -555,6 +587,56 @@ export function initChangesPanel({
     s.listHeight = Math.round(Math.min(maximum, Math.max(60, height)));
     el.panel.style.setProperty("--changes-list-height", `${s.listHeight}px`);
     el.splitResizer.setAttribute("aria-valuenow", String(s.listHeight));
+  }
+
+  // Expanded view: the list takes a share of the width and the diff takes the rest.
+  function setListWidth(width) {
+    const total = el.changesTabpanel.getBoundingClientRect().width;
+    const maximum = Math.max(minimumListWidth, total - splitterWidth - minimumDiffWidth);
+    const clamped = Math.round(Math.min(maximum, Math.max(minimumListWidth, width)));
+    el.panel.style.setProperty("--changes-list-width", `${clamped}px`);
+    el.splitResizer.setAttribute("aria-valuenow", String(clamped));
+    el.splitResizer.setAttribute("aria-valuetext", `${clamped} pixels`);
+  }
+
+  // The splitter stays visible in the expanded view even with no file open, since the list is still beside the empty diff area.
+  function syncSplitResizer() {
+    el.splitResizer.hidden = !s.openFile && !listExpanded;
+    el.splitResizer.setAttribute("aria-orientation", listExpanded ? "vertical" : "horizontal");
+    el.splitResizer.setAttribute("aria-label", listExpanded ? "Resize file list and diff" : "Resize file list");
+  }
+
+  // Expanded view: dragging the divider between Unstaged and Staged sets the Unstaged section's height.
+  let groupSplitStart = null;
+  groupDivider.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.isPrimary === false) {
+      return;
+    }
+    event.preventDefault();
+    const unstaged = el.list.querySelector(".changes-group-unstaged");
+    groupSplitStart = {
+      pointerId: event.pointerId,
+      y: event.clientY,
+      height: unstaged?.getBoundingClientRect().height ?? 0
+    };
+    groupDivider.setPointerCapture(event.pointerId);
+  });
+  groupDivider.addEventListener("pointermove", (event) => {
+    if (groupSplitStart && event.pointerId === groupSplitStart.pointerId) {
+      setUnstagedHeight(groupSplitStart.height + event.clientY - groupSplitStart.y);
+    }
+  });
+  const finishGroupSplit = () => {
+    groupSplitStart = null;
+  };
+  groupDivider.addEventListener("pointerup", finishGroupSplit);
+  groupDivider.addEventListener("pointercancel", finishGroupSplit);
+
+  function setUnstagedHeight(height) {
+    const total = el.list.getBoundingClientRect().height;
+    const maximum = Math.max(minimumGroupHeight, total - splitterWidth - minimumGroupHeight);
+    const clamped = Math.round(Math.min(maximum, Math.max(minimumGroupHeight, height)));
+    el.list.style.setProperty("--changes-unstaged-height", `${clamped}px`);
   }
 
   // ---- data ------------------------------------------------------------
@@ -1499,7 +1581,7 @@ export function initChangesPanel({
     }
     let index = 0;
     for (const group of model.groups) {
-      if (group.items.length === 0) {
+      if (group.items.length === 0 && !listExpanded) {
         continue;
       }
       const section = element("div", `changes-group changes-group-${group.id}`);
@@ -1508,11 +1590,17 @@ export function initChangesPanel({
       const header = element("div", "changes-group-title");
       header.append(element("span", "", group.title), element("span", "changes-group-count", sectionTotals(group.items)));
       section.append(header);
+      if (group.items.length === 0) {
+        section.append(element("p", "changes-group-empty", s.filter ? "No matching files" : `No ${group.id} changes`));
+      }
       el.list.append(section);
       for (const item of group.items) {
         s.navigableItems.push(item);
         section.append(rowFor(item, index));
         index += 1;
+      }
+      if (listExpanded && group.id === "unstaged") {
+        el.list.append(groupDivider);
       }
     }
     const active = s.navigableItems.find((item) => item.key === s.activeKey);
@@ -1562,7 +1650,7 @@ export function initChangesPanel({
   function renderDiffArea() {
     const file = s.openFile;
     el.diff.hidden = !file;
-    el.splitResizer.hidden = !file;
+    syncSplitResizer();
     el.panel.classList.toggle("has-diff", Boolean(file));
     if (!file) {
       el.panel.dataset.view = "list";
@@ -1704,11 +1792,20 @@ export function initChangesPanel({
     return file.section === "staged" ? `git diff --cached -- ${quoted}` : `git diff -- ${quoted}`;
   }
 
+  // Ask and Attach put text in the conversation composer, which is hidden while the panel is expanded.
+  function restoreWidth() {
+    if (s.expanded) {
+      s.expanded = false;
+      applyOpen();
+    }
+  }
+
   function askCopilot(hunk = null) {
     const file = s.openFile;
     if (!file || !s.repository) {
       return;
     }
+    restoreWidth();
     const subject = hunk
       ? `the hunk at lines ${hunk.newStart}–${hunk.newStart + Math.max(hunk.newLines - 1, 0)} of my ${file.section} changes to`
       : `my ${file.section} changes to`;
@@ -1722,6 +1819,7 @@ export function initChangesPanel({
     if (!file || !text) {
       return;
     }
+    restoreWidth();
     const name = `${basename(file.path)}${hunk ? `-L${hunk.newStart}` : ""}.diff`;
     const attached = await attachFiles([new File([text], name, { type: "text/x-diff" })]);
     if (!attached) {

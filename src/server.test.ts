@@ -4727,13 +4727,37 @@ test("changes view lists staged and unstaged files, stages and unstages them, re
   assert.equal(await evaluate(`Array.from(document.querySelectorAll("#changes-panel .visually-hidden"))
     .every((node) => document.querySelector("#changes-panel").contains(node.offsetParent))`), true);
 
+  // Expanding the panel hides the sidebar and conversation; Ask and Attach restore the previous width.
+  const layout = `JSON.stringify([
+    document.querySelector(".app-shell").classList.contains("repository-expanded"),
+    getComputedStyle(document.querySelector(".sidebar")).display !== "none",
+    getComputedStyle(document.querySelector(".conversation")).display !== "none",
+    Math.round(document.querySelector("#changes-panel").getBoundingClientRect().width) ===
+      Math.round(document.querySelector(".app-shell").getBoundingClientRect().width)
+  ])`;
+  // The shell animates its columns for 180ms, so wait for the layout to settle before comparing.
+  const waitForLayout = (expected: boolean[]) => waitFor(`${layout} === ${JSON.stringify(JSON.stringify(expected))}`);
+  await evaluate(`document.querySelector("#changes-expand").click()`);
+  await waitForLayout([true, false, false, true]);
+  // Expanded: Unstaged sits above Staged in the list column, and the diff is to the right of the list.
+  assert.deepEqual(await evaluate(`(() => {
+    const unstaged = document.querySelector(".changes-group-unstaged").getBoundingClientRect();
+    const staged = document.querySelector(".changes-group-staged").getBoundingClientRect();
+    const list = document.querySelector("#changes-list").getBoundingClientRect();
+    const diff = document.querySelector("#changes-diff").getBoundingClientRect();
+    return [unstaged.bottom <= staged.top, Math.round(unstaged.left) === Math.round(staged.left), list.right <= diff.left];
+  })()`), [true, true, true]);
   await evaluate(`document.querySelector("#changes-ask").click()`);
   await waitFor(`document.querySelector("#prompt-input").value.includes("Review my unstaged changes to")`);
+  await waitForLayout([false, true, true, false]);
   const prompt = String(await evaluate(`document.querySelector("#prompt-input").value`));
   assert.ok(prompt.includes("src/a.txt") && prompt.includes(repo) && prompt.includes("git diff -- src/a.txt"), prompt);
 
+  await evaluate(`document.querySelector("#changes-expand").click()`);
+  await waitForLayout([true, false, false, true]);
   await evaluate(`document.querySelector("#changes-attach").click()`);
   await waitFor(`document.querySelector("#attachment-list").textContent.includes("a.txt.diff")`);
+  await waitForLayout([false, true, true, false]);
 
   // The keyboard stages and unstages the highlighted row; the highlight follows the file across sections.
   await evaluate(`document.querySelector("#changes-list").focus()`);
@@ -11467,8 +11491,16 @@ test("terminal opens from More actions for the selected repository and keeps its
   await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
   await waitFor(`document.querySelector("#changes-panel").hidden === false`);
   await waitFor(`document.querySelector("#changes-repository").dataset.root === ${JSON.stringify(repo)}`);
+  // Full-screen Repository: the terminal replaces the changes body and fills the panel down to its bottom edge.
+  await evaluate(`document.querySelector("#changes-expand").click()`);
   await evaluate(`document.querySelector("#repository-tab-terminal").click()`);
   await waitFor(`document.querySelector("#terminal-screen .xterm-rows")?.textContent.includes("cpw-42")`);
+  assert.deepEqual(await evaluate(`[
+    getComputedStyle(document.querySelector("#changes-tabpanel")).display,
+    Math.round(document.querySelector("#terminal-tabpanel").getBoundingClientRect().bottom) ===
+      Math.round(document.querySelector("#changes-panel").getBoundingClientRect().bottom)
+  ]`), ["none", true]);
+  await evaluate(`document.querySelector("#changes-expand").click()`);
   assert.equal(await evaluate(`document.querySelectorAll("#terminal-tabs [role=tab]").length`), 1);
   assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
   // xterm and the terminal panel must run entirely under the page's Content-Security-Policy.

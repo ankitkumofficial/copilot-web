@@ -279,21 +279,9 @@
             title="Drag or use the arrow keys to resize the repository panel"
             hidden
           ></div>
-          <aside id="changes-panel" class="changes-panel" aria-labelledby="changes-title" data-view="list" hidden>
-            <header class="changes-header">
-              <button id="changes-back" class="changes-icon-button changes-back" type="button" aria-label="Back to conversation" title="Back to conversation">‹</button>
-              <h2 id="changes-title">Repository</h2>
-              <button id="changes-refresh" class="changes-icon-button" type="button" aria-label="Refresh changes" title="Refresh (R)">
-                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5"></path><path d="M19.4 12A7.5 7.5 0 1 1 17 6.5L20 9"></path></svg>
-              </button>
-              <button id="changes-expand" class="changes-icon-button" type="button" aria-label="Expand repository panel" aria-pressed="false" title="Expand">
-                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7"></path></svg>
-              </button>
-              <button id="changes-close" class="changes-icon-button" type="button" aria-label="Close repository panel" title="Close (Ctrl+Shift+G)">
-                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg>
-              </button>
-            </header>
+          <aside id="changes-panel" class="changes-panel" aria-label="Repository" data-view="list" hidden>
             <div class="changes-repository-row">
+              <button id="changes-back" class="changes-icon-button changes-back" type="button" aria-label="Back to conversation" title="Back to conversation">‹</button>
               <div class="changes-repository-picker">
                 <button id="changes-repository" class="composer-setting changes-repository-button" type="button" title="Repository" aria-haspopup="tree" aria-expanded="false" aria-controls="changes-repository-menu">
                   <svg class="composer-setting-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5A1.5 1.5 0 0 1 6.5 3H19v15H6.5A1.5 1.5 0 0 0 5 19.5Z"></path><path d="M5 19.5A1.5 1.5 0 0 0 6.5 21H19v-3"></path></svg>
@@ -302,6 +290,17 @@
                 <div id="changes-repository-menu" class="changes-repository-menu" role="tree" aria-label="Repositories" tabindex="-1" hidden></div>
               </div>
               <span id="changes-branch" class="changes-branch"></span>
+              <div class="changes-header-actions">
+                <button id="changes-refresh" class="changes-icon-button" type="button" aria-label="Refresh changes" title="Refresh (R)">
+                  <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5"></path><path d="M19.4 12A7.5 7.5 0 1 1 17 6.5L20 9"></path></svg>
+                </button>
+                <button id="changes-expand" class="changes-icon-button" type="button" aria-label="Expand repository panel" aria-pressed="false" title="Expand">
+                  <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7"></path></svg>
+                </button>
+                <button id="changes-close" class="changes-icon-button" type="button" aria-label="Close repository panel" title="Close (Ctrl+Shift+G)">
+                  <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg>
+                </button>
+              </div>
             </div>
             <div id="changes-suggestion" class="changes-suggestion" role="status" hidden>
               <p id="changes-suggestion-text"></p>
@@ -358,6 +357,7 @@
               </div>
               <div id="changes-diff-body" class="changes-diff-body"></div>
             </section>
+            <p id="changes-diff-empty" class="changes-diff-empty">Select a file to see its diff.</p>
             </div>
             <section id="terminal-tabpanel" class="repository-tabpanel terminal-tabpanel" role="tabpanel" aria-labelledby="repository-tab-terminal" hidden>
               <div id="terminal-empty" class="terminal-empty">
