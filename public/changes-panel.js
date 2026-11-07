@@ -1468,7 +1468,7 @@ export function initChangesPanel({
     button.type = "button";
     button.tabIndex = -1;
     button.disabled = s.staging.has(item.key);
-    button.title = deletesFile ? "Reset (deletes new file)" : "Reset changes";
+    button.title = deletesFile ? "Reset (deletes new file) (⌘J)" : "Reset changes (⌘J)";
     button.setAttribute("aria-label", deletesFile ? `Delete new file ${item.path}` : `Reset changes to ${item.path}`);
     button.append(iconElement(resetIconPaths));
     button.addEventListener("click", (event) => {
@@ -2032,6 +2032,15 @@ export function initChangesPanel({
     }
   }
 
+  // Same confirmed reset as the row's Reset button, for the highlighted row or the file open in the diff.
+  function resetActive(inList) {
+    const key = inList ? s.activeKey : s.openFile?.key;
+    const target = s.navigableItems.find((item) => item.key === key);
+    if (target) {
+      void resetItem(target);
+    }
+  }
+
   function moveActive(delta) {
     const items = s.navigableItems;
     if (items.length === 0) {
@@ -2230,7 +2239,8 @@ export function initChangesPanel({
   });
 
   el.panel.addEventListener("keydown", (event) => {
-    if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) {
+    const resetShortcut = event.metaKey && event.key.toLowerCase() === "j";
+    if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.altKey || (event.metaKey && !resetShortcut)) {
       return;
     }
     // Keys typed into the shell belong to the shell, including Escape.
@@ -2263,6 +2273,11 @@ export function initChangesPanel({
     }
     // Nested buttons and group summaries in the list keep their native keyboard behavior.
     const inList = event.target === el.list;
+    if (resetShortcut) {
+      event.preventDefault();
+      resetActive(inList);
+      return;
+    }
     switch (event.key) {
       case "ArrowDown":
       case "ArrowUp":

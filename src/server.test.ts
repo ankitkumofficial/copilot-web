@@ -5048,9 +5048,12 @@ test("changes view resets unstaged files only after confirmation, deleting new f
   assert.equal(await readFile(path.join(repo, "tracked.txt"), "utf8"), "changed\n");
   assert.equal(await evaluate(`Boolean(document.querySelector('[data-key="unstaged:tracked.txt"] .changes-file-action-reset'))`), true);
 
-  // Confirming a tracked reset restores the file to its committed version.
-  await evaluate(`document.querySelector('[data-key="unstaged:tracked.txt"] .changes-file-action-reset').click()`);
+  // Cmd+J on the highlighted row confirms the same reset as its Reset button.
+  await evaluate(`document.querySelector('[data-key="unstaged:tracked.txt"]').click()`);
+  await command("Input.dispatchKeyEvent", { type: "keyDown", modifiers: 4, key: "j", code: "KeyJ", windowsVirtualKeyCode: 74 }, sessionId);
+  await command("Input.dispatchKeyEvent", { type: "keyUp", modifiers: 4, key: "j", code: "KeyJ", windowsVirtualKeyCode: 74 }, sessionId);
   await waitFor(`${dialog}.open === true`);
+  assert.equal(await evaluate(`document.querySelector("#changes-reset-title").textContent`), "Reset tracked.txt?");
   await evaluate(`document.querySelector("#changes-reset-confirm").click()`);
   await waitFor(`!document.querySelector('[data-key="unstaged:tracked.txt"]')`);
   assert.equal(await readFile(path.join(repo, "tracked.txt"), "utf8"), "base\n");
