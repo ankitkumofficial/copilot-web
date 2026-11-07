@@ -4632,6 +4632,7 @@ test("changes view lists staged and unstaged files, stages and unstages them, re
   ]`), [false, "true", ["reconnect-tools", "attach-files", "terminal-action", "changes-toggle"]]);
 
   await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await evaluate(`document.querySelector("#repository-tab-changes").click()`);
   assert.equal(await evaluate(`document.querySelector("#composer-more-menu").hidden`), true);
   // This conversation runs outside any repository, so the picker decides.
   await evaluate(`document.querySelector("#changes-repository").click()`);
@@ -4842,6 +4843,7 @@ test("changes view offers a repository picker for an unsent conversation and sup
   const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
   await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
   await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await evaluate(`document.querySelector("#repository-tab-changes").click()`);
   await waitFor(`document.querySelectorAll("#changes-repository-menu [role=treeitem]").length === 3`);
   await evaluate(`document.querySelector("#changes-repository").click()`);
   await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
@@ -4944,6 +4946,7 @@ test("changes view resets unstaged files only after confirmation, deleting new f
   const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
   await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
   await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await evaluate(`document.querySelector("#repository-tab-changes").click()`);
   await waitFor(`document.querySelectorAll("#changes-repository-menu [role=treeitem]").length === 1`);
   await evaluate(`document.querySelector("#changes-repository").click()`);
   await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
@@ -11624,7 +11627,7 @@ test("the Repository action switches a terminal view back to Changes", {
   await waitFor(`document.querySelector("#changes-tabpanel").hidden === false &&
     document.querySelector("#terminal-tabpanel").hidden === true`);
   assert.equal(await evaluate(`document.querySelector("#changes-panel").hidden`), false);
-  assert.equal(await evaluate(`document.querySelector("#repository-tab-changes").getAttribute("aria-selected")`), "true");
+  assert.equal(await evaluate(`document.querySelector("#repository-tab-current-changes").getAttribute("aria-selected")`), "true");
   assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
 });
 
@@ -11676,7 +11679,7 @@ test("current changes lists only the files this conversation edited, while all c
   await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
   await waitFor(`document.querySelector(".session-item.active")?.dataset.sessionId === "session-1"`);
   await evaluate(`document.querySelector("#changes-toggle").click()`);
-
+  await evaluate(`document.querySelector("#repository-tab-changes").click()`);
   // Only the edit tool's file counts as the conversation's change, so the other changed file stays out of Current changes.
   const sendEdit = async (filePath: string) => {
     const deadline = Date.now() + 5_000;
@@ -11726,6 +11729,7 @@ test("the diff view has a close button that still works after the file is staged
   await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
   await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
   await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await evaluate(`document.querySelector("#repository-tab-changes").click()`);
   await evaluate(`document.querySelector("#changes-repository").click()`);
   await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]")).some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
   await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))

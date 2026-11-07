@@ -187,8 +187,9 @@ remote service.
   **More actions** → **Terminal**, next to the Repository panel's tabs; see
   [Interactive terminal](#interactive-terminal).
 - Review uncommitted changes in the **Repository** panel (**More actions** (⋯)
-  menu in the message bar, or `Ctrl+Shift+G`). **All changes** lists every
-  uncommitted file in the repository. **Current changes** lists only the files
+  menu in the message bar, or `Ctrl+Shift+G`). It opens on **Current changes**
+  by default. **All changes** lists every uncommitted file in the repository.
+  **Current changes** lists only the files
   this conversation has edited with `edit`, `create`, or `apply_patch`; changes
   made by shell commands are not included. Its list is read from the
   conversation's history, so it survives server restarts and resumed
