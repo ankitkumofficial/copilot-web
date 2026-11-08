@@ -123,7 +123,7 @@ case "${1:-}" in
 
   restart)
     if is_loaded; then
-      launchctl bootout "$SERVICE"
+      launchctl bootout --wait "$SERVICE"
     fi
     build_app
     launchctl bootstrap "$DOMAIN" "$PLIST"
@@ -134,7 +134,7 @@ case "${1:-}" in
 
   stop)
     if is_loaded; then
-      launchctl bootout "$SERVICE"
+      launchctl bootout --wait "$SERVICE"
       echo "copilot-web stopped"
     else
       echo "copilot-web is not running"

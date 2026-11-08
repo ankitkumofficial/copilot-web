@@ -112,6 +112,10 @@ cat > "$TMP_PLIST" <<EOF
   <string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
+    <string>/bin/zsh</string>
+    <string>-c</string>
+    <string>exec "\$@"</string>
+    <string>copilot-web</string>
     <string>$XML_NODE_BIN</string>
     <string>$XML_SERVER_PATH</string>
   </array>
