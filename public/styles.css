@@ -587,6 +587,63 @@ button:disabled {
   font-size: 0.75rem;
 }
 
+.server-controls {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.server-control {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+}
+
+.server-control .button-icon {
+  width: 16px;
+  height: 16px;
+}
+
+.server-control:not([aria-disabled="true"]):hover {
+  background: var(--surface-hover);
+}
+
+.server-control:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+#server-stop:not([aria-disabled="true"]):hover {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.server-control[aria-disabled="true"] {
+  color: var(--muted);
+  opacity: 0.45;
+  cursor: default;
+}
+
+.server-status {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.server-status[data-tone="error"] {
+  color: var(--danger);
+}
+
 .status-dot {
   width: 8px;
   height: 8px;
@@ -2856,8 +2913,18 @@ button:disabled {
 }
 
 .app-shell.sidebar-collapsed .sidebar-footer {
+  flex-direction: column;
   justify-content: center;
   border-top: 0;
+}
+
+.app-shell.sidebar-collapsed .server-controls {
+  flex-direction: column;
+  margin-left: 0;
+}
+
+.app-shell.sidebar-collapsed .server-status {
+  display: none;
 }
 
 @media (max-width: 900px) {

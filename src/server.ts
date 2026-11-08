@@ -1,9 +1,10 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { spawn } from "node:child_process";
-import { statSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { closeSync, mkdirSync, openSync, statSync, writeSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import {
   access,
+  appendFile,
   constants,
   mkdir,
   readFile,
@@ -390,6 +391,79 @@ async function resolveExecutable(command: string): Promise<string> {
     }
   }
   return command;
+}
+
+const cpwUnavailableMessage =
+  "Stop and restart use cpw, which isn't installed. Install cpw first (see cpw-installer/macOS/README.md), then reload this page.";
+const cpwNotManagedMessage =
+  "This copilot-web isn't running as a cpw service, so cpw can't stop or restart it. Stop it in the terminal where it runs.";
+const cpwStatusTimeoutMs = 10_000;
+
+type CpwAction = "stop" | "restart";
+
+async function isExecutableFile(candidate: string): Promise<boolean> {
+  try {
+    await access(candidate, constants.X_OK);
+    return (await stat(candidate)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function findCpwCommand(): Promise<string | undefined> {
+  const configured = process.env.CPW_BIN?.trim();
+  const candidates = configured
+    ? [await resolveExecutable(configured)]
+    : [await resolveExecutable("cpw"), path.join(os.homedir(), ".local", "bin", "cpw")];
+  for (const candidate of candidates) {
+    if (path.isAbsolute(candidate) && await isExecutableFile(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function cpwStatusLine(cpwPath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(cpwPath, ["status"], { encoding: "utf8", timeout: cpwStatusTimeoutMs }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error((stderr || stdout || error.message).trim()));
+        return;
+      }
+      resolve(stdout.trim());
+    });
+  });
+}
+
+async function requireCpwManagedCopilotWeb(cpwPath: string): Promise<void> {
+  let status: string;
+  try {
+    status = await cpwStatusLine(cpwPath);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message.split("\n")[0] : "unknown error";
+    throw new HttpError(409, `cpw could not check copilot-web: ${detail}`, "cpw_failed");
+  }
+  if (!status.startsWith("copilot-web is running on ")) {
+    throw new HttpError(409, cpwNotManagedMessage, "not_managed");
+  }
+}
+
+// Detached so the child outlives this server: launchctl bootout also kills children that share its process group.
+function startCpwAction(cpwPath: string, action: CpwAction): void {
+  const logDirectory = path.join(os.homedir(), "Library", "Logs", "copilot-web");
+  const logPath = path.join(logDirectory, "cpw.log");
+  mkdirSync(logDirectory, { recursive: true });
+  const log = openSync(logPath, "a");
+  try {
+    writeSync(log, `${new Date().toISOString()} cpw ${action}\n`);
+    const child = spawn(cpwPath, [action], { detached: true, stdio: ["ignore", log, log] });
+    child.once("error", (error) => {
+      void appendFile(logPath, `Could not run cpw ${action}: ${error.message}\n`).catch(() => undefined);
+    });
+    child.unref();
+  } finally {
+    closeSync(log);
+  }
 }
 
 async function readGitHubQuota(command: string, cwd: string): Promise<GitHubQuota> {
@@ -2569,6 +2643,33 @@ async function main(): Promise<void> {
         nativeMessageHistoryAvailable: copilotHistory.available,
         editorUrlTemplate,
         newSessionDefaults
+      });
+      return true;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/api/cpw") {
+      const cpwPath = await findCpwCommand();
+      jsonResponse(response, 200, cpwPath
+        ? { available: true }
+        : { available: false, message: cpwUnavailableMessage });
+      return true;
+    }
+
+    if (request.method === "POST" && (requestUrl.pathname === "/api/cpw/stop" || requestUrl.pathname === "/api/cpw/restart")) {
+      const action: CpwAction = requestUrl.pathname === "/api/cpw/stop" ? "stop" : "restart";
+      const cpwPath = await findCpwCommand();
+      if (!cpwPath) {
+        throw new HttpError(409, cpwUnavailableMessage, "cpw_unavailable");
+      }
+      await requireCpwManagedCopilotWeb(cpwPath);
+      jsonResponse(response, 202, { action });
+      // cpw ends this server, so it starts only after the response has been written.
+      response.once("close", () => {
+        try {
+          startCpwAction(cpwPath, action);
+        } catch (error) {
+          console.error(`[server] Could not run cpw ${action}: ${error instanceof Error ? error.message : error}`);
+        }
       });
       return true;
     }

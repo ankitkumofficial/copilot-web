@@ -697,6 +697,19 @@ input.on("line", (line) => {
 });
 `;
 
+// Stands in for cpw. `stop` and `restart` end the server the way launchctl bootout does, by signalling its parent.
+const fakeCpw = (statusLine: string, restart: string) => `#!/bin/sh
+printf '%s\\n' "$1" >> "$(dirname "$0")/cpw-calls.log"
+case "$1" in
+  status) echo "${statusLine}" ;;
+  stop) kill -TERM "$PPID" ;;
+  restart)
+    kill -TERM "$PPID"
+    ${restart}
+    ;;
+esac
+`;
+
 const fakeGitHubCli = `#!/usr/bin/env node
 const fs = require("node:fs");
 fs.appendFileSync(
@@ -878,6 +891,7 @@ async function startTestServer(t: TestContext, options: {
   webUser?: string;
   nativeSessionDelete?: boolean;
   quotaCommand?: "success" | "failure" | "missing";
+  cpwCommand?: "running" | "not-running" | "missing" | "restarts";
   aicUsageEvents?: number;
   aicNoopUsageEvent?: boolean;
   sessionActivity?: Record<string, string>;
@@ -901,6 +915,7 @@ async function startTestServer(t: TestContext, options: {
   const copilotSdk = path.join(directory, "copilot-sdk");
   const fakeCommand = path.join(directory, "copilot-fake");
   const fakeGitHubCommand = path.join(directory, "gh-fake");
+  const fakeCpwCommand = path.join(directory, "cpw-fake");
   const githubCliLogPath = path.join(projects, "gh-requests.log");
   const port = await unusedPort();
   await mkdir(home, { recursive: true });
@@ -915,6 +930,14 @@ async function startTestServer(t: TestContext, options: {
   await chmod(fakeCommand, 0o700);
   await writeFile(fakeGitHubCommand, fakeGitHubCli);
   await chmod(fakeGitHubCommand, 0o700);
+  await writeFile(fakeCpwCommand, fakeCpw(
+    options.cpwCommand === "not-running" ? "copilot-web is not running" : "copilot-web is running on 127.0.0.1:8765",
+    options.cpwCommand === "restarts"
+      ? `(sleep 2; exec "${process.execPath}" "${fileURLToPath(new URL("./server.js", import.meta.url))}") >/dev/null 2>&1 &
+    echo $! > "$(dirname "$0")/restarted.pid"`
+      : ""
+  ));
+  await chmod(fakeCpwCommand, 0o700);
   if (options.nativeHistory) {
     await mkdir(copilotSdk, { recursive: true });
     await writeFile(path.join(copilotSdk, "package.json"), JSON.stringify({ type: "module" }));
@@ -937,6 +960,9 @@ async function startTestServer(t: TestContext, options: {
       GH_BIN: options.quotaCommand === "missing"
         ? path.join(directory, "gh-not-installed")
         : fakeGitHubCommand,
+      CPW_BIN: options.cpwCommand === "missing"
+        ? path.join(directory, "cpw-not-installed")
+        : fakeCpwCommand,
       COPILOT_ALLOW_ALL: String(options.allowAll ?? false),
       COPILOT_WEB_USER: options.webUser ?? "",
       COPILOT_SDK_PATH: options.nativeHistory
@@ -1025,6 +1051,7 @@ async function startTestServer(t: TestContext, options: {
     headers,
     directory,
     projectsDirectory: projects,
+    exited: new Promise<void>((resolve) => child.once("exit", () => resolve())),
     sessionId,
     createSession,
     session: (id: string) => readFile(path.join(projects, `profile-session-${id}.json`), "utf8")
@@ -1601,6 +1628,39 @@ test("updates empty-session IDs through the API and preserves metadata and selec
   assert.equal(usage?.size, 968_000);
   assert.equal((await server.requests()).some((request) => request.method === "session/load"), false);
 });
+
+test("tells the user to install cpw before stop or restart can run", async (t) => {
+  const server = await startTestServer(t, { cpwCommand: "missing" });
+  const availability = await fetch(`${server.baseUrl}/api/cpw`, { headers: server.headers });
+  const body = await availability.json() as JsonObject;
+  assert.equal(body.available, false);
+  assert.match(String(body.message), /Install cpw first/);
+  for (const action of ["stop", "restart"]) {
+    const response = await fetch(`${server.baseUrl}/api/cpw/${action}`, { method: "POST", headers: server.headers });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json() as JsonObject).code, "cpw_unavailable");
+  }
+  assert.equal((await fetch(`${server.baseUrl}/api/cpw`, { headers: server.headers })).status, 200);
+});
+
+test("refuses cpw stop and restart for a copilot-web that cpw did not start", async (t) => {
+  const server = await startTestServer(t, { cpwCommand: "not-running" });
+  const response = await fetch(`${server.baseUrl}/api/cpw/restart`, { method: "POST", headers: server.headers });
+  assert.equal(response.status, 409);
+  assert.equal((await response.json() as JsonObject).code, "not_managed");
+  assert.equal(await readFile(path.join(server.directory, "cpw-calls.log"), "utf8"), "status\n");
+});
+
+for (const action of ["stop", "restart"] as const) {
+  test(`runs cpw ${action} after answering the request, which ends the server`, { timeout: 30_000 }, async (t) => {
+    const server = await startTestServer(t);
+    const response = await fetch(`${server.baseUrl}/api/cpw/${action}`, { method: "POST", headers: server.headers });
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { action });
+    await server.exited;
+    assert.equal(await readFile(path.join(server.directory, "cpw-calls.log"), "utf8"), `status\n${action}\n`);
+  });
+}
 
 test("archives and restores conversations through the API and persists the archive", async (t) => {
   const server = await startTestServer(t, { existingSession: true });
@@ -3009,9 +3069,9 @@ async function startTestBrowser(t: TestContext, baseUrl: string, preloadScript?:
       throw error;
     }
   );
-  const waitFor = async (expression: string): Promise<void> => {
+  const waitFor = async (expression: string, timeoutMs = 15_000): Promise<void> => {
     // Full-suite runs share CPU with parallel test files and other load; 10s was too tight for slow browser updates.
-    const deadline = Date.now() + 15_000;
+    const deadline = Date.now() + timeoutMs;
     while (!await conditionHolds(expression)) {
       if (Date.now() >= deadline) {
         const details = await evaluate(`({
@@ -3307,6 +3367,85 @@ test("deletes conversations in the background while navigating and sending new p
     assert.equal(await evaluate(`document.querySelector("#messages").textContent.includes("New prompt 2")`), true);
   }
   assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+});
+
+// Sends one key press to the focused element of a test browser.
+async function pressBrowserKey(
+  command: Awaited<ReturnType<typeof startTestBrowser>>["command"],
+  sessionId: string,
+  key: "Enter" | "Escape"
+): Promise<void> {
+  const windowsVirtualKeyCode = key === "Enter" ? 13 : 27;
+  await command("Input.dispatchKeyEvent", {
+    type: "keyDown", key, code: key, windowsVirtualKeyCode, ...(key === "Enter" ? { text: "\r" } : {})
+  }, sessionId);
+  await command("Input.dispatchKeyEvent", { type: "keyUp", key, code: key, windowsVirtualKeyCode }, sessionId);
+}
+
+test("stops copilot-web through cpw from the sidebar when Enter confirms and shows it as stopped", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 90_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`document.querySelector("#connection-label")?.textContent === "Connected"`);
+
+  await evaluate(`document.querySelector("#server-stop").click()`);
+  await waitFor(`document.querySelector("#server-dialog")?.open === true`);
+  await pressBrowserKey(command, sessionId, "Escape");
+  await waitFor(`document.querySelector("#server-dialog")?.open !== true`);
+  assert.equal(await readFile(path.join(server.directory, "cpw-calls.log"), "utf8").catch(() => ""), "");
+
+  await evaluate(`document.querySelector("#server-stop").click()`);
+  await waitFor(`document.querySelector("#server-dialog")?.open === true`);
+  await pressBrowserKey(command, sessionId, "Enter");
+  await waitFor(`document.querySelector("#connection-label")?.textContent === "Stopped" || document.querySelector("#server-status")?.dataset.tone === "error"`, 60_000);
+  assert.equal(await evaluate(`document.querySelector("#connection-label").textContent`), "Stopped",
+    String(await evaluate(`document.querySelector("#server-status").textContent`)));
+  assert.equal(await evaluate(`document.querySelector("#server-stop").getAttribute("aria-disabled")`), "true");
+  await server.exited;
+  assert.equal(await evaluate(`document.querySelector("#server-status").textContent.includes("cpw start")`), true);
+});
+
+test("restarts copilot-web through cpw from the sidebar and reloads once it is back", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 90_000
+}, async (t) => {
+  const server = await startTestServer(t, { cpwCommand: "restarts" });
+  // The fake cpw starts a replacement server on the same port; stop it when the test ends.
+  registerResourceCleanup(t, async () => {
+    const pid = Number((await readFile(path.join(server.directory, "restarted.pid"), "utf8").catch(() => "")).trim());
+    if (pid > 0) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        // The replacement server already exited.
+      }
+    }
+  });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`document.querySelector("#connection-label")?.textContent === "Connected"`);
+
+  await evaluate(`window.loadedBeforeRestart = true`);
+  await evaluate(`document.querySelector("#server-restart").click()`);
+  await waitFor(`document.querySelector("#server-dialog")?.open === true`);
+  await evaluate(`document.querySelector("#server-dialog-confirm").click()`);
+  await waitFor(`window.loadedBeforeRestart !== true && document.querySelector("#connection-label")?.textContent === "Connected"`, 60_000);
+  assert.equal(await readFile(path.join(server.directory, "cpw-calls.log"), "utf8"), "status\nrestart\n");
+});
+
+test("explains that cpw must be installed when the sidebar restart control is used without it", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { cpwCommand: "missing" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`document.querySelector("#server-restart")?.getAttribute("aria-disabled") === "true"`);
+
+  await evaluate(`document.querySelector("#server-restart").click()`);
+  await waitFor(`document.querySelector("#server-status")?.hidden === false`);
+  assert.match(String(await evaluate(`document.querySelector("#server-status").textContent`)), /Install cpw first/);
+  assert.equal(await evaluate(`document.querySelector("#server-dialog").open`), false);
 });
 
 test("archives conversations behind a confirmation and restores them from the collapsed Archived section", {

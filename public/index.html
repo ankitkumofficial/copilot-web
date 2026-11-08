@@ -43,7 +43,20 @@
         <div class="sidebar-footer">
           <span id="connection-status" class="status-dot status-connecting"></span>
           <span id="connection-label">Connecting...</span>
+          <div class="server-controls" role="group" aria-label="copilot-web server">
+            <button id="server-restart" class="server-control" type="button" aria-label="Restart copilot-web" title="Restart copilot-web (cpw restart)" aria-disabled="false">
+              <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M19.727 15.071A8 8 0 1 1 17.657 7.343M17.657 2.843v4.5h-4.5"></path>
+              </svg>
+            </button>
+            <button id="server-stop" class="server-control" type="button" aria-label="Stop copilot-web" title="Stop copilot-web (cpw stop)" aria-disabled="false">
+              <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="6" y="6" width="12" height="12" rx="2.5" fill="currentColor" stroke="none"></rect>
+              </svg>
+            </button>
+          </div>
         </div>
+        <p id="server-status" class="server-status" role="status" aria-live="polite" hidden></p>
       </aside>
       <div
         id="sidebar-resizer"
@@ -423,6 +436,17 @@
         <div class="delete-dialog-actions">
           <button class="secondary-button" value="cancel" type="submit">Cancel</button>
           <button id="terminal-close-confirm" class="danger-button" value="confirm" type="submit">Close</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="server-dialog" class="delete-dialog" aria-labelledby="server-dialog-title" aria-describedby="server-dialog-description">
+      <form id="server-form" method="dialog">
+        <h2 id="server-dialog-title"></h2>
+        <p id="server-dialog-description"></p>
+        <div class="delete-dialog-actions">
+          <button class="secondary-button" value="cancel" type="submit">Cancel</button>
+          <button id="server-dialog-confirm" class="danger-button" value="confirm" type="submit"></button>
         </div>
       </form>
     </dialog>
