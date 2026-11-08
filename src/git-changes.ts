@@ -638,7 +638,102 @@ export function readStatus(repo: string, scope?: ReadonlySet<string>): Promise<R
   return pending;
 }
 
-export function validateRelativePathSyntax(value: unknown): string {
+export interface RepositoryFileEntry {
+  name: string;
+  // Path from the repository root with "/" separators.
+  path: string;
+  // A symbolic link takes the type of what it points to.
+  type: "directory" | "file";
+}
+
+export interface RepositoryFolderListing {
+  path: string;
+  entries: RepositoryFileEntry[];
+  truncated: boolean;
+}
+
+export const maximumFolderEntries = 2_000;
+
+export interface RepositoryFolderOptions {
+  // Names starting with "." (such as .env and .git) are listed only when this is set.
+  showHidden?: boolean;
+  limit?: number;
+}
+
+function isHiddenName(name: string): boolean {
+  return name.startsWith(".");
+}
+
+function hasHiddenSegment(relativePath: string): boolean {
+  return relativePath.split(/[\\/]/).some((segment) => isHiddenName(segment));
+}
+
+function folderUnavailable(error: unknown): GitChangesError {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "EACCES" || code === "EPERM"
+    ? new GitChangesError(403, "This folder cannot be read", "invalid_path")
+    : new GitChangesError(404, "This folder is not available", "invalid_path");
+}
+
+// Lists one folder from disk: its files and folders, including ignored and untracked ones. Hidden names are listed only
+// when showHidden is set. A folder reached through a symbolic link must still resolve inside the repository.
+export async function listRepositoryFolder(
+  repo: string,
+  folder: string,
+  { showHidden = false, limit = maximumFolderEntries }: RepositoryFolderOptions = {}
+): Promise<RepositoryFolderListing> {
+  if (!showHidden && hasHiddenSegment(folder)) {
+    throw new GitChangesError(400, "Hidden folders are not listed", "invalid_path");
+  }
+  const resolved = await realpath(folder ? path.join(repo, folder) : repo).catch((error: unknown) => {
+    throw folderUnavailable(error);
+  });
+  const root = await realpath(repo);
+  if (!isWithinOrEqual(root, resolved)) {
+    throw new GitChangesError(400, "File paths must stay inside the repository", "invalid_path");
+  }
+  const inside = path.relative(root, resolved);
+  if (!showHidden && hasHiddenSegment(inside)) {
+    throw new GitChangesError(400, "Hidden folders are not listed", "invalid_path");
+  }
+  const dirents = await readdir(resolved, { withFileTypes: true }).catch((error: unknown) => {
+    throw folderUnavailable(error);
+  });
+  const entries = await Promise.all(dirents
+    .filter((dirent) => showHidden || !isHiddenName(dirent.name))
+    .map(async (dirent): Promise<RepositoryFileEntry> => {
+      // stat follows a symbolic link, so a link to a folder is listed as a folder.
+      const target = dirent.isSymbolicLink()
+        ? await stat(path.join(resolved, dirent.name)).catch(() => undefined)
+        : undefined;
+      const directory = dirent.isDirectory() || target?.isDirectory() === true;
+      return {
+        name: dirent.name,
+        path: folder ? `${folder}/${dirent.name}` : dirent.name,
+        type: directory ? "directory" : "file"
+      };
+    }));
+  const sorted = entries.sort((left, right) => (
+    Number(left.type === "file") - Number(right.type === "file")
+  ) || left.name.localeCompare(right.name));
+  return {
+    path: folder,
+    entries: sorted.slice(0, limit),
+    truncated: sorted.length > limit
+  };
+}
+
+// Whether a file lies inside the repository. Previews outside the projects folder use this.
+export function isPreviewableInRepository(repo: string, absolutePath: string): boolean {
+  return path.relative(repo, absolutePath) !== "" && isWithinOrEqual(repo, absolutePath);
+}
+
+export interface RelativePathOptions {
+  // Only the Files tab opts in. The Git endpoints keep rejecting Git metadata.
+  allowGitMetadata?: boolean;
+}
+
+export function validateRelativePathSyntax(value: unknown, { allowGitMetadata = false }: RelativePathOptions = {}): string {
   if (typeof value !== "string" || value.length === 0 || value.length > 4096 || value.includes("\0")) {
     throw new GitChangesError(400, "A valid repository-relative path is required", "invalid_path");
   }
@@ -652,14 +747,14 @@ export function validateRelativePathSyntax(value: unknown): string {
   if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../")) {
     throw new GitChangesError(400, "File paths must stay inside the repository", "invalid_path");
   }
-  if (normalized.split("/").some((segment) => segment.toLowerCase() === ".git")) {
+  if (!allowGitMetadata && normalized.split("/").some((segment) => segment.toLowerCase() === ".git")) {
     throw new GitChangesError(400, "Git metadata cannot be read", "invalid_path");
   }
   return normalized;
 }
 
-export async function validateRelativePath(repo: string, value: unknown): Promise<string> {
-  const normalized = validateRelativePathSyntax(value);
+export async function validateRelativePath(repo: string, value: unknown, options: RelativePathOptions = {}): Promise<string> {
+  const normalized = validateRelativePathSyntax(value, options);
   // The file itself may be deleted, so resolve its nearest existing ancestor instead.
   let ancestor = path.dirname(path.join(repo, normalized));
   while (isWithinOrEqual(repo, ancestor)) {

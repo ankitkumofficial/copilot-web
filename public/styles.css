@@ -3090,6 +3090,7 @@ button:disabled {
 .changes-icon-button:focus-visible,
 .changes-action:focus-visible,
 .changes-list:focus-visible,
+.files-tree:focus-visible,
 .changes-resizer:focus-visible,
 .changes-split-resizer:focus-visible,
 .diff-hunk-action:focus-visible,
@@ -4146,6 +4147,106 @@ button:disabled {
   flex: 1 1 auto;
   flex-direction: column;
   min-height: 0;
+}
+
+.files-tabpanel {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Files tab: a tree of the repository's files whose folders look and behave like the repository picker's. */
+.files-tree {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 6px 8px;
+  outline: 0;
+}
+
+.files-item {
+  display: grid;
+  gap: 1px;
+}
+
+.files-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 4px 8px 4px calc(8px + (var(--level, 1) - 1) * 14px);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.files-row:hover,
+.files-item.is-active > .files-row {
+  background: var(--surface-hover);
+}
+
+.files-folder > .files-row {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.files-folder > .files-row:hover,
+.files-folder.is-active > .files-row {
+  color: var(--text);
+}
+
+.files-file[aria-selected="true"] > .files-row {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.files-row .button-icon {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+}
+
+.files-chevron {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+  transition: transform 120ms ease;
+}
+
+.files-folder[aria-expanded="true"] > .files-row .files-chevron {
+  transform: rotate(90deg);
+}
+
+.files-spacer {
+  flex: 0 0 auto;
+  width: 10px;
+}
+
+.files-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.files-note {
+  margin: 2px 8px 2px calc(8px + (var(--level, 1) - 1) * 14px);
+}
+
+.files-status[hidden] {
+  display: none;
+}
+
+.files-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 6px 10px 0;
 }
 
 .terminal-toolbar {

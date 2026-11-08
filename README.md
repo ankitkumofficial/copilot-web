@@ -200,9 +200,15 @@ remote service.
 - Open an interactive terminal for the selected repository from
   **More actions** → **Terminal**, next to the Repository panel's tabs; see
   [Interactive terminal](#interactive-terminal).
-- Review uncommitted changes in the **Repository** panel (**More actions** (⋯)
-  menu in the message bar, or `Ctrl+Shift+G`). It opens on **Current changes**
-  by default. **All changes** lists every uncommitted file in the repository.
+- Review uncommitted changes and browse files in the **Repository** panel
+  (**More actions** (⋯) menu in the message bar, or `Ctrl+Shift+G`). It opens on
+  **Current changes** by default. **Files** is the first tab: a tree of the
+  repository's files and folders as they are on disk, including ignored and
+  untracked ones. Names starting with `.`, such as `.env` and `.git`, are hidden
+  until you turn on **Hidden files** in that tab. The server sends them only
+  while it is on. Folders open and close as in the picker, and selecting a file
+  opens it in the file preview. **All changes** lists every uncommitted file in
+  the repository.
   **Current changes** lists only the files
   this conversation has edited with `edit`, `create`, or `apply_patch`; changes
   made by shell commands are not included. Its list is read from the
@@ -548,6 +554,8 @@ Reloading the page restores the screen of a running terminal.
   shows both parts. The panel does not show per-turn or per-tool-call diffs.
   Repositories must be under
   `COPILOT_PROJECTS_DIR`, or be the conversation's working-directory repository or the repository of its newest edit.
+  Previews and edits of files outside `COPILOT_PROJECTS_DIR` are limited to the
+  files inside those repositories, including hidden files such as `.git`.
   Lists stop at 2,000 files, diffs at 1 MiB (cut at a hunk boundary), and
   untracked files over 2 MB are not diffed. Git must be on the server's `PATH`
   (for the macOS LaunchAgent, see `SERVICE_PATH` in

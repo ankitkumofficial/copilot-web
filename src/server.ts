@@ -65,8 +65,10 @@ import { SerialTaskQueue } from "./persistence.js";
 import {
   computeStatus,
   GitChangesError,
+  isPreviewableInRepository,
   isWithinOrEqual,
   listProjectRepositories,
+  listRepositoryFolder,
   readFileDiff,
   readStatus,
   resetChangedFile,
@@ -1238,11 +1240,11 @@ async function readPreviewableFile(filePath: string): Promise<Buffer> {
 async function readLocalFilePreview(
   projectsDirectory: string,
   reference: string,
-  allowAll: boolean
+  isAllowed: (filePath: string) => boolean
 ): Promise<JsonObject> {
   const filePath = await resolveLocalFile(projectsDirectory, reference);
-  if (!allowAll && !isWithinDirectory(projectsDirectory, filePath)) {
-    throw new HttpError(403, "File previews are limited to the configured projects directory");
+  if (!isAllowed(filePath)) {
+    throw new HttpError(403, "File previews are limited to the projects directory and to repository files");
   }
   return localFilePreview(filePath, await readPreviewableFile(filePath));
 }
@@ -1255,7 +1257,11 @@ function withLineEndingsOf(original: string, text: string): string {
   return crlfCount > bareLfCount ? normalized.replace(/\n/g, "\r\n") : normalized;
 }
 
-async function saveLocalFilePreview(projectsDirectory: string, allowAll: boolean, body: JsonObject): Promise<JsonObject> {
+async function saveLocalFilePreview(
+  projectsDirectory: string,
+  isAllowed: (filePath: string) => boolean,
+  body: JsonObject
+): Promise<JsonObject> {
   const reference = body.path;
   const content = body.content;
   const version = body.version;
@@ -1270,8 +1276,8 @@ async function saveLocalFilePreview(projectsDirectory: string, allowAll: boolean
   }
 
   const filePath = await resolveLocalFile(projectsDirectory, reference);
-  if (!allowAll && !isWithinDirectory(projectsDirectory, filePath)) {
-    throw new HttpError(403, "File edits are limited to the configured projects directory");
+  if (!isAllowed(filePath)) {
+    throw new HttpError(403, "File edits are limited to the projects directory and to repository files");
   }
   const current = await readPreviewableFile(filePath);
   const originalText = previewText(filePath, current);
@@ -1623,6 +1629,17 @@ async function main(): Promise<void> {
       throw notAllowed;
     }
     return resolved;
+  };
+
+  // Previews and edits cover the projects folder and every file of a repository the server already uses, hidden files included.
+  const filePreviewAllowed = (filePath: string): boolean => {
+    if (allowAll || isWithinDirectory(projectsRoot, filePath)) {
+      return true;
+    }
+    const repository = [...knownRepositoryRoots]
+      .filter((root) => isWithinOrEqual(root, filePath))
+      .sort((left, right) => right.length - left.length)[0];
+    return repository !== undefined && isPreviewableInRepository(repository, filePath);
   };
 
   // Live edits are queued until the persisted history has been replayed, so older replayed edits never override newer live ones.
@@ -2764,13 +2781,13 @@ async function main(): Promise<void> {
       if (reference === null) {
         throw new HttpError(400, "A local file path is required");
       }
-      jsonResponse(response, 200, await readLocalFilePreview(projectsRoot, reference, allowAll));
+      jsonResponse(response, 200, await readLocalFilePreview(projectsRoot, reference, filePreviewAllowed));
       return true;
     }
 
     if (request.method === "PUT" && requestUrl.pathname === "/api/file-preview") {
       const body = await readJsonBody(request);
-      jsonResponse(response, 200, await filePreviewWrites.enqueue(() => saveLocalFilePreview(projectsRoot, allowAll, body)));
+      jsonResponse(response, 200, await filePreviewWrites.enqueue(() => saveLocalFilePreview(projectsRoot, filePreviewAllowed, body)));
       return true;
     }
 
@@ -2986,6 +3003,18 @@ async function main(): Promise<void> {
         section: requestedSection,
         context: requestedContext === "full" ? "full" : Number(requestedContext)
       }));
+      return true;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/api/git/files") {
+      const repo = await resolveAllowedRepository(requestUrl.searchParams.get("repo"));
+      const requestedFolder = requestUrl.searchParams.get("path");
+      const folder = requestedFolder ? await validateRelativePath(repo, requestedFolder, { allowGitMetadata: true }) : "";
+      const hidden = requestUrl.searchParams.get("hidden");
+      if (hidden !== null && hidden !== "0" && hidden !== "1") {
+        throw new HttpError(400, "The hidden parameter must be 0 or 1", "invalid_hidden");
+      }
+      jsonResponse(response, 200, await listRepositoryFolder(repo, folder, { showHidden: hidden === "1" }));
       return true;
     }
 

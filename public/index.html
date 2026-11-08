@@ -324,6 +324,7 @@
               </div>
             </div>
             <div class="repository-tabs" role="tablist" aria-label="Repository views">
+              <button id="repository-tab-files" class="repository-tab" type="button" role="tab" aria-selected="false" aria-controls="files-tabpanel" tabindex="-1">Files</button>
               <button id="repository-tab-current-changes" class="repository-tab" type="button" role="tab" aria-selected="true" aria-controls="changes-tabpanel" tabindex="0">Current changes</button>
               <button id="repository-tab-changes" class="repository-tab" type="button" role="tab" aria-selected="false" aria-controls="changes-tabpanel" tabindex="-1">All changes</button>
               <button id="repository-tab-terminal" class="repository-tab" type="button" role="tab" aria-selected="false" aria-controls="terminal-tabpanel" tabindex="-1" hidden>Terminal</button>
@@ -373,6 +374,13 @@
             </section>
             <p id="changes-diff-empty" class="changes-diff-empty">Select a file to see its diff.</p>
             </div>
+            <section id="files-tabpanel" class="repository-tabpanel files-tabpanel" role="tabpanel" aria-labelledby="repository-tab-files" hidden>
+              <div class="files-toolbar">
+                <button id="files-hidden-toggle" class="changes-action" type="button" aria-pressed="false" title="Show names that start with a dot, such as .env and .git">Hidden files</button>
+              </div>
+              <div id="files-status" class="changes-empty files-status" hidden></div>
+              <div id="files-tree" class="files-tree" role="tree" aria-label="Files in this repository" tabindex="0"></div>
+            </section>
             <section id="terminal-tabpanel" class="repository-tabpanel terminal-tabpanel" role="tabpanel" aria-labelledby="repository-tab-terminal" hidden>
               <div id="terminal-empty" class="terminal-empty">
                 <p id="terminal-empty-text"></p>

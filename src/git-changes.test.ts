@@ -8,12 +8,15 @@ import test, { type TestContext } from "node:test";
 import {
   type ChangedFile,
   GitChangesError,
+  isPreviewableInRepository,
   listProjectRepositories,
+  listRepositoryFolder,
   maximumDiffBytes,
   parseNumstat,
   parsePorcelainStatus,
   readFileDiff,
   readStatus,
+  type RepositoryFolderOptions,
   resetChangedFile,
   resolveToplevel,
   runGit,
@@ -135,6 +138,7 @@ test("validates repository-relative path syntax", () => {
       error instanceof GitChangesError && error.status === 400 && error.code === "invalid_path"
     ), String(invalid));
   }
+  assert.equal(validateRelativePathSyntax(".git/config", { allowGitMetadata: true }), ".git/config");
 });
 
 test("maps a missing git executable to git_unavailable", async () => {
@@ -342,6 +346,122 @@ test("lists nested repositories below folders, skipping hidden, dependency, and 
     { root: below("team", "api"), name: "api", relativePath: "team/api" },
     { root: below("team", "group", "service"), name: "service", relativePath: "team/group/service" }
   ]);
+});
+
+test("lists a folder from disk without hidden names unless asked", {
+  skip: skipWithoutGit
+}, async (t) => {
+  const repo = await temporaryRepository(t, false);
+  const write = async (name: string, content = "x\n") => {
+    await mkdir(path.dirname(path.join(repo, name)), { recursive: true });
+    await writeFile(path.join(repo, name), content);
+  };
+  await write("README.md");
+  await write(".env", "SECRET=1\n");
+  await write(".gitignore", "build/\n");
+  await write("src/app.ts");
+  await write("src/lib/util.ts");
+  await write("build/out.js");
+  await write("docs/old.md");
+  // A folder left empty by a deleted file is still a folder.
+  await rm(path.join(repo, "docs", "old.md"));
+  // A nested repository is a folder here, and its own .git is hidden like any other dot name.
+  await write("vendor/tool/index.js");
+  git(path.join(repo, "vendor", "tool"), "init", "-q");
+
+  const listing = async (folder: string, options: RepositoryFolderOptions = {}) => {
+    const result = await listRepositoryFolder(repo, folder, options);
+    return { truncated: result.truncated, entries: result.entries.map((entry) => [entry.path, entry.type]) };
+  };
+  assert.deepEqual(await listing(""), {
+    truncated: false,
+    entries: [
+      ["build", "directory"],
+      ["docs", "directory"],
+      ["src", "directory"],
+      ["vendor", "directory"],
+      ["README.md", "file"]
+    ]
+  });
+  assert.deepEqual((await listing("src")).entries, [["src/lib", "directory"], ["src/app.ts", "file"]]);
+  assert.deepEqual((await listing("build")).entries, [["build/out.js", "file"]]);
+  assert.deepEqual((await listing("docs")).entries, []);
+  assert.deepEqual((await listing("vendor/tool")).entries, [["vendor/tool/index.js", "file"]]);
+  assert.deepEqual(await listing("", { limit: 2 }), {
+    truncated: true,
+    entries: [["build", "directory"], ["docs", "directory"]]
+  });
+  await assert.rejects(listRepositoryFolder(repo, ".config"), (error: unknown) => (
+    error instanceof GitChangesError && error.code === "invalid_path"
+  ));
+
+  // Hidden names come back only when asked for, Git metadata included.
+  assert.deepEqual(await listing("", { showHidden: true }), {
+    truncated: false,
+    entries: [
+      [".git", "directory"],
+      ["build", "directory"],
+      ["docs", "directory"],
+      ["src", "directory"],
+      ["vendor", "directory"],
+      [".env", "file"],
+      [".gitignore", "file"],
+      ["README.md", "file"]
+    ]
+  });
+  assert.deepEqual((await listing("vendor/tool", { showHidden: true })).entries, [
+    ["vendor/tool/.git", "directory"],
+    ["vendor/tool/index.js", "file"]
+  ]);
+  assert.ok((await listing(".git", { showHidden: true })).entries.some(([entryPath]) => entryPath === ".git/HEAD"));
+  await assert.rejects(listRepositoryFolder(repo, ".git"), /Hidden folders are not listed/);
+});
+
+test("keeps symbolic links from reaching folders outside the repository, and hidden folders unless shown", {
+  skip: skipWithoutGit
+}, async (t) => {
+  const repo = await temporaryRepository(t, false);
+  const outside = path.join(path.dirname(repo), "outside");
+  await mkdir(outside);
+  await writeFile(path.join(outside, "secret.txt"), "outside\n");
+  await mkdir(path.join(repo, ".vault"));
+  await writeFile(path.join(repo, ".vault", "key.txt"), "hidden\n");
+  await mkdir(path.join(repo, "src"));
+  await writeFile(path.join(repo, "src", "app.ts"), "export {};\n");
+  await symlink(outside, path.join(repo, "linked-out"));
+  await symlink(path.join(repo, ".vault"), path.join(repo, "linked-vault"));
+  await symlink(path.join(repo, "src"), path.join(repo, "linked-src"));
+  await symlink(path.join(repo, ".git"), path.join(repo, "linked-git"));
+
+  // A link to a folder is listed as a folder, but opening it must still resolve inside the repository.
+  assert.deepEqual((await listRepositoryFolder(repo, "")).entries.map((entry) => [entry.path, entry.type]), [
+    ["linked-git", "directory"],
+    ["linked-out", "directory"],
+    ["linked-src", "directory"],
+    ["linked-vault", "directory"],
+    ["src", "directory"]
+  ]);
+  await assert.rejects(listRepositoryFolder(repo, "linked-out"), (error: unknown) => (
+    error instanceof GitChangesError && error.status === 400 && error.code === "invalid_path"
+  ));
+  await assert.rejects(listRepositoryFolder(repo, "linked-vault"), /Hidden folders are not listed/);
+  assert.deepEqual((await listRepositoryFolder(repo, "linked-vault", { showHidden: true })).entries.map((entry) => entry.path), [
+    "linked-vault/key.txt"
+  ]);
+  assert.deepEqual((await listRepositoryFolder(repo, "linked-src")).entries.map((entry) => entry.path), ["linked-src/app.ts"]);
+  const linkedGit = await listRepositoryFolder(repo, "linked-git", { showHidden: true });
+  assert.ok(linkedGit.entries.some((entry) => entry.path === "linked-git/HEAD"));
+});
+
+test("previews every file inside the repository, hidden names and Git metadata included", () => {
+  const repo = path.join(path.sep, "work", "repo");
+  assert.equal(isPreviewableInRepository(repo, path.join(repo, "README.md")), true);
+  assert.equal(isPreviewableInRepository(repo, path.join(repo, "build", "out.js")), true);
+  assert.equal(isPreviewableInRepository(repo, path.join(repo, ".env")), true);
+  assert.equal(isPreviewableInRepository(repo, path.join(repo, ".git", "config")), true);
+  assert.equal(isPreviewableInRepository(repo, path.join(repo, "vendor", "tool", ".git", "config")), true);
+  assert.equal(isPreviewableInRepository(repo, path.join(path.sep, "work", "outside.txt")), false);
+  assert.equal(isPreviewableInRepository(repo, repo), false);
 });
 
 const entryKeys = (files: readonly ChangedFile[]): string[] => files.map((file) => `${file.section}:${file.path}`).sort();
