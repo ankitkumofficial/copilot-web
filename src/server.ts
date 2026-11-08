@@ -1152,11 +1152,37 @@ function decodePreviewText(content: Buffer): string | undefined {
   }
 }
 
-async function readLocalFilePreview(
-  projectsDirectory: string,
-  reference: string,
-  allowAll: boolean
-): Promise<JsonObject> {
+// A text preview carries a version, so a save can tell whether the file changed after it was opened.
+function filePreviewVersion(content: Buffer): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+function previewText(filePath: string, content: Buffer): string | undefined {
+  const mimeType = inferredAttachmentMimeType(filePath);
+  return mimeType.startsWith("image/") || mimeType === "application/pdf"
+    ? undefined
+    : decodePreviewText(content);
+}
+
+function localFilePreview(filePath: string, content: Buffer): JsonObject {
+  const name = path.basename(filePath);
+  const text = previewText(filePath, content);
+  if (text === undefined) {
+    return {
+      name,
+      mimeType: inferredAttachmentMimeType(filePath),
+      data: content.toString("base64")
+    };
+  }
+  return {
+    name,
+    mimeType: "text/plain",
+    text,
+    version: filePreviewVersion(content)
+  };
+}
+
+async function resolveLocalFile(projectsDirectory: string, reference: string): Promise<string> {
   if (reference.length === 0 || reference.length > 4096) {
     throw new HttpError(400, "Invalid local file reference");
   }
@@ -1180,9 +1206,8 @@ async function readLocalFilePreview(
     throw new HttpError(400, "Invalid local file reference");
   }
 
-  let filePath: string;
   try {
-    filePath = await realpath(requestedPath);
+    return await realpath(requestedPath);
   } catch (error) {
     if (isRecord(error) && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
       throw new HttpError(404, "Local file not found");
@@ -1192,10 +1217,9 @@ async function readLocalFilePreview(
     }
     throw error;
   }
-  if (!allowAll && !isWithinDirectory(projectsDirectory, filePath)) {
-    throw new HttpError(403, "File previews are limited to the configured projects directory");
-  }
+}
 
+async function readPreviewableFile(filePath: string): Promise<Buffer> {
   const fileStats = await stat(filePath);
   if (!fileStats.isFile()) {
     throw new HttpError(400, "Only files can be previewed");
@@ -1208,15 +1232,75 @@ async function readLocalFilePreview(
   if (content.length > maximumPreviewFileBytes) {
     throw new HttpError(413, "File is too large to preview (maximum size is 2 MB)");
   }
-  const inferredMimeType = inferredAttachmentMimeType(filePath);
-  const text = inferredMimeType.startsWith("image/") || inferredMimeType === "application/pdf"
-    ? undefined
-    : decodePreviewText(content);
-  return {
-    name: path.basename(filePath),
-    mimeType: text === undefined ? inferredMimeType : "text/plain",
-    ...(text === undefined ? { data: content.toString("base64") } : { text })
-  };
+  return content;
+}
+
+async function readLocalFilePreview(
+  projectsDirectory: string,
+  reference: string,
+  allowAll: boolean
+): Promise<JsonObject> {
+  const filePath = await resolveLocalFile(projectsDirectory, reference);
+  if (!allowAll && !isWithinDirectory(projectsDirectory, filePath)) {
+    throw new HttpError(403, "File previews are limited to the configured projects directory");
+  }
+  return localFilePreview(filePath, await readPreviewableFile(filePath));
+}
+
+// The editor works with LF line endings. A file that uses CRLF keeps them, so saving does not rewrite every line.
+function withLineEndingsOf(original: string, text: string): string {
+  const normalized = text.replace(/\r\n?/g, "\n");
+  const crlfCount = original.split("\r\n").length - 1;
+  const bareLfCount = original.split("\n").length - 1 - crlfCount;
+  return crlfCount > bareLfCount ? normalized.replace(/\n/g, "\r\n") : normalized;
+}
+
+async function saveLocalFilePreview(projectsDirectory: string, allowAll: boolean, body: JsonObject): Promise<JsonObject> {
+  const reference = body.path;
+  const content = body.content;
+  const version = body.version;
+  if (typeof reference !== "string") {
+    throw new HttpError(400, "A local file path is required");
+  }
+  if (typeof content !== "string") {
+    throw new HttpError(400, "File content must be a string");
+  }
+  if (typeof version !== "string") {
+    throw new HttpError(400, "A file version is required");
+  }
+
+  const filePath = await resolveLocalFile(projectsDirectory, reference);
+  if (!allowAll && !isWithinDirectory(projectsDirectory, filePath)) {
+    throw new HttpError(403, "File edits are limited to the configured projects directory");
+  }
+  const current = await readPreviewableFile(filePath);
+  const originalText = previewText(filePath, current);
+  if (originalText === undefined) {
+    throw new HttpError(400, "Only text files can be edited");
+  }
+  if (filePreviewVersion(current) !== version) {
+    throw new HttpError(409, "The file changed after it was opened. Reload the preview before saving.", "file_changed");
+  }
+  if (content.includes("\0")) {
+    throw new HttpError(400, "Text files cannot contain NUL characters");
+  }
+  // Previews leave out the byte-order mark, so saving restores the one that the file starts with.
+  const byteOrderMark = Buffer.from([0xef, 0xbb, 0xbf]);
+  const hasByteOrderMark = current.subarray(0, byteOrderMark.length).equals(byteOrderMark);
+  const text = withLineEndingsOf(originalText, content);
+  const data = Buffer.concat([hasByteOrderMark ? byteOrderMark : Buffer.alloc(0), Buffer.from(text, "utf8")]);
+  if (data.length > maximumPreviewFileBytes) {
+    throw new HttpError(413, "File is too large to save (maximum size is 2 MB)");
+  }
+  try {
+    await writeFile(filePath, data);
+  } catch (error) {
+    if (isRecord(error) && ["EACCES", "EPERM", "EROFS"].includes(String(error.code))) {
+      throw new HttpError(403, "Local file is not writable");
+    }
+    throw error;
+  }
+  return localFilePreview(filePath, data);
 }
 
 function decodeAttachmentData(name: string, value: unknown): { data: string; size: number } {
@@ -1467,6 +1551,7 @@ async function main(): Promise<void> {
   const sessionArchiveWrites = new SerialTaskQueue();
   const repositoryRecordWrites = new SerialTaskQueue();
   const gitIndexWrites = new SerialTaskQueue();
+  const filePreviewWrites = new SerialTaskQueue();
   const replayingSessions = new Map<string, JsonObject[]>();
   const fallbackReplayTails = new Map<string, JsonObject[]>();
   const busySessions = new Map<string, BusyPrompt>();
@@ -2680,6 +2765,12 @@ async function main(): Promise<void> {
         throw new HttpError(400, "A local file path is required");
       }
       jsonResponse(response, 200, await readLocalFilePreview(projectsRoot, reference, allowAll));
+      return true;
+    }
+
+    if (request.method === "PUT" && requestUrl.pathname === "/api/file-preview") {
+      const body = await readJsonBody(request);
+      jsonResponse(response, 200, await filePreviewWrites.enqueue(() => saveLocalFilePreview(projectsRoot, allowAll, body)));
       return true;
     }
 

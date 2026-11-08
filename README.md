@@ -178,6 +178,9 @@ remote service.
   using the attachment picker.
 - Preview internal files linked from messages with syntax coloring based on
   their file type, without changing source text or whitespace.
+- Edit text files from their preview with the edit icon, then save with
+  **Save**. Edits follow the same file access rules as previews. Saving keeps
+  CRLF line endings and is refused if the file changed after it was opened.
 - Render common Markdown formatting in user and assistant messages, including
   emphasis, headings, lists, links, inline code, code blocks, and quotes.
 - Use a light or dark theme, defaulting to the browser/system theme.
