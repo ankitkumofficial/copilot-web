@@ -1527,6 +1527,40 @@ button:disabled {
   box-shadow: 0 0 0 3px rgba(139, 124, 255, 0.16), var(--shadow);
 }
 
+.composer::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  padding: 2px;
+  border-radius: inherit;
+  background: conic-gradient(from var(--starting-angle), transparent 55%, var(--accent) 85%, transparent);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+/* Appears only when creating the conversation takes long enough to notice. */
+.composer.is-starting::after {
+  opacity: 1;
+  transition: opacity 160ms ease 150ms;
+  animation: composer-starting-spin 1.2s linear infinite;
+}
+
+@property --starting-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes composer-starting-spin {
+  to {
+    --starting-angle: 360deg;
+  }
+}
+
 .pending-send-review {
   display: flex;
   flex-wrap: wrap;
@@ -3069,7 +3103,8 @@ button:disabled {
   }
 
   .decision-badge,
-  .changes-decision-icon {
+  .changes-decision-icon,
+  .composer.is-starting::after {
     animation: none;
   }
 }

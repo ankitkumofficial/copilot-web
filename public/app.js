@@ -248,6 +248,7 @@ function createConversationState(sessionId = null) {
     draftRevision: 0,
     promptQueue: [],
     pendingSubmissions: [],
+    startingPromptKeys: new Set(),
     creationRequest: null,
     failedPendingSendId: null,
     syntheticMessageCounter: 0,
@@ -3094,6 +3095,7 @@ function createSessionRow(session, { archived = false } = {}) {
 function renderConversationControls() {
   renderConfigurationControls();
   syncChangesPanelSession();
+  renderComposerStartingState();
 }
 
 function syncChangesPanelSession() {
@@ -8837,6 +8839,8 @@ async function submitPrompt() {
   submissionConversation.pendingSubmissions.push(submission);
   let pendingSend = null;
   let pendingSendWarning = null;
+  // An unsent first message is shown in the conversation and cleared from the composer until it is queued.
+  let firstPromptHeld = false;
   try {
     if (!conversation.sessionId) {
       conversation.creationRequest ??= {
@@ -8881,7 +8885,20 @@ async function submitPrompt() {
       pendingSend = null;
     }
     if (!conversation.sessionId) {
-      conversation = await createServerConversation(submissionConversation);
+      // The message moves from the composer into the conversation while its conversation is created behind it.
+      if (pendingSend) {
+        beginFirstPromptPending(conversation, pendingSend, displayText, attachments, selections);
+        clearSentDraft(submissionConversation, submission);
+        firstPromptHeld = true;
+      }
+      try {
+        conversation = await createServerConversation(submissionConversation);
+      } finally {
+        if (pendingSend) {
+          endFirstPromptPending(submissionConversation, pendingSend.id);
+          discardFirstPrompt(submissionConversation, pendingSend.id);
+        }
+      }
     }
     if (!conversation?.sessionId) {
       if (pendingSend) {
@@ -8936,23 +8953,8 @@ async function submitPrompt() {
     if (currentComposerConversation() === conversation) {
       persistComposerDraft();
     }
-    if (conversation.draftRevision === submission.draftRevision && conversation.draft === text) {
-      conversation.draft = "";
-      conversation.draftRevision += 1;
-    }
-    const sentAttachmentIds = new Set(attachmentReferences.map((attachment) => attachment.id));
-    const sentSelectionIds = new Set(selectionReferences.map((selection) => selection.id));
-    conversation.attachments = conversation.attachments.filter((attachment) => !sentAttachmentIds.has(attachment.id));
-    conversation.selections = conversation.selections.filter((selection) => !sentSelectionIds.has(selection.id));
-    if (conversation.selections.length === 0) {
-      conversation.nextSelectionNumber = 1;
-    }
-    if (currentComposerConversation() === conversation) {
-      elements.input.value = conversation.draft;
-      resizePromptInput();
-      renderAttachmentList();
-      renderSelectionList();
-    }
+    clearSentDraft(conversation, submission);
+    firstPromptHeld = false;
     enqueuePrompt(conversation, promptText, attachments, false, displayText, selections, pendingSend);
   } catch (error) {
     if (pendingSend) {
@@ -8964,11 +8966,91 @@ async function submitPrompt() {
     }
     showError(error, conversation ?? submissionConversation);
   } finally {
+    if (firstPromptHeld) {
+      restoreUnsentFirstPrompt(submissionConversation, submission, pendingSend);
+    }
     const submissionIndex = submissionConversation.pendingSubmissions.indexOf(submission);
     if (submissionIndex >= 0) {
       submissionConversation.pendingSubmissions.splice(submissionIndex, 1);
     }
   }
+}
+
+function beginFirstPromptPending(conversation, pendingSend, displayText, attachments, selections) {
+  addMessage("user", displayText, pendingSend.id, attachments, conversation, selections);
+  conversation.startingPromptKeys.add(pendingSend.id);
+  setStatus("Starting conversation...", conversation);
+  renderComposerStartingState();
+}
+
+function endFirstPromptPending(conversation, key) {
+  conversation.startingPromptKeys.delete(key);
+  renderComposerStartingState();
+}
+
+// A promoted conversation already holds its own messages, so only an unsent first message is removed.
+function discardFirstPrompt(conversation, key) {
+  if (conversation.sessionId !== null || !conversation.messageKeys.has(key)) {
+    return;
+  }
+  conversation.messages.splice(conversation.messageKeys.get(key), 1);
+  reindexMessages(conversation);
+  scheduleMessagesRender(conversation);
+}
+
+function renderComposerStartingState(conversation = currentComposerConversation()) {
+  const starting = conversation.sessionId === null && conversation.startingPromptKeys.size > 0;
+  elements.composer.classList.toggle("is-starting", starting);
+}
+
+function renderComposerDraft(conversation) {
+  if (currentComposerConversation() !== conversation) {
+    return;
+  }
+  elements.input.value = conversation.draft;
+  resizePromptInput();
+  renderAttachmentList();
+  renderSelectionList();
+}
+
+// Newer edits stay in place: the draft is cleared only while it is still the text that was sent.
+function clearSentDraft(conversation, submission) {
+  if (conversation.draftRevision === submission.draftRevision && conversation.draft === submission.text) {
+    conversation.draft = "";
+    conversation.draftRevision += 1;
+  }
+  const sentAttachmentIds = new Set(submission.attachments.map((attachment) => attachment.id));
+  const sentSelectionIds = new Set(submission.selections.map((selection) => selection.id));
+  conversation.attachments = conversation.attachments.filter((attachment) => !sentAttachmentIds.has(attachment.id));
+  conversation.selections = conversation.selections.filter((selection) => !sentSelectionIds.has(selection.id));
+  if (conversation.selections.length === 0) {
+    conversation.nextSelectionNumber = 1;
+  }
+  renderComposerDraft(conversation);
+}
+
+// An unsent first message returns to its composer. If that composer already has new input, or was replaced,
+// the message stays in the review list above the composer instead.
+function restoreUnsentFirstPrompt(conversation, submission, pendingSend) {
+  const canRestoreInPlace = conversation === state.composer || conversation.sessionId !== null;
+  const composerIsEmpty = conversation.draft === "" &&
+    conversation.attachments.length === 0 &&
+    conversation.selections.length === 0;
+  if (!canRestoreInPlace || !composerIsEmpty) {
+    if (conversation.failedPendingSendId === pendingSend.id) {
+      conversation.failedPendingSendId = null;
+    }
+    retainPendingSendForReview(pendingSend, conversation);
+    return;
+  }
+  conversation.draft = submission.text;
+  conversation.draftRevision += 1;
+  conversation.attachments = [...submission.attachments];
+  conversation.selections = [...submission.selections];
+  conversation.nextSelectionNumber = Math.max(0, ...conversation.selections.map((selection) => selection.number)) + 1;
+  // A refresh can abort the response after the server accepted creation.
+  conversation.failedPendingSendId = pendingSend.id;
+  renderComposerDraft(conversation);
 }
 
 function enqueuePrompt(

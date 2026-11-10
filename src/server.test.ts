@@ -8779,6 +8779,135 @@ test("keeps a send when reloading aborts the actual in-flight creation request",
   assert.equal(await evaluate(`document.querySelectorAll(".message.system").length`), 0);
 });
 
+test("shows a new conversation's first message while the conversation is being created", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      if (resource === "/api/sessions" && init?.method === "POST" && !window.creationHeld) {
+        window.creationHeld = true;
+        await new Promise((resolve) => { window.releaseCreation = resolve; });
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  const creationsBeforeSend = (await server.requests())
+    .filter((request) => request.method === "session/new").length;
+  const prompt = "Show me right away while the conversation starts";
+  await evaluate(`
+    document.querySelector("#prompt-input").value = ${JSON.stringify(prompt)};
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`window.creationHeld === true &&
+    document.querySelectorAll(".message.user").length === 1 &&
+    document.querySelector("#composer").classList.contains("is-starting")`);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "");
+  assert.equal((await server.requests()).filter((request) => request.method === "session/new").length,
+    creationsBeforeSend);
+
+  await evaluate(`window.releaseCreation()`);
+  assert.deepEqual(await sentPromptTexts(server, 1), [prompt]);
+  await waitFor(`document.querySelector("#messages")?.textContent.includes("Done.")`);
+  assert.equal(await evaluate(`document.querySelectorAll(".message.user").length`), 1);
+  assert.equal(await evaluate(`document.querySelector("#composer").classList.contains("is-starting")`), false);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "");
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("removes an unsent first message when its conversation cannot be created and keeps its draft and attachments", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      if (resource === "/api/sessions" && init?.method === "POST" && !window.creationFailed) {
+        window.creationFailed = true;
+        return new Response(JSON.stringify({ error: "Copilot is unavailable" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  await evaluate(`
+    const files = new DataTransfer();
+    files.items.add(new File(["notes"], "notes.txt", { type: "text/plain" }));
+    const fileInput = document.querySelector("#file-input");
+    fileInput.files = files.files;
+    fileInput.dispatchEvent(new Event("change"));
+  `);
+  await waitFor(`document.querySelector("#attachment-list").textContent.includes("notes.txt") &&
+    document.querySelector("#attach-files").disabled === false`);
+  const prompt = "Keep this draft when the conversation fails to start";
+  await evaluate(`
+    document.querySelector("#prompt-input").value = ${JSON.stringify(prompt)};
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`document.querySelector("#messages")?.textContent.includes("Copilot is unavailable")`);
+  assert.equal(await evaluate(`document.querySelectorAll(".message.user").length`), 0);
+  assert.equal(await evaluate(`document.querySelector("#composer").classList.contains("is-starting")`), false);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), prompt);
+  assert.equal(await evaluate(`document.querySelector("#attachment-list").textContent.includes("notes.txt")`), true);
+
+  await evaluate(`document.querySelector("#composer").requestSubmit()`);
+  assert.deepEqual(await sentPromptTexts(server, 1), [prompt]);
+  await waitFor(`document.querySelector("#messages")?.textContent.includes("Done.")`);
+  assert.equal(await evaluate(`document.querySelectorAll(".message.user").length`), 1);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("keeps an unsent first message for review when new text was typed before its conversation fails", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t, { profileSessions: true });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (resource, init) => {
+      if (resource === "/api/sessions" && init?.method === "POST" && !window.creationFailed) {
+        window.creationFailed = true;
+        await new Promise((resolve) => { window.releaseCreation = resolve; });
+        return new Response(JSON.stringify({ error: "Copilot is unavailable" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      return nativeFetch(resource, init);
+    };
+  `);
+  await waitFor(`document.querySelector("#model-select")?.disabled === false`);
+  const prompt = "Keep this message for review when its conversation fails";
+  const typedDuringCreation = "Typed while the conversation starts";
+  await evaluate(`
+    document.querySelector("#prompt-input").value = ${JSON.stringify(prompt)};
+    document.querySelector("#composer").requestSubmit();
+  `);
+  await waitFor(`window.creationFailed === true && document.querySelectorAll(".message.user").length === 1`);
+  await evaluate(`
+    const input = document.querySelector("#prompt-input");
+    input.value = ${JSON.stringify(typedDuringCreation)};
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+  `);
+  await evaluate(`window.releaseCreation()`);
+  await waitFor(`document.querySelector("#messages")?.textContent.includes("Copilot is unavailable")`);
+  assert.equal(await evaluate(`document.querySelectorAll(".message.user").length`), 0);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), typedDuringCreation);
+  assert.equal(await evaluate(`
+    document.querySelector("#pending-send-reviews").hidden === false &&
+      document.querySelector("#pending-send-reviews").textContent.includes(${JSON.stringify(prompt)})
+  `), true);
+  assert.deepEqual(await sentPromptTexts(server, 0), []);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
 for (const working of [false, true]) {
   test(`restores a new ${working ? "working" : "completed"} conversation before the CLI lists it`, {
     skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",

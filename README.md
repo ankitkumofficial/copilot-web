@@ -67,6 +67,10 @@ remote service.
   redirects it to whichever conversation is currently selected. Draft text and
   attachments composed after **Send** remain intact while creation finishes,
   including edits in the same composer and files that are still being read.
+  A first message leaves the composer as soon as it is sent and appears in its
+  conversation at once; if creation fails, it returns to the composer, or stays
+  in the review list above the composer if you typed a new draft or clicked
+  **New conversation** in the meantime.
 - Preserve submitted messages across an immediate refresh, even while the first
   conversation is still being created. Pending sends are kept in this tab's
   browser session storage until delivery is confirmed, including when a refresh
