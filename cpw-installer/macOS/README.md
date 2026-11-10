@@ -27,6 +27,19 @@ cpw stop
 LaunchAgent logs are written to `~/Library/Logs/copilot-web/`. Complete
 `copilot login` before using the app.
 
+The LaunchAgent starts Node through non-interactive `/bin/zsh`, which reads
+`~/.zshenv` on every service start. Keep service environment variables exported
+there (for example, `export MY_VARIABLE="value"`), then run `cpw restart` after
+changing them. It does not read `~/.zshrc` or `~/.zprofile`, or inherit the
+environment of the terminal running `cpw`. Variables are loaded at startup,
+not copied into the plist. If you installed an older version, rerun the installer
+and then `cpw restart` to apply this startup behavior.
+
+`restart` and `stop` use `launchctl bootout --wait` to finish unloading the
+service before continuing. This prevents a restart, or a subsequent `start`,
+from racing with an unfinished shutdown. These commands require a macOS version
+that supports `bootout --wait` and can remain waiting if shutdown stalls.
+
 If the checkout is moved, run the installer again from its new location, then
 run `cpw restart` to load the updated LaunchAgent configuration.
 
