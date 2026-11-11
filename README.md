@@ -187,6 +187,13 @@ remote service.
   to the bottom.
 - Collapse or expand the conversation sidebar; its state is remembered in the
   browser.
+- Restart or stop copilot-web from the sidebar footer, next to the connection
+  status. The buttons run `cpw restart` and `cpw stop` after a confirmation, so
+  they need the [macOS `cpw` command](cpw-installer/macOS/README.md); without it
+  they explain how to install it. Restart reloads the page when the server is
+  back. Output from these commands is appended to
+  `~/Library/Logs/copilot-web/cpw.log`. Running prompts and terminals end, and
+  after a stop, run `cpw start` in a terminal.
 - Open an interactive terminal for the selected repository from
   **More actions** → **Terminal**, next to the Repository panel's tabs; see
   [Interactive terminal](#interactive-terminal).
@@ -573,6 +580,7 @@ retrieve quota, the composer shows a warning in place of the numbers.
 | `COPILOT_PROJECTS_DIR` | `~/projects` | Starting directory for new conversations |
 | `COPILOT_BIN` | `copilot` | Copilot CLI executable |
 | `GH_BIN` | `gh` | GitHub CLI executable used to retrieve account quota |
+| `CPW_BIN` | unset | `cpw` executable used by the sidebar Stop and Restart buttons; when unset, the server looks on `PATH` and in `~/.local/bin` |
 | `COPILOT_ALLOW_ALL` | `false` | Pass `--allow-all` to the Copilot ACP process |
 | `COPILOT_NATIVE_SESSION_DELETE` | `true` | Enable the SDK/native CLI fallback for deleting sessions |
 | `COPILOT_SDK_PATH` | auto-discovered | Optional path to the installed Copilot SDK `index.js`, used for session deletion and persisted-message history |

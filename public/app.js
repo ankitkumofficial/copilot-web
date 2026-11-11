@@ -830,6 +830,14 @@ const elements = {
   deleteTitle: document.querySelector("#delete-title"),
   deleteDescription: document.querySelector("#delete-description"),
   archiveDialog: document.querySelector("#archive-dialog"),
+  serverRestart: document.querySelector("#server-restart"),
+  serverStop: document.querySelector("#server-stop"),
+  serverStatus: document.querySelector("#server-status"),
+  serverDialog: document.querySelector("#server-dialog"),
+  serverForm: document.querySelector("#server-form"),
+  serverDialogTitle: document.querySelector("#server-dialog-title"),
+  serverDialogDescription: document.querySelector("#server-dialog-description"),
+  serverDialogConfirm: document.querySelector("#server-dialog-confirm"),
   archiveTitle: document.querySelector("#archive-title"),
   renameDialog: document.querySelector("#rename-dialog"),
   renameForm: document.querySelector("#rename-form"),
@@ -846,6 +854,16 @@ const elements = {
 };
 
 const speechRecognitionConstructor = window.SpeechRecognition ?? window.webkitSpeechRecognition;
+const serverControlState = {
+  available: true,
+  unavailableMessage: "",
+  busy: false,
+  stopped: false
+};
+const serverStopTimeoutMs = 30_000;
+const serverRestartTimeoutMs = 180_000;
+let pendingServerConfirmation = null;
+
 const voiceInputState = {
   supported: Boolean(window.isSecureContext) && typeof speechRecognitionConstructor === "function",
   unavailableReason: window.isSecureContext
@@ -1004,7 +1022,8 @@ function applyBranding(value, initial) {
 const statusFaviconColors = {
   connected: "#51d68a",
   connecting: "#e5b75c",
-  error: "#f2788b"
+  error: "#f2788b",
+  stopped: "#9aa2af"
 };
 
 function renderStatusFavicon(status) {
@@ -1944,7 +1963,7 @@ function renderConnectionStatus() {
       : backgroundPromptCount > 0 && state.connectionStatus === "connected"
         ? `${backgroundPromptCount} other conversation${backgroundPromptCount === 1 ? "" : "s"} working`
       : state.connectionLabel;
-  elements.connectionStatus.classList.remove("status-connected", "status-error", "status-connecting");
+  elements.connectionStatus.classList.remove("status-connected", "status-error", "status-connecting", "status-stopped");
   elements.connectionStatus.classList.add(`status-${status}`);
   elements.connectionLabel.textContent = label;
   renderStatusFavicon(faviconStatus);
@@ -1954,6 +1973,138 @@ function setConnection(status, label) {
   state.connectionStatus = status;
   state.connectionLabel = label;
   renderConnectionStatus();
+}
+
+function renderServerControls() {
+  const unavailable = serverControlState.available === false;
+  const locked = serverControlState.busy || serverControlState.stopped;
+  for (const button of [elements.serverRestart, elements.serverStop]) {
+    button.setAttribute("aria-disabled", String(unavailable || locked));
+  }
+}
+
+function showServerStatus(message, tone) {
+  elements.serverStatus.textContent = message;
+  elements.serverStatus.dataset.tone = tone;
+  elements.serverStatus.hidden = false;
+}
+
+function clearServerStatus() {
+  elements.serverStatus.textContent = "";
+  elements.serverStatus.hidden = true;
+}
+
+async function loadServerControlAvailability() {
+  try {
+    const response = await fetch("/api/cpw", { cache: "no-store", credentials: "same-origin" });
+    if (!response.ok) {
+      return;
+    }
+    const body = await response.json();
+    serverControlState.available = body.available === true;
+    serverControlState.unavailableMessage = typeof body.message === "string" ? body.message : "";
+    renderServerControls();
+  } catch {
+    // An unreachable server is already shown by the connection status.
+  }
+}
+
+function confirmServerAction(action) {
+  const restarting = action === "restart";
+  const title = restarting ? "Restart copilot-web?" : "Stop copilot-web?";
+  const description = restarting
+    ? "Running prompts and open terminals will end. This page reloads when copilot-web is back."
+    : "Running prompts and open terminals will end. Start copilot-web again with cpw start in a terminal.";
+  if (typeof elements.serverDialog.showModal !== "function") {
+    return Promise.resolve(window.confirm(`${title}\n\n${description}`));
+  }
+
+  elements.serverDialogTitle.textContent = title;
+  elements.serverDialogDescription.textContent = description;
+  elements.serverDialogConfirm.textContent = restarting ? "Restart" : "Stop";
+  elements.serverDialogConfirm.className = restarting ? "send-button" : "danger-button";
+  return new Promise((resolve) => {
+    pendingServerConfirmation?.(false);
+    pendingServerConfirmation = resolve;
+    elements.serverDialog.showModal();
+  });
+}
+
+// Any HTTP answer, even an authorization failure, means the server is up; only a failed connection means it is down.
+async function serverResponds() {
+  try {
+    await fetch("/api/cpw", { cache: "no-store", credentials: "same-origin", signal: AbortSignal.timeout(2_000) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitUntil(condition, timeoutMs, intervalMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await condition()) {
+      return true;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+  }
+  return false;
+}
+
+async function runServerAction(action) {
+  if (serverControlState.busy || serverControlState.stopped) {
+    return;
+  }
+  if (serverControlState.available === false) {
+    showServerStatus(serverControlState.unavailableMessage, "info");
+    return;
+  }
+  if (!await confirmServerAction(action)) {
+    return;
+  }
+
+  serverControlState.busy = true;
+  renderServerControls();
+  try {
+    await performServerAction(action);
+  } finally {
+    serverControlState.busy = false;
+    renderServerControls();
+  }
+}
+
+async function performServerAction(action) {
+  const restarting = action === "restart";
+  showServerStatus(restarting ? "Restarting copilot-web…" : "Stopping copilot-web…", "info");
+  try {
+    const response = await fetch(`/api/cpw/${action}`, { method: "POST", cache: "no-store", credentials: "same-origin" });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      showServerStatus(body.error ?? "copilot-web did not accept the request.", ["cpw_unavailable", "not_managed"].includes(body.code) ? "info" : "error");
+      return;
+    }
+  } catch {
+    // The server can end before it answers; the checks below decide the outcome.
+  }
+
+  const wentDown = await waitUntil(async () => !await serverResponds(), serverStopTimeoutMs, 500);
+  if (!wentDown) {
+    showServerStatus("copilot-web is still running. Check ~/Library/Logs/copilot-web/cpw.log for details.", "error");
+    return;
+  }
+  if (!restarting) {
+    serverControlState.stopped = true;
+    setConnection("stopped", "Stopped");
+    showServerStatus("copilot-web stopped. Run cpw start in a terminal to bring it back; this page reconnects automatically.", "info");
+    return;
+  }
+  setConnection("connecting", "Restarting…");
+  const cameBack = await waitUntil(serverResponds, serverRestartTimeoutMs, 1_000);
+  if (cameBack) {
+    window.location.reload();
+    return;
+  }
+  showServerStatus("copilot-web hasn't come back yet. Check ~/Library/Logs/copilot-web/cpw.log for details.", "error");
 }
 
 function promptIsActive(conversation = activeConversation()) {
@@ -9228,6 +9379,9 @@ function connectEvents() {
       state.selectedContext = state.newSessionDefaults.context;
     }
     setConnection("connected", "Connected");
+    serverControlState.stopped = false;
+    clearServerStatus();
+    renderServerControls();
     void loadContextDefaults(state.selectedContext);
     void (async () => {
       try {
@@ -9730,6 +9884,24 @@ elements.cancel.addEventListener("click", () => {
   void cancelPrompt();
 });
 elements.reconnectTools.addEventListener("click", reconnectTools);
+elements.serverRestart.addEventListener("click", () => runServerAction("restart"));
+elements.serverStop.addEventListener("click", () => runServerAction("stop"));
+elements.serverDialog.addEventListener("close", () => {
+  // A close queued before the dialog reopened must not answer the newer confirmation.
+  if (elements.serverDialog.open || pendingServerConfirmation === null) {
+    return;
+  }
+  const resolve = pendingServerConfirmation;
+  pendingServerConfirmation = null;
+  resolve(elements.serverDialog.returnValue === "confirm");
+});
+elements.serverDialog.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.isComposing) {
+    return;
+  }
+  event.preventDefault();
+  elements.serverForm.requestSubmit(elements.serverDialogConfirm);
+});
 elements.keepAwake.addEventListener("click", () => {
   setScreenWakeLockEnabled(!screenWakeLock.enabled);
   screenWakeLock.error = null;
@@ -9810,4 +9982,5 @@ resizePromptInput();
 renderMessages();
 renderConnectionStatus();
 void updateScreenWakeLock();
+void loadServerControlAvailability();
 connectEvents();
