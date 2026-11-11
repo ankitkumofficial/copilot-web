@@ -136,6 +136,7 @@ export function initChangesPanel({
   attachFiles,
   changeWorkingDirectory,
   terminal = null,
+  filesPanel = null,
   notify = () => {},
   onDecisionChange = () => {}
 }) {
@@ -156,11 +157,13 @@ export function initChangesPanel({
     repositoryLabel: query("#changes-repository-label"),
     repositoryMenu: query("#changes-repository-menu"),
     branch: query("#changes-branch"),
+    tabFiles: query("#repository-tab-files"),
     tabChanges: query("#repository-tab-changes"),
     tabCurrentChanges: query("#repository-tab-current-changes"),
     tabTerminal: query("#repository-tab-terminal"),
     tabsRow: query(".repository-tabs"),
     changesTabpanel: query("#changes-tabpanel"),
+    filesTabpanel: query("#files-tabpanel"),
     terminalTabpanel: query("#terminal-tabpanel"),
     // Created from a template only while the terminal is enabled, so a disabled server leaves no menu entry.
     terminalAction: null,
@@ -204,6 +207,8 @@ export function initChangesPanel({
     // The terminal tab exists only when the server enables it; the tab resets to Current changes when it does not.
     terminalEnabled: false,
     tab: "current",
+    // The changes view shown last, which decides whether an open diff survives a switch through Files or the terminal.
+    changesTab: "current",
     editorUrlTemplate: null,
     session: null,
     sessionRoot: null,
@@ -356,23 +361,29 @@ export function initChangesPanel({
 
   // ---- tabs ------------------------------------------------------------
 
+  function isChangesTab(tab) {
+    return tab === "current" || tab === "all";
+  }
+
   function applyTabs() {
     syncTerminalAction();
-    const onChanges = s.tab !== "terminal" || !s.terminalEnabled;
-    const activeChangesTab = s.tab === "current" ? el.tabCurrentChanges : el.tabChanges;
+    const buttons = { files: el.tabFiles, current: el.tabCurrentChanges, all: el.tabChanges, terminal: el.tabTerminal };
     el.tabTerminal.hidden = !s.terminalEnabled;
-    for (const button of [el.tabChanges, el.tabCurrentChanges]) {
-      const selected = onChanges && button === activeChangesTab;
+    for (const [tab, button] of Object.entries(buttons)) {
+      const selected = tab === s.tab;
       button.setAttribute("aria-selected", String(selected));
       button.tabIndex = selected ? 0 : -1;
     }
-    el.changesTabpanel.setAttribute("aria-labelledby", activeChangesTab.id);
-    el.tabTerminal.setAttribute("aria-selected", String(!onChanges));
-    el.tabTerminal.tabIndex = onChanges ? -1 : 0;
+    const onChanges = isChangesTab(s.tab);
+    if (onChanges) {
+      el.changesTabpanel.setAttribute("aria-labelledby", buttons[s.tab].id);
+    }
     el.changesTabpanel.hidden = !onChanges;
-    el.terminalTabpanel.hidden = onChanges;
-    el.refresh.hidden = !onChanges;
-    el.panel.dataset.tab = onChanges ? "changes" : "terminal";
+    el.filesTabpanel.hidden = s.tab !== "files";
+    el.terminalTabpanel.hidden = s.tab !== "terminal";
+    el.refresh.hidden = s.tab === "terminal";
+    el.panel.dataset.tab = onChanges ? "changes" : s.tab;
+    filesPanel?.setActive(s.open && s.tab === "files");
   }
 
   function syncTerminalAction() {
@@ -401,15 +412,17 @@ export function initChangesPanel({
       return;
     }
     if (s.tab !== tab) {
-      const previousTab = s.tab;
       s.tab = tab;
-      if (previousTab !== "terminal" && tab !== "terminal" && previousTab !== tab) {
+      if (isChangesTab(tab)) {
         // Each changes view lists different files, so an open diff and its highlight belong to the view they were opened in.
-        resetDiff();
-        s.activeKey = null;
+        if (tab !== s.changesTab) {
+          resetDiff();
+          s.activeKey = null;
+        }
+        s.changesTab = tab;
       }
       render();
-      if (tab !== "terminal" && s.open && !statusIsCurrent()) {
+      if (isChangesTab(tab) && s.open && !statusIsCurrent()) {
         refreshStatusAndRender();
       }
     }
@@ -431,7 +444,7 @@ export function initChangesPanel({
   function setTerminalEnabled(enabled) {
     s.terminalEnabled = enabled === true;
     if (!s.terminalEnabled && s.tab === "terminal") {
-      s.tab = "current";
+      setTab("current");
     }
     render();
   }
@@ -459,6 +472,7 @@ export function initChangesPanel({
     void terminal.openRepository(s.repository);
   }
 
+  el.tabFiles.addEventListener("click", () => setTab("files"));
   el.tabChanges.addEventListener("click", () => setTab("all"));
   el.tabCurrentChanges.addEventListener("click", () => setTab("current"));
   el.tabTerminal.addEventListener("click", () => setTab("terminal"));
@@ -467,8 +481,8 @@ export function initChangesPanel({
       return;
     }
     event.preventDefault();
-    const tabs = s.terminalEnabled ? ["current", "all", "terminal"] : ["current", "all"];
-    const buttons = { all: el.tabChanges, current: el.tabCurrentChanges, terminal: el.tabTerminal };
+    const tabs = s.terminalEnabled ? ["files", "current", "all", "terminal"] : ["files", "current", "all"];
+    const buttons = { files: el.tabFiles, all: el.tabChanges, current: el.tabCurrentChanges, terminal: el.tabTerminal };
     const step = event.key === "ArrowRight" ? 1 : -1;
     const tab = tabs[(Math.max(tabs.indexOf(s.tab), 0) + step + tabs.length) % tabs.length];
     setTab(tab);
@@ -761,6 +775,12 @@ export function initChangesPanel({
         render();
       }
     }
+  }
+
+  // Refresh reloads the changes and the file tree; the tree also reloads whenever its tab is shown.
+  function refreshViews(options) {
+    filesPanel?.refresh();
+    return refreshAll(options);
   }
 
   // "all" lists the repository's changes; "current" lists the files the open conversation edited.
@@ -1768,9 +1788,11 @@ export function initChangesPanel({
   }
 
   function render() {
+    // The terminal's repository is set before applyOpen can activate the terminal, since a later root change resets a terminal being shown.
+    syncTerminalRepository();
     applyOpen();
     renderToolbar();
-    syncTerminalRepository();
+    filesPanel?.setRepository(s.repository);
     if (!s.open) {
       return;
     }
@@ -2091,7 +2113,7 @@ export function initChangesPanel({
     toggle(false);
     focusToggle();
   });
-  el.refresh.addEventListener("click", () => void refreshAll({ announce: true }));
+  el.refresh.addEventListener("click", () => void refreshViews({ announce: true }));
   el.expand.addEventListener("click", () => {
     s.expanded = !s.expanded;
     applyOpen();
@@ -2260,6 +2282,18 @@ export function initChangesPanel({
       }
       return;
     }
+    // The file tree handles its own arrows, Enter, and Space; the changes shortcuts below do not apply to it.
+    if (s.tab === "files") {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        toggle(false);
+        focusToggle();
+      } else if (event.key === "r" || event.key === "R") {
+        event.preventDefault();
+        void refreshViews({ announce: true });
+      }
+      return;
+    }
     if (event.key === "Escape") {
       if (event.target === el.filter && el.filter.value) {
         return;
@@ -2340,6 +2374,8 @@ export function initChangesPanel({
     if (s.open) {
       if (s.tab === "terminal") {
         terminal?.focus();
+      } else if (s.tab === "files") {
+        filesPanel?.focus();
       } else {
         el.list.focus();
       }
@@ -2350,6 +2386,7 @@ export function initChangesPanel({
     if (s.open && s.repository && document.visibilityState === "visible" &&
         Date.now() - s.statusAt > focusRefreshAgeMs) {
       refreshStatusAndRender();
+      filesPanel?.refresh();
     }
   };
   window.addEventListener("focus", refreshOnFocus);
@@ -2426,14 +2463,14 @@ export function initChangesPanel({
         return;
       }
       window.clearTimeout(s.toolRefreshTimer);
-      s.toolRefreshTimer = window.setTimeout(() => void refreshAll(), toolRefreshDelayMs);
+      s.toolRefreshTimer = window.setTimeout(() => void refreshViews(), toolRefreshDelayMs);
     },
     notifyPromptComplete(sessionId) {
       if (sessionId !== s.session?.sessionId) {
         return;
       }
       window.clearTimeout(s.toolRefreshTimer);
-      void refreshAll();
+      void refreshViews();
     },
     forgetSession(sessionId) {
       repositoryRecords.delete(sessionId);

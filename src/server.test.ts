@@ -1508,6 +1508,99 @@ test("current changes lists only the files the conversation edited, rebuilt from
   ]);
 });
 
+test("lists repository folders for the Files tab from disk and previews its files in a known repository outside the projects directory", {
+  skip: gitAvailable ? false : "git is not on PATH"
+}, async (t) => {
+  const workspace = await mkdtemp(path.join(tmpdir(), "copilot-files-"));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const repo = await createTestRepository(path.join(workspace, "edited"), {
+    "src/app.ts": "export const app = 1;\n",
+    ".gitignore": "build/\n"
+  });
+  await mkdir(path.join(repo, "build"));
+  await writeFile(path.join(repo, "build", "out.js"), "ignored\n");
+  await writeFile(path.join(repo, "notes.md"), "untracked\n");
+  await writeFile(path.join(repo, ".env"), "TOKEN=1\n");
+  const elsewhere = await createTestRepository(path.join(workspace, "elsewhere"), { "x.txt": "x\n" });
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeHistory: { events: fileEditHistory("call-1", path.join(repo, "src", "app.ts"), true) }
+  });
+  // Reading the conversation's repository records the edited repository as one the server uses.
+  const sessionRepository = await fetch(`${server.baseUrl}/api/sessions/session-1/repository`, { headers: server.headers });
+  assert.equal((await sessionRepository.json() as JsonObject).editedRoot, repo);
+
+  const get = (url: string) => fetch(`${server.baseUrl}${url}`, { headers: server.headers });
+  const repoQuery = `repo=${encodeURIComponent(repo)}`;
+  // Ignored and untracked files are listed. Hidden names (.gitignore, .env, .git) wait for the Files tab to ask.
+  const root = await get(`/api/git/files?${repoQuery}`);
+  assert.equal(root.status, 200);
+  assert.deepEqual(await root.json(), {
+    path: "",
+    entries: [
+      { name: "build", path: "build", type: "directory" },
+      { name: "src", path: "src", type: "directory" },
+      { name: "notes.md", path: "notes.md", type: "file" }
+    ],
+    truncated: false
+  });
+  const src = await get(`/api/git/files?${repoQuery}&path=src`);
+  assert.deepEqual(await src.json(), {
+    path: "src",
+    entries: [{ name: "app.ts", path: "src/app.ts", type: "file" }],
+    truncated: false
+  });
+  const shown = await get(`/api/git/files?${repoQuery}&hidden=1`);
+  assert.equal(shown.status, 200);
+  assert.deepEqual(await shown.json(), {
+    path: "",
+    entries: [
+      { name: ".git", path: ".git", type: "directory" },
+      { name: "build", path: "build", type: "directory" },
+      { name: "src", path: "src", type: "directory" },
+      { name: ".env", path: ".env", type: "file" },
+      { name: ".gitignore", path: ".gitignore", type: "file" },
+      { name: "notes.md", path: "notes.md", type: "file" }
+    ],
+    truncated: false
+  });
+  assert.equal((await get(`/api/git/files?${repoQuery}&hidden=yes`)).status, 400);
+  assert.equal((await get(`/api/git/files?${repoQuery}&path=.git`)).status, 400);
+  const gitFolder = await get(`/api/git/files?${repoQuery}&hidden=1&path=.git`);
+  assert.equal(gitFolder.status, 200);
+  assert.ok((await gitFolder.json() as { entries: Array<{ path: string }> }).entries.some((entry) => entry.path === ".git/HEAD"));
+  const build = await get(`/api/git/files?${repoQuery}&path=build`);
+  assert.deepEqual(await build.json(), {
+    path: "build",
+    entries: [{ name: "out.js", path: "build/out.js", type: "file" }],
+    truncated: false
+  });
+  assert.equal((await get(`/api/git/files?${repoQuery}&path=.hidden`)).status, 400);
+  assert.equal((await get(`/api/git/files?${repoQuery}&path=../outside`)).status, 400);
+  assert.equal((await get(`/api/git/files?repo=${encodeURIComponent(elsewhere)}`)).status, 403);
+
+  // Previews and saves outside the projects directory cover every file of the repository, hidden ones included; other repositories stay closed.
+  const versionOf = (content: string) => createHash("sha256").update(content).digest("hex");
+  const previewRequest = (filePath: string) => get(`/api/file-preview?${new URLSearchParams({ path: pathToFileURL(filePath).href })}`);
+  const listedPreview = await previewRequest(path.join(repo, "src", "app.ts"));
+  assert.equal(listedPreview.status, 200);
+  assert.equal((await listedPreview.json() as JsonObject).text, "export const app = 1;\n");
+  assert.equal((await previewRequest(path.join(repo, "build", "out.js"))).status, 200);
+  assert.equal((await previewRequest(path.join(repo, ".env"))).status, 200);
+  assert.equal((await previewRequest(path.join(repo, ".git", "config"))).status, 200);
+  assert.equal((await previewRequest(path.join(elsewhere, "x.txt"))).status, 403);
+  const save = (filePath: string, content: string, version: string) => fetch(`${server.baseUrl}/api/file-preview`, {
+    method: "PUT",
+    headers: { ...server.headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ path: pathToFileURL(filePath).href, content, version })
+  });
+  // A stale version stops the save after the policy check, so the repository's Git metadata is not written.
+  assert.equal((await save(path.join(repo, ".git", "HEAD"), "ref: refs/heads/other\n", "stale-version")).status, 409);
+  const saved = await save(path.join(repo, "src", "app.ts"), "export const app = 2;\n", versionOf("export const app = 1;\n"));
+  assert.equal(saved.status, 200);
+  assert.equal(await readFile(path.join(repo, "src", "app.ts"), "utf8"), "export const app = 2;\n");
+});
+
 test("rejects HTTP and WebSocket requests whose Host is not the local Copilot Web address", async (t) => {
   const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
   const statusWithHost = (host: string, requestPath: string, headers: Record<string, string> = {}) =>
@@ -5401,6 +5494,184 @@ test("changes view offers a repository picker for an unsent conversation and sup
   await key("Escape");
   await waitFor(`document.querySelector("#changes-panel").hidden === true`);
   assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("files tab lists the repository as a tree, opens folders from the keyboard, and previews the files it opens", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), {
+    "README.md": "# App\n",
+    ".gitignore": "build/\n",
+    "src/app.ts": "export const app = 1;\n",
+    "src/lib/util.ts": "export const util = 2;\n"
+  });
+  await writeFile(path.join(repo, "src", "new.ts"), "export const created = true;\n");
+  await mkdir(path.join(repo, "build"));
+  await writeFile(path.join(repo, "build", "out.js"), "ignored\n");
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`document.querySelector("#changes-panel").hidden === false`);
+
+  // Files is the first tab, and Current changes remains the tab that opens by default.
+  assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll(".repository-tabs [role=tab]")).map((tab) => tab.id)`), [
+    "repository-tab-files", "repository-tab-current-changes", "repository-tab-changes", "repository-tab-terminal"
+  ]);
+  assert.equal(await evaluate(`document.querySelector("#repository-tab-current-changes").getAttribute("aria-selected")`), "true");
+  await evaluate(`document.querySelector("#repository-tab-files").click()`);
+  assert.equal(await evaluate(`document.querySelector("#files-tabpanel").hidden`), false);
+  assert.equal(await evaluate(`document.querySelector("#changes-tabpanel").hidden`), true);
+  await waitFor(`document.querySelector("#files-status").textContent.includes("Choose a repository")`);
+
+  // The repository chosen in the picker is listed at its root: folders first, and hidden names left out.
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelectorAll("#files-tree > [role=treeitem]").length === 3`);
+  const rootKeys = `Array.from(document.querySelectorAll("#files-tree > [role=treeitem]")).map((item) => item.dataset.key)`;
+  assert.deepEqual(await evaluate(rootKeys), ["folder:build", "folder:src", "file:README.md"]);
+  assert.equal(await evaluate(`document.querySelector("#files-status").hidden`), true);
+
+  // Hidden files are off by default. Turning them on asks the server for them, and turning them off removes them again.
+  assert.equal(await evaluate(`document.querySelector("#files-hidden-toggle").getAttribute("aria-pressed")`), "false");
+  await evaluate(`document.querySelector("#files-hidden-toggle").click()`);
+  await waitFor(`document.querySelectorAll("#files-tree > [role=treeitem]").length === 5`);
+  assert.deepEqual(await evaluate(rootKeys), ["folder:.git", "folder:build", "folder:src", "file:.gitignore", "file:README.md"]);
+  assert.equal(await evaluate(`document.querySelector("#files-hidden-toggle").getAttribute("aria-pressed")`), "true");
+  await evaluate(`document.querySelector("#files-hidden-toggle").click()`);
+  await waitFor(`document.querySelectorAll("#files-tree > [role=treeitem]").length === 3`);
+  assert.equal(await evaluate(`document.querySelector('#files-tree [data-key="file:.gitignore"]')`), null);
+  assert.equal(await evaluate(`document.querySelector("#files-hidden-toggle").getAttribute("aria-pressed")`), "false");
+
+  // A click opens a folder in place.
+  await evaluate(`document.querySelector('#files-tree [data-key="folder:src"] > .files-row').click()`);
+  await waitFor(`document.querySelector('#files-tree [data-key="folder:src"]').getAttribute("aria-expanded") === "true" &&
+    Boolean(document.querySelector('#files-tree [data-key="file:src/app.ts"]'))`);
+  const childKeys = `Array.from(document.querySelectorAll('#files-tree [data-key="folder:src"] [role=group] > [role=treeitem]'))
+    .map((item) => item.dataset.key)`;
+  assert.deepEqual(await evaluate(childKeys), ["folder:src/lib", "file:src/app.ts", "file:src/new.ts"]);
+
+  // The tree follows the arrow keys: Right opens a folder or moves into it, and Left closes it or moves to its parent.
+  await evaluate(`document.querySelector("#files-tree").focus()`);
+  const key = (name: string) => evaluate(`document.querySelector("#files-tree").dispatchEvent(
+    new KeyboardEvent("keydown", { key: ${JSON.stringify(name)}, bubbles: true, cancelable: true }))`);
+  const highlighted = () => evaluate(`document.getElementById(document.querySelector("#files-tree")
+    .getAttribute("aria-activedescendant"))?.dataset.key ?? null`);
+  // The click highlighted the folder it opened, so the arrows continue from there.
+  assert.equal(await highlighted(), "folder:src");
+  await key("ArrowDown");
+  assert.equal(await highlighted(), "folder:src/lib");
+  await key("ArrowRight");
+  await waitFor(`Boolean(document.querySelector('#files-tree [data-key="file:src/lib/util.ts"]'))`);
+  assert.equal(await highlighted(), "folder:src/lib");
+  await key("ArrowRight");
+  assert.equal(await highlighted(), "file:src/lib/util.ts");
+  await key("ArrowLeft");
+  assert.equal(await highlighted(), "folder:src/lib");
+  await key("ArrowLeft");
+  assert.equal(await evaluate(`document.querySelector('#files-tree [data-key="folder:src/lib"]').getAttribute("aria-expanded")`), "false");
+  await key("ArrowDown");
+  assert.equal(await highlighted(), "file:src/app.ts");
+
+  // Enter opens the highlighted file in the file preview, the same dialog that opens files linked from messages.
+  await key("Enter");
+  await waitFor(`document.querySelector("#image-preview-dialog").open === true &&
+    document.querySelector("#file-preview-title").textContent === "app.ts" &&
+    document.querySelector("#file-preview-content .file-preview-code")?.textContent === ${JSON.stringify("export const app = 1;\n")}`);
+  assert.equal(await evaluate(`document.querySelector('#files-tree [data-key="file:src/app.ts"]').getAttribute("aria-selected")`), "true");
+  assert.notEqual(await evaluate(`getComputedStyle(document.querySelector('#files-tree [data-key="file:src/app.ts"] > .files-row')).boxShadow`), "none");
+  await evaluate(`document.querySelector(".image-preview-close").click()`);
+  await waitFor(`document.querySelector("#image-preview-dialog").open === false`);
+
+  // A click opens a file too, and R reloads the tree so files created since it was listed appear.
+  await evaluate(`document.querySelector('#files-tree [data-key="file:README.md"] > .files-row').click()`);
+  await waitFor(`document.querySelector("#file-preview-title").textContent === "README.md"`);
+  await evaluate(`document.querySelector(".image-preview-close").click()`);
+  await waitFor(`document.querySelector("#image-preview-dialog").open === false`);
+  await writeFile(path.join(repo, "src", "fresh.ts"), "export {};\n");
+  await key("r");
+  await waitFor(`Boolean(document.querySelector('#files-tree [data-key="file:src/fresh.ts"]'))`);
+
+  // Long listings scroll inside the tree, so the tree's last item can be reached from the panel.
+  await mkdir(path.join(repo, "bulk"));
+  for (let index = 1; index <= 150; index += 1) {
+    await writeFile(path.join(repo, "bulk", `file-${String(index).padStart(3, "0")}.txt`), "x\n");
+  }
+  await key("r");
+  await waitFor(`Boolean(document.querySelector('#files-tree [data-key="folder:bulk"]'))`);
+  await evaluate(`document.querySelector('#files-tree [data-key="folder:bulk"] > .files-row').click()`);
+  await waitFor(`Boolean(document.querySelector('#files-tree [data-key="file:bulk/file-150.txt"]'))`);
+  const tree = `document.querySelector("#files-tree")`;
+  assert.equal(await evaluate(`${tree}.scrollHeight > ${tree}.clientHeight`), true);
+  await evaluate(`${tree}.scrollTop = ${tree}.scrollHeight`);
+  assert.equal(await evaluate(`(() => {
+    const items = document.querySelectorAll('#files-tree [role=treeitem]');
+    const last = items[items.length - 1].getBoundingClientRect();
+    const box = document.querySelector("#files-tree").getBoundingClientRect();
+    return last.top >= box.top && last.bottom <= box.bottom;
+  })()`), true);
+
+  await key("Escape");
+  await waitFor(`document.querySelector("#changes-panel").hidden === true`);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("an open diff stays through Files or Terminal only while the same changes view returns", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), {
+    "a.txt": "one\n",
+    "b.txt": "two\n"
+  });
+  await writeFile(path.join(repo, "a.txt"), "one\ntwo\n");
+  await writeFile(path.join(repo, "b.txt"), "two\nthree\n");
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await evaluate(`document.querySelector("#repository-tab-changes").click()`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]")).some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`Boolean(document.querySelector('[data-key="unstaged:a.txt"]'))`);
+
+  const openDiff = async () => {
+    await waitFor(`Boolean(document.querySelector('[data-key="unstaged:a.txt"]'))`);
+    await evaluate(`document.querySelector('[data-key="unstaged:a.txt"]').click()`);
+    await waitFor(`document.querySelector("#changes-diff").hidden === false`);
+  };
+  const clickTab = (id: string) => evaluate(`document.querySelector("#${id}").click()`);
+
+  // Files is a different tab, but All changes is the same view when it returns, so its diff is still open.
+  await openDiff();
+  await clickTab("repository-tab-files");
+  await waitFor(`document.querySelector("#files-tabpanel").hidden === false`);
+  await clickTab("repository-tab-changes");
+  await waitFor(`document.querySelector("#changes-diff").hidden === false`);
+
+  // Current changes is another view, so the diff closes even though Files came between.
+  await clickTab("repository-tab-files");
+  await clickTab("repository-tab-current-changes");
+  await waitFor(`document.querySelector("#changes-diff").hidden === true`);
+
+  // The terminal lists no changes either, so the same rule applies after it.
+  await clickTab("repository-tab-changes");
+  await openDiff();
+  await clickTab("repository-tab-terminal");
+  await waitFor(`document.querySelector("#terminal-tabpanel").hidden === false`);
+  await clickTab("repository-tab-current-changes");
+  await waitFor(`document.querySelector("#changes-diff").hidden === true`);
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
 });
 
 test("changes view resets unstaged files only after confirmation, deleting new files only when confirmed", {
@@ -12311,8 +12582,8 @@ test("current changes lists only the files this conversation edited, while all c
 
   const rowKeys = `Array.from(document.querySelectorAll("#changes-list [role=option]")).map((row) => row.dataset.key)`;
   await waitFor(`${rowKeys}.length === 2`);
-  assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll(".repository-tab")).slice(0, 2).map((tab) => tab.textContent)`), [
-    "Current changes", "All changes"
+  assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll(".repository-tab")).slice(0, 3).map((tab) => tab.textContent)`), [
+    "Files", "Current changes", "All changes"
   ]);
   assert.deepEqual(await evaluate(rowKeys), ["unstaged:edited.txt", "unstaged:other.txt"]);
 

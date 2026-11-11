@@ -6,6 +6,7 @@ import {
   tableDelimiterAlignments
 } from "./prompt-editor.js";
 import { initChangesPanel } from "./changes-panel.js";
+import { initFilesPanel } from "./files-panel.js";
 import { initTerminalPanel } from "./terminal-panel.js";
 
 const defaultBrandName = "Copilot Web";
@@ -769,6 +770,7 @@ let selectionNoticeTimer = null;
 let renderedMessagesConversation = null;
 let changesPanel = null;
 let terminalPanel = null;
+let filesPanel = null;
 
 const elements = {
   statusFavicon: document.querySelector("#app-favicon"),
@@ -10081,9 +10083,14 @@ if (typeof systemThemeQuery.addEventListener === "function") {
 }
 
 terminalPanel = initTerminalPanel({ api });
+filesPanel = initFilesPanel({
+  api,
+  openFile: (reference, name) => void openLocalFilePreview(localFilePreviewUrl(reference), name)
+});
 changesPanel = initChangesPanel({
   api,
   terminal: terminalPanel,
+  filesPanel,
   insertIntoComposer,
   changeWorkingDirectory,
   onDecisionChange: setMoreActionsDecisionAttention,
