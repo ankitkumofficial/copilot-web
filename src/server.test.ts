@@ -2219,7 +2219,8 @@ test("previews local project files and denies paths outside the projects directo
   assert.deepEqual(await relativeResponse.json(), {
     name: "example.ts",
     mimeType: "text/plain",
-    text
+    text,
+    version: createHash("sha256").update(text).digest("hex")
   });
 
   const absoluteResponse = await fetch(endpoint(pathToFileURL(filePath).href), {
@@ -2229,7 +2230,8 @@ test("previews local project files and denies paths outside the projects directo
   assert.deepEqual(await absoluteResponse.json(), {
     name: "example.ts",
     mimeType: "text/plain",
-    text
+    text,
+    version: createHash("sha256").update(text).digest("hex")
   });
 
   const outsidePath = path.join(path.dirname(server.projectsDirectory), "outside.txt");
@@ -2251,8 +2253,116 @@ test("previews local project files and denies paths outside the projects directo
   assert.deepEqual(await allowedOutsideResponse.json(), {
     name: "outside.txt",
     mimeType: "text/plain",
-    text: "preview allowed"
+    text: "preview allowed",
+    version: createHash("sha256").update("preview allowed").digest("hex")
   });
+});
+
+test("saves edits to text previews, refusing stale and binary files and outside files without allow-all", async (t) => {
+  const server = await startTestServer(t);
+  const endpoint = `${server.baseUrl}/api/file-preview`;
+  const versionOf = (content: string | Buffer) => createHash("sha256").update(content).digest("hex");
+  const previewOf = async (reference: string): Promise<JsonObject> => {
+    const response = await fetch(`${endpoint}?${new URLSearchParams({ path: reference })}`, {
+      headers: server.headers
+    });
+    assert.equal(response.status, 200);
+    const preview: unknown = await response.json();
+    assert.ok(isRecord(preview));
+    return preview;
+  };
+  const saveRequest = (body: Record<string, unknown>) => fetch(endpoint, {
+    method: "PUT",
+    headers: { ...server.headers, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  const notesPath = path.join(server.projectsDirectory, "notes", "todo.txt");
+  await mkdir(path.dirname(notesPath), { recursive: true });
+  await writeFile(notesPath, "first\nsecond\n");
+  const original = await previewOf("notes/todo.txt");
+  assert.deepEqual(original, {
+    name: "todo.txt",
+    mimeType: "text/plain",
+    text: "first\nsecond\n",
+    version: versionOf("first\nsecond\n")
+  });
+
+  const saved = await saveRequest({ path: "notes/todo.txt", content: "first\nchanged\n", version: original.version });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(await saved.json(), {
+    name: "todo.txt",
+    mimeType: "text/plain",
+    text: "first\nchanged\n",
+    version: versionOf("first\nchanged\n")
+  });
+  assert.equal(await readFile(notesPath, "utf8"), "first\nchanged\n");
+
+  // A save based on an earlier version must not overwrite a change made after it was opened.
+  await writeFile(notesPath, "agent edit\n");
+  const stale = await saveRequest({
+    path: "notes/todo.txt",
+    content: "user edit\n",
+    version: versionOf("first\nchanged\n")
+  });
+  assert.equal(stale.status, 409);
+  const staleBody: JsonObject = await stale.json();
+  assert.equal(staleBody.code, "file_changed");
+  assert.equal(await readFile(notesPath, "utf8"), "agent edit\n");
+
+  // The editor sends LF, but a CRLF file keeps its line endings.
+  const batPath = path.join(server.projectsDirectory, "windows.bat");
+  await writeFile(batPath, "echo one\r\necho two\r\n");
+  const windows = await previewOf("windows.bat");
+  const windowsSaved = await saveRequest({
+    path: "windows.bat",
+    content: "echo one\necho two\necho three\n",
+    version: windows.version
+  });
+  assert.equal(windowsSaved.status, 200);
+  assert.equal(await readFile(batPath, "utf8"), "echo one\r\necho two\r\necho three\r\n");
+
+  // The preview omits a byte-order mark, and saving writes the file's own mark back.
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  const bomPath = path.join(server.projectsDirectory, "bom.txt");
+  await writeFile(bomPath, Buffer.concat([bom, Buffer.from("bom\n")]));
+  const withBom = await previewOf("bom.txt");
+  assert.equal(withBom.text, "bom\n");
+  const bomSaved = await saveRequest({ path: "bom.txt", content: "bom edited\n", version: withBom.version });
+  assert.equal(bomSaved.status, 200);
+  assert.deepEqual(await readFile(bomPath), Buffer.concat([bom, Buffer.from("bom edited\n")]));
+
+  const outsidePath = path.join(path.dirname(server.projectsDirectory), "outside-edit.txt");
+  await writeFile(outsidePath, "outside");
+  const outsideSave = await saveRequest({ path: outsidePath, content: "changed", version: versionOf("outside") });
+  assert.equal(outsideSave.status, 403);
+  assert.equal(await readFile(outsidePath, "utf8"), "outside");
+
+  const binaryPath = path.join(server.projectsDirectory, "data.bin");
+  await writeFile(binaryPath, Buffer.from([0, 1, 2]));
+  const binarySave = await saveRequest({
+    path: "data.bin",
+    content: "text",
+    version: versionOf(Buffer.from([0, 1, 2]))
+  });
+  assert.equal(binarySave.status, 400);
+  assert.deepEqual(await readFile(binaryPath), Buffer.from([0, 1, 2]));
+
+  // With allow-all, files outside the projects directory are editable like any other previewed file.
+  const allowAllServer = await startTestServer(t, { allowAll: true });
+  const allowedOutsidePath = path.join(path.dirname(allowAllServer.projectsDirectory), "outside-allowed.txt");
+  await writeFile(allowedOutsidePath, "readable");
+  const allowedPreview: JsonObject = await (await fetch(
+    `${allowAllServer.baseUrl}/api/file-preview?${new URLSearchParams({ path: allowedOutsidePath })}`,
+    { headers: allowAllServer.headers }
+  )).json();
+  const allowAllSave = await fetch(`${allowAllServer.baseUrl}/api/file-preview`, {
+    method: "PUT",
+    headers: { ...allowAllServer.headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ path: allowedOutsidePath, content: "edited", version: allowedPreview.version })
+  });
+  assert.equal(allowAllSave.status, 200);
+  assert.equal(await readFile(allowedOutsidePath, "utf8"), "edited");
 });
 
 test("retries conversation creation and prompts without repeating accepted work", async (t) => {
@@ -4218,6 +4328,158 @@ test("highlights line hints and toggles formatted and raw markdown in file previ
   await waitFor(`Boolean(document.querySelector(".file-preview-markdown"))`);
   assert.equal(await evaluate(`document.querySelector(".file-preview-line-highlight")`), null);
   await closePreview();
+});
+
+test("edits text file previews, saves them, and asks before discarding unsaved edits", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, {
+    existingSession: true,
+    nativeMessages: true,
+    allowAll: true,
+    nativeHistory: {
+      events: [
+        {
+          id: "persisted-user-event",
+          type: "user.message",
+          timestamp: "2026-10-13T12:00:00.000Z",
+          parentId: null,
+          data: { messageId: "native-user-1", content: "Show the files." }
+        },
+        {
+          id: "persisted-assistant-event",
+          type: "assistant.message",
+          timestamp: "2026-10-13T12:00:05.000Z",
+          parentId: "persisted-user-event",
+          data: {
+            messageId: "native-assistant-1",
+            content: "Open [src/edit.ts](src/edit.ts) and [outside.txt](../outside-edit.txt)"
+          }
+        }
+      ]
+    }
+  });
+  const editPath = path.join(server.projectsDirectory, "src", "edit.ts");
+  await mkdir(path.dirname(editPath), { recursive: true });
+  await writeFile(editPath, "export const value = 1;\n");
+  const outsidePath = path.join(path.dirname(server.projectsDirectory), "outside-edit.txt");
+  await writeFile(outsidePath, "outside text\n");
+
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    window.confirmAnswer = false;
+    window.confirmCount = 0;
+    window.confirm = () => {
+      window.confirmCount += 1;
+      return window.confirmAnswer;
+    };
+  `);
+  await waitFor(`Boolean(document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ))`);
+  await evaluate(`document.querySelector(
+    'button.session-item[data-session-id="${server.sessionId}"]'
+  ).click()`);
+  await waitFor(`Boolean(document.querySelector(
+    ".message.assistant a[data-local-file-preview]"
+  ))`);
+
+  const openPreview = async (index: number) => {
+    await evaluate(`document.querySelectorAll(
+      ".message.assistant a[data-local-file-preview]"
+    )[${index}].click()`);
+    await waitFor(`document.querySelector("#image-preview-dialog").open &&
+      Boolean(document.querySelector("#file-preview-content .file-preview-code"))`);
+  };
+  const typeIntoEditor = (text: string) => evaluate(`(() => {
+    const editor = document.querySelector(".file-preview-editor");
+    editor.value = ${JSON.stringify(text)};
+    editor.dispatchEvent(new Event("input"));
+  })()`);
+  // A real click gives the page user activation, which Chrome needs before it lets Escape be canceled.
+  const clickTrusted = async (selector: string) => {
+    const center = await evaluate(`(() => {
+      const rect = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+      return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    })()`) as { x: number; y: number };
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await command("Input.dispatchMouseEvent", { type, ...center, button: "left", clickCount: 1 }, sessionId);
+    }
+  };
+
+  await openPreview(0);
+  assert.equal(await evaluate(`document.querySelector("#file-preview-edit").hidden`), false);
+  await evaluate(`document.querySelector("#file-preview-edit").click()`);
+  await waitFor(`Boolean(document.querySelector(".file-preview-editor"))`);
+  assert.equal(await evaluate(`document.querySelector(".file-preview-editor").value`), "export const value = 1;\n");
+  assert.equal(await evaluate(`document.querySelector("#file-preview-save").disabled`), true);
+
+  await typeIntoEditor("export const value = 2;\n");
+  assert.equal(await evaluate(`document.querySelector("#file-preview-save").disabled`), false);
+  await evaluate(`document.querySelector("#file-preview-save").click()`);
+  await waitFor(`document.querySelector(".file-preview-code")?.textContent === ${JSON.stringify("export const value = 2;\n")} &&
+    !document.querySelector("#file-preview-edit").hidden`);
+  assert.equal(await readFile(editPath, "utf8"), "export const value = 2;\n");
+
+  // Cancel, Escape, and the close button each keep unsaved edits unless the user confirms discarding them.
+  await evaluate(`document.querySelector("#file-preview-edit").click()`);
+  await waitFor(`Boolean(document.querySelector(".file-preview-editor"))`);
+  await typeIntoEditor("discarded edit\n");
+  await clickTrusted("#file-preview-cancel");
+  await waitFor(`window.confirmCount === 1`);
+  assert.equal(await evaluate(`Boolean(document.querySelector(".file-preview-editor"))`), true);
+  await pressBrowserKey(command, sessionId, "Escape");
+  await waitFor(`window.confirmCount === 2`);
+  assert.equal(await evaluate(`document.querySelector("#image-preview-dialog").open`), true);
+  await evaluate(`document.querySelector(".image-preview-close").click()`);
+  await waitFor(`window.confirmCount === 3`);
+  assert.equal(await evaluate(`document.querySelector("#image-preview-dialog").open`), true);
+
+  await evaluate(`window.confirmAnswer = true`);
+  await evaluate(`document.querySelector("#file-preview-cancel").click()`);
+  await waitFor(`window.confirmCount === 4 && !document.querySelector(".file-preview-editor")`);
+  assert.equal(await evaluate(`document.querySelector(".file-preview-code").textContent`), "export const value = 2;\n");
+
+  await evaluate(`document.querySelector("#file-preview-edit").click()`);
+  await waitFor(`Boolean(document.querySelector(".file-preview-editor"))`);
+  await typeIntoEditor("discarded again\n");
+  await pressBrowserKey(command, sessionId, "Escape");
+  await waitFor(`!document.querySelector("#image-preview-dialog").open`);
+  assert.equal(await evaluate("window.confirmCount"), 5);
+  assert.equal(await readFile(editPath, "utf8"), "export const value = 2;\n");
+
+  // A file changed on disk after the preview opened is not overwritten, and the typed text stays in the editor.
+  await openPreview(0);
+  await evaluate(`document.querySelector("#file-preview-edit").click()`);
+  await waitFor(`Boolean(document.querySelector(".file-preview-editor"))`);
+  await writeFile(editPath, "export const value = 3;\n");
+  await typeIntoEditor("export const value = 4;\n");
+  await evaluate(`document.querySelector("#file-preview-save").click()`);
+  await waitFor(`!document.querySelector(".file-preview-edit-error").hidden`);
+  assert.match(
+    String(await evaluate(`document.querySelector(".file-preview-edit-error").textContent`)),
+    /^Not saved: .*changed after it was opened/
+  );
+  assert.equal(await readFile(editPath, "utf8"), "export const value = 3;\n");
+  assert.equal(await evaluate(`document.querySelector(".file-preview-editor").value`), "export const value = 4;\n");
+  await evaluate(`window.confirmAnswer = true`);
+  await evaluate(`document.querySelector("#file-preview-cancel").click()`);
+  await waitFor(`window.confirmCount === 6 && !document.querySelector(".file-preview-editor")`);
+  await evaluate(`document.querySelector("#image-preview-dialog").close()`);
+  await waitFor(`!document.querySelector("#image-preview-dialog").open`);
+
+  // With allow-all, the outside file opens in the same editor and saves like any other previewed file.
+  await openPreview(1);
+  assert.equal(await evaluate(`document.querySelector("#file-preview-title").textContent`), "outside-edit.txt");
+  assert.equal(await evaluate(`document.querySelector("#file-preview-edit").hidden`), false);
+  await evaluate(`document.querySelector("#file-preview-edit").click()`);
+  await waitFor(`Boolean(document.querySelector(".file-preview-editor"))`);
+  await typeIntoEditor("outside edited\n");
+  await evaluate(`document.querySelector("#file-preview-save").click()`);
+  await waitFor(`document.querySelector(".file-preview-code")?.textContent === ${JSON.stringify("outside edited\n")}`);
+  assert.equal(await readFile(outsidePath, "utf8"), "outside edited\n");
+  await evaluate(`document.querySelector("#image-preview-dialog").close()`);
+  await waitFor(`!document.querySelector("#image-preview-dialog").open`);
 });
 
 test("renders native completion times outside message content through refresh", {

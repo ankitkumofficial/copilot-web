@@ -848,6 +848,10 @@ const elements = {
   imagePreviewImage: document.querySelector("#image-preview-image"),
   filePreviewTitle: document.querySelector("#file-preview-title"),
   filePreviewViewToggle: document.querySelector("#file-preview-view-toggle"),
+  filePreviewToolbar: document.querySelector("#file-preview-toolbar"),
+  filePreviewEdit: document.querySelector("#file-preview-edit"),
+  filePreviewSave: document.querySelector("#file-preview-save"),
+  filePreviewCancel: document.querySelector("#file-preview-cancel"),
   filePreviewFormatted: document.querySelector("#file-preview-view-formatted"),
   filePreviewRaw: document.querySelector("#file-preview-view-raw"),
   filePreviewContent: document.querySelector("#file-preview-content")
@@ -4148,6 +4152,7 @@ function scheduleMessagesRender(conversation = activeConversation(), message = n
 let filePreviewRequestSequence = 0;
 let filePreviewObjectUrl = null;
 let filePreviewTextView = null;
+let filePreviewEditSession = null;
 
 function revokeFilePreviewObjectUrl() {
   if (filePreviewObjectUrl) {
@@ -4158,7 +4163,21 @@ function revokeFilePreviewObjectUrl() {
 
 function clearFilePreviewTextView() {
   filePreviewTextView = null;
-  elements.filePreviewViewToggle.hidden = true;
+  filePreviewEditSession = null;
+  renderFilePreviewToolbar();
+}
+
+function renderFilePreviewToolbar() {
+  const view = filePreviewTextView;
+  const session = filePreviewEditSession;
+  const showToggle = Boolean(view?.markdown) && !session;
+  elements.filePreviewViewToggle.hidden = !showToggle;
+  elements.filePreviewToolbar.hidden = !view || (!showToggle && !view.editable);
+  elements.filePreviewEdit.hidden = !view?.editable || Boolean(session);
+  elements.filePreviewSave.hidden = !session;
+  elements.filePreviewCancel.hidden = !session;
+  elements.filePreviewSave.disabled = !session || session.saving || !filePreviewEditDirty();
+  elements.filePreviewCancel.disabled = !session || session.saving;
 }
 
 function resetFilePreviewContent() {
@@ -4510,6 +4529,7 @@ function setFilePreviewViewMode(mode) {
     return;
   }
   const formatted = view.markdown && mode === "formatted";
+  view.mode = formatted ? "formatted" : "raw";
   elements.filePreviewFormatted.setAttribute("aria-pressed", String(formatted));
   elements.filePreviewRaw.setAttribute("aria-pressed", String(!formatted));
   if (formatted) {
@@ -4523,11 +4543,99 @@ function setFilePreviewViewMode(mode) {
   }
 }
 
-function showTextFilePreview(name, text, lineRange) {
+function showTextFilePreview(name, text, lineRange, editable = null, mode = null) {
   const markdown = /\.md$/i.test(name);
-  filePreviewTextView = { name, text, lineRange, markdown };
-  elements.filePreviewViewToggle.hidden = !markdown;
-  setFilePreviewViewMode(markdown && !lineRange ? "formatted" : "raw");
+  filePreviewTextView = { name, text, lineRange, markdown, editable };
+  renderFilePreviewToolbar();
+  setFilePreviewViewMode(mode ?? (markdown && !lineRange ? "formatted" : "raw"));
+}
+
+function filePreviewEditDirty() {
+  return filePreviewEditSession !== null &&
+    filePreviewEditSession.textarea.value !== filePreviewEditSession.baseline;
+}
+
+// Returns false when the user keeps the unsaved edits open.
+function confirmDiscardFilePreviewEdits() {
+  return !filePreviewEditDirty() || window.confirm("Discard unsaved changes to this file?");
+}
+
+function startFilePreviewEdit() {
+  const view = filePreviewTextView;
+  if (!view?.editable || filePreviewEditSession) {
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.className = "file-preview-editor";
+  textarea.setAttribute("aria-label", `Edit ${view.name}`);
+  textarea.spellcheck = false;
+  textarea.wrap = "off";
+  textarea.value = view.text;
+  const error = document.createElement("p");
+  error.className = "file-preview-edit-error";
+  error.setAttribute("role", "alert");
+  error.hidden = true;
+  filePreviewEditSession = { textarea, error, baseline: textarea.value, saving: false };
+  textarea.addEventListener("input", renderFilePreviewToolbar);
+  elements.filePreviewContent.replaceChildren(textarea, error);
+  renderFilePreviewToolbar();
+  textarea.focus();
+}
+
+async function saveFilePreviewEdit() {
+  const session = filePreviewEditSession;
+  const view = filePreviewTextView;
+  if (!session || !view?.editable || session.saving || !filePreviewEditDirty()) {
+    return;
+  }
+  const requestSequence = filePreviewRequestSequence;
+  session.saving = true;
+  session.error.hidden = true;
+  renderFilePreviewToolbar();
+  try {
+    const saved = await api(localFilePreviewRoute, {
+      method: "PUT",
+      body: JSON.stringify({
+        path: view.editable.reference,
+        content: session.textarea.value,
+        version: view.editable.version
+      })
+    });
+    if (requestSequence !== filePreviewRequestSequence || filePreviewEditSession !== session) {
+      return;
+    }
+    if (typeof saved?.name !== "string" || typeof saved.text !== "string" || typeof saved.version !== "string") {
+      throw new Error("The server returned an invalid file preview");
+    }
+    filePreviewEditSession = null;
+    showTextFilePreview(
+      saved.name,
+      saved.text,
+      view.lineRange,
+      { reference: view.editable.reference, version: saved.version },
+      view.mode
+    );
+    elements.filePreviewEdit.focus();
+  } catch (error) {
+    if (requestSequence !== filePreviewRequestSequence || filePreviewEditSession !== session) {
+      return;
+    }
+    session.saving = false;
+    session.error.textContent = `Not saved: ${error instanceof Error ? error.message : String(error)}`;
+    session.error.hidden = false;
+    renderFilePreviewToolbar();
+  }
+}
+
+function cancelFilePreviewEdit() {
+  const session = filePreviewEditSession;
+  const view = filePreviewTextView;
+  if (!session || session.saving || !confirmDiscardFilePreviewEdits()) {
+    return;
+  }
+  filePreviewEditSession = null;
+  showTextFilePreview(view.name, view.text, view.lineRange, view.editable, view.mode);
+  elements.filePreviewEdit.focus();
 }
 
 async function openLocalFilePreview(url, fallbackName) {
@@ -4562,7 +4670,11 @@ async function openLocalFilePreview(url, fallbackName) {
 
     elements.filePreviewTitle.textContent = preview.name;
     if (typeof preview.text === "string") {
-      showTextFilePreview(preview.name, preview.text, lineRange);
+      const reference = new URL(url, window.location.origin).searchParams.get("path") ?? "";
+      const editable = typeof preview.version === "string" && reference !== ""
+        ? { reference, version: preview.version }
+        : null;
+      showTextFilePreview(preview.name, preview.text, lineRange, editable);
       return;
     }
     if (typeof preview.data !== "string") {
@@ -4610,6 +4722,9 @@ async function openLocalFilePreview(url, fallbackName) {
 }
 
 function closeImagePreview() {
+  if (!confirmDiscardFilePreviewEdits()) {
+    return;
+  }
   if (elements.imagePreviewDialog.open && typeof elements.imagePreviewDialog.close === "function") {
     elements.imagePreviewDialog.close();
   } else {
@@ -9580,6 +9695,9 @@ elements.messages.addEventListener("click", (event) => {
 elements.messages.addEventListener("scroll", updateScrollToBottomButton, { passive: true });
 elements.filePreviewFormatted.addEventListener("click", () => setFilePreviewViewMode("formatted"));
 elements.filePreviewRaw.addEventListener("click", () => setFilePreviewViewMode("raw"));
+elements.filePreviewEdit.addEventListener("click", startFilePreviewEdit);
+elements.filePreviewSave.addEventListener("click", () => void saveFilePreviewEdit());
+elements.filePreviewCancel.addEventListener("click", cancelFilePreviewEdit);
 elements.filePreviewContent.addEventListener("click", (event) => {
   const target = event.target;
   if (!(target instanceof Element)) {
@@ -9742,6 +9860,17 @@ elements.imagePreviewDialog.addEventListener("click", (event) => {
 elements.imagePreviewDialog.addEventListener("close", () => {
   if (!elements.imagePreviewDialog.open) {
     resetFilePreviewContent();
+  }
+});
+// Escape and the close button both close the dialog natively, so they need the same unsaved-edits check.
+elements.imagePreviewDialog.addEventListener("cancel", (event) => {
+  if (!confirmDiscardFilePreviewEdits()) {
+    event.preventDefault();
+  }
+});
+elements.imagePreviewDialog.querySelector("form").addEventListener("submit", (event) => {
+  if (!confirmDiscardFilePreviewEdits()) {
+    event.preventDefault();
   }
 });
 function setMoreActionsOpen(open, { focusTrigger = false } = {}) {
