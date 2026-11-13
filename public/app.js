@@ -8,6 +8,7 @@ import {
 import { initChangesPanel } from "./changes-panel.js";
 import { initFilesPanel } from "./files-panel.js";
 import { initTerminalPanel } from "./terminal-panel.js";
+import { initEyeCare } from "./eye-care.js";
 
 const defaultBrandName = "Copilot Web";
 const defaultBrandInitial = "C";
@@ -9921,7 +9922,7 @@ elements.moreActions.addEventListener("click", () => {
   setMoreActionsOpen(elements.moreActionsMenu.hidden);
 });
 elements.moreActionsMenu.addEventListener("click", (event) => {
-  if (event.target.closest("button:not(:disabled)")) {
+  if (event.target.closest("button:not(:disabled):not([data-keep-menu-open])")) {
     setMoreActionsOpen(false);
   }
 });
@@ -10126,6 +10127,7 @@ changesPanel = initChangesPanel({
   },
   notify: (message) => setStatus(message, currentComposerConversation())
 });
+initEyeCare();
 // The terminal entries are hidden only when the server could not start the terminal, and the reason is in its capability.
 function applyTerminalCapability() {
   changesPanel?.setTerminalEnabled(state.capabilities.terminal?.enabled === true);

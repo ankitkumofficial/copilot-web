@@ -2632,6 +2632,81 @@ button:disabled {
   color: var(--accent);
 }
 
+#eye-care-toggle {
+  color: var(--text);
+}
+
+.eye-care-icon {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+#eye-care-toggle[aria-pressed="true"] .eye-care-icon .button-icon {
+  color: var(--accent);
+}
+
+#eye-care-toggle[aria-pressed="false"] .eye-care-icon .button-icon {
+  color: var(--muted);
+}
+
+.eye-care-badge {
+  position: absolute;
+  right: -5px;
+  bottom: -5px;
+  width: 12px;
+  height: 12px;
+}
+
+.eye-care-badge-disc {
+  stroke: var(--surface-raised);
+  stroke-width: 2;
+}
+
+.composer-more-item:hover .eye-care-badge-disc,
+.composer-more-item:focus-visible .eye-care-badge-disc {
+  stroke: var(--surface-hover);
+}
+
+#eye-care-toggle[aria-pressed="true"] .eye-care-badge-disc {
+  fill: var(--accent);
+}
+
+#eye-care-toggle[aria-pressed="false"] .eye-care-badge-disc {
+  fill: var(--muted);
+}
+
+.eye-care-badge-mark {
+  fill: none;
+  stroke: var(--surface-raised);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.eye-care-badge-check {
+  display: none;
+}
+
+#eye-care-toggle[aria-pressed="true"] .eye-care-badge-check {
+  display: inline;
+}
+
+#eye-care-toggle[aria-pressed="true"] .eye-care-badge-cross {
+  display: none;
+}
+
+.eye-care-state {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-weight: 700;
+}
+
+#eye-care-toggle[aria-pressed="true"] .eye-care-state {
+  color: var(--accent);
+}
+
 .changes-decision-icon {
   display: inline-flex;
   flex: 0 0 auto;
