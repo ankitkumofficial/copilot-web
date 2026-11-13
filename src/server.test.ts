@@ -8613,6 +8613,85 @@ test("disables MCP recovery across conversations and restores it when background
   await waitFor(`!document.querySelector('#reconnect-tools').disabled`);
 });
 
+test("reconnect tools on a new conversation creates it in the picked repository and keeps the draft", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { nativeMessages: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "reconnect-app"), { "a.txt": "a\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="${server.sessionId}"]'))`);
+  await evaluate(`document.querySelector("#new-chat").click()`);
+  await waitFor(`!document.querySelector("#prompt-input").disabled`);
+
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "reconnect-app"`);
+
+  await evaluate(`
+    (() => {
+      const input = document.querySelector("#prompt-input");
+      input.value = "unsent draft";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    })()
+  `);
+  await waitFor(`!document.querySelector("#reconnect-tools").disabled`);
+  await evaluate(`document.querySelector("#reconnect-tools").click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("/mcp reload")`);
+  await waitFor(`!document.querySelector("#reconnect-tools").disabled`);
+
+  const requests = await server.requests();
+  assert.equal(requests.filter((request) => request.method === "session/new" && request.cwd === repo).length, 1);
+  assert.equal(requests.filter((request) => (
+    request.method === "session/prompt" && request.text === "/mcp reload"
+  )).length, 1);
+  assert.equal(await evaluate(`document.querySelector("#prompt-input").value`), "unsent draft");
+  const activeId = await evaluate(`document.querySelector("button.session-item.active")?.dataset.sessionId ?? null`);
+  assert.ok(typeof activeId === "string" && activeId !== server.sessionId);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
+test("reconnect tools on a new conversation is enabled again when creating the conversation fails", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { nativeMessages: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "removed-app"), { "a.txt": "a\n" });
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  await waitFor(`Boolean(document.querySelector('button.session-item[data-session-id="${server.sessionId}"]'))`);
+  await evaluate(`document.querySelector("#new-chat").click()`);
+  await waitFor(`!document.querySelector("#prompt-input").disabled`);
+
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelector("#changes-repository-label").textContent === "removed-app"`);
+  // The picked repository is gone, so the server refuses to create the conversation in it.
+  await rm(repo, { recursive: true, force: true });
+
+  await waitFor(`!document.querySelector("#reconnect-tools").disabled`);
+  await evaluate(`document.querySelector("#reconnect-tools").click()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("outside the allowed roots")`);
+  await waitFor(`!document.querySelector("#reconnect-tools").disabled`);
+  const requests = await server.requests();
+  assert.equal(requests.some((request) => request.method === "session/new" && String(request.cwd).endsWith("/removed-app")), false);
+  assert.equal(requests.some((request) => request.text === "/mcp reload"), false);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
 test("keeps MCP recovery disabled when local cleanup overlaps a newer remote prompt", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000

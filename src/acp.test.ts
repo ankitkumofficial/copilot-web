@@ -209,6 +209,10 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       };
       sessions.set(session.sessionId, session);
       respond({ sessionId: session.sessionId, configOptions: configOptions(session) });
+      notify(session, {
+        sessionUpdate: "available_commands_update",
+        availableCommands: [{ name: "mcp", description: "Manage MCP servers" }]
+      });
       break;
     }
     case "session/load": {
@@ -266,6 +270,10 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         process.exit(17);
       }
       const session = sessions.get(request.params.sessionId);
+      if (request.params.prompt[0].text === "/mcp reload") {
+        respond({ stopReason: "end_turn" });
+        break;
+      }
       if (request.params.prompt[0].text === "permission") {
         pendingPermission = { request, session };
         process.stdout.write(JSON.stringify({
@@ -870,6 +878,30 @@ test("recreates unprompted sessions on model and context changes without loading
     ]);
     assert.equal(acp.getSessionContext(original.sessionId), undefined);
     await assert.rejects(acp.prompt(original, [{ type: "text", text: "stale session" }]), /was replaced/);
+  } finally {
+    await acp.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("keeps a reloaded empty session unprompted so a profile change replaces it", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-reloaded-empty-test-"));
+  const command = path.join(directory, "copilot-fake");
+  await writeFile(command, tieredCopilot);
+  await chmod(command, 0o700);
+  const acp = new AcpConnectionManager({ command, cwd: directory, clientVersion: "test" });
+  try {
+    const setup = await acp.newSession(directory, "long_context", { model: "gpt-6-luna" });
+    const original = { sessionId: setup.sessionId, cwd: directory };
+    assert.equal(await acp.reloadMcpServers(original), "end_turn");
+    const replaced = await acp.loadSession(original, "default");
+    assert.notEqual(replaced.sessionId, original.sessionId);
+    const requests = (await readFile(path.join(directory, "tiered-requests.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line));
+    assert.ok(requests.some((request) => (
+      request.method === "session/prompt" && request.params.prompt[0].text === "/mcp reload"
+    )));
+    assert.equal(requests.some((request) => request.method === "session/load"), false);
   } finally {
     await acp.stop();
     await rm(directory, { recursive: true, force: true });

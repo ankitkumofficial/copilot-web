@@ -1293,7 +1293,7 @@ export class AcpConnectionManager {
       if (!supported) {
         throw new AcpError("This Copilot CLI does not advertise the native /mcp command through ACP");
       }
-      this.unpromptedSessions.delete(session.sessionId);
+      // /mcp reload leaves no persisted history, so the session stays unprompted.
       return connection.prompt(session, [{ type: "text", text: "/mcp reload" }]);
     });
   }
