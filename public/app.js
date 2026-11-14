@@ -1452,10 +1452,12 @@ function applyServerPromptState(sessionId, result, request = null) {
 }
 
 function canReloadMcp(conversation) {
-  return Boolean(conversation?.sessionId) &&
+  return Boolean(conversation) &&
     !conversation.loading &&
     !conversation.configurationBusy &&
     !conversation.attachmentBusy &&
+    conversation.pendingSubmissions.length === 0 &&
+    !conversationCreationPromises.has(conversation) &&
     !promptIsActive(conversation) &&
     conversation.promptQueue.length === 0 &&
     ![...serverPromptStates.values()].some((promptState) => promptState.busy) &&
@@ -8080,6 +8082,20 @@ function applyFallbackConversationTitle(queuedPrompt, conversation) {
   renderSessionList();
 }
 
+function ensureNewConversationRequest(conversation) {
+  if (!conversation.creationRequest) {
+    const repository = changesPanel?.repositoryForPrompt(null) ?? null;
+    conversation.creationRequest = {
+      id: crypto.randomUUID(),
+      body: {
+        context: state.selectedContext,
+        configOverrides: selectedNewSessionConfigOverrides(conversation),
+        ...(repository ? { repository } : {})
+      }
+    };
+  }
+}
+
 function createServerConversation(sourceConversation = currentComposerConversation()) {
   const existingCreation = conversationCreationPromises.get(sourceConversation);
   if (existingCreation) {
@@ -9074,7 +9090,6 @@ async function submitPrompt() {
     setStatus("Wait for the working directory to change before sending", conversation);
     return;
   }
-  const repositoryRoot = changesPanel?.repositoryForPrompt(null) ?? null;
   const displayText = text.trim()
     ? text
     : selections.length > 0
@@ -9111,14 +9126,7 @@ async function submitPrompt() {
   let firstPromptHeld = false;
   try {
     if (!conversation.sessionId) {
-      conversation.creationRequest ??= {
-        id: crypto.randomUUID(),
-        body: {
-          context: state.selectedContext,
-          configOverrides: selectedNewSessionConfigOverrides(conversation),
-          ...(repositoryRoot ? { repository: repositoryRoot } : {})
-        }
-      };
+      ensureNewConversationRequest(conversation);
     }
     // A pending working-directory note goes with the first normal message after a change, never with a slash command.
     const pendingDirectory = conversation.sessionId ? pendingWorkingDirectoryNote(conversation.sessionId) : null;
@@ -9378,9 +9386,25 @@ function enqueuePrompt(
 }
 
 async function reconnectTools() {
-  const conversation = activeConversation();
+  let conversation = activeConversation();
   if (!canReloadMcp(conversation)) {
     return;
+  }
+  if (!conversation.sessionId) {
+    if (!state.requestScope) {
+      showError(new Error("Copilot is still connecting. Wait for the connection before reconnecting tools."), conversation);
+      return;
+    }
+    // The reload runs as a prompt, so a new conversation must first get a session.
+    ensureNewConversationRequest(conversation);
+    const creation = createServerConversation(conversation);
+    renderConfigurationControls();
+    conversation = await creation;
+    // Nothing else re-renders the button when creation fails.
+    renderConfigurationControls();
+    if (!conversation || !canReloadMcp(conversation)) {
+      return;
+    }
   }
   if (conversation.newerHistoryHidden) {
     const loaded = await loadConversation(conversation.sessionId, undefined, true);

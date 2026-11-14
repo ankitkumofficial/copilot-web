@@ -165,6 +165,9 @@ remote service.
   tool is unavailable without attempting a call, or after refreshing the page.
   This uses the native `/mcp reload` ACP command without restarting the CLI,
   rerunning earlier actions, or clearing your draft.
+  On a new conversation, the first click creates it with the composer's model,
+  context, and repository, as sending a first message would, then reloads. The
+  conversation stays empty until you send a message.
   The reload control remains disabled while any conversation has an
   active or queued prompt, including background conversations.
   Server activity is tracked separately from local prompt queues, and delayed
