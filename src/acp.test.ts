@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { AcpConnection, AcpConnectionManager, isRecord } from "./acp.js";
+import { AcpConnection, AcpConnectionManager, isRecord, PromptStalledError, type PromptStallOptions } from "./acp.js";
 
 const fakeCopilot = `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -1003,6 +1003,238 @@ test("routes permission responses to the session's model profile despite collidi
       acp.respondToPermission("default", 500, { outcome: "cancelled" }, luna.sessionId),
       /no longer pending/
     );
+  } finally {
+    await acp.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+const stallingCopilot = `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const readline = require("node:readline");
+const requestsFile = path.join(process.cwd(), "stalling-requests.jsonl");
+const turns = new Map();
+const write = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+const respond = (id, result) => write({ id, result });
+const update = (sessionId, value) => write({ method: "session/update", params: { sessionId, update: value } });
+const input = readline.createInterface({ input: process.stdin });
+input.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === undefined) {
+    // The client answers a permission request by its id.
+    const turn = [...turns.values()].find((candidate) => candidate.permissionId === request.id);
+    if (turn) {
+      turns.delete(turn.sessionId);
+      setTimeout(() => respond(turn.request.id, { stopReason: "end_turn" }), turn.answerDelayMs);
+    }
+    return;
+  }
+  fs.appendFileSync(requestsFile, JSON.stringify({ method: request.method }) + "\\n");
+  switch (request.method) {
+    case "initialize":
+      respond(request.id, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
+      break;
+    case "session/load":
+      respond(request.id, { sessionId: request.params.sessionId, configOptions: [] });
+      break;
+    case "session/cancel": {
+      const turn = turns.get(request.params.sessionId);
+      if (turn) {
+        turns.delete(request.params.sessionId);
+        // Replies after the client has stopped waiting, like a CLI that finishes its cancelled turn late.
+        respond(turn.request.id, { stopReason: "cancelled" });
+      }
+      break;
+    }
+    case "session/prompt": {
+      const sessionId = request.params.sessionId;
+      const text = request.params.prompt[0].text;
+      if (text === "stream") {
+        let chunks = 0;
+        const timer = setInterval(() => {
+          update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "." } });
+          chunks += 1;
+          if (chunks === 20) {
+            clearInterval(timer);
+            respond(request.id, { stopReason: "end_turn" });
+          }
+        }, 20);
+      } else if (text === "permission" || text === "permission-slow") {
+        turns.set(sessionId, { sessionId, request, permissionId: 500, answerDelayMs: text === "permission-slow" ? 50 : 0 });
+        write({
+          id: 500,
+          method: "session/request_permission",
+          params: { sessionId, options: [{ optionId: "allow", kind: "allow_once" }] }
+        });
+      } else if (text === "tool") {
+        turns.set(sessionId, { sessionId, request });
+        update(sessionId, {
+          sessionUpdate: "tool_call", toolCallId: "tool-1", title: "Run tests", kind: "execute", status: "in_progress"
+        });
+      } else if (text === "stall") {
+        // Like a CLI stuck on a dead connection, it never answers unless it is cancelled.
+        turns.set(sessionId, { sessionId, request });
+      } else {
+        respond(request.id, { stopReason: "end_turn" });
+      }
+      break;
+    }
+    default:
+      if (request.id !== undefined) {
+        respond(request.id, {});
+      }
+  }
+});
+`;
+
+async function startStallingConnection(promptStall: Partial<PromptStallOptions>) {
+  const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-prompt-stall-test-"));
+  const command = path.join(directory, "copilot-fake");
+  await writeFile(command, stallingCopilot);
+  await chmod(command, 0o700);
+  const acp = new AcpConnection({ command, cwd: directory, clientVersion: "test", promptStall });
+  return { acp, directory, session: { sessionId: "session-1", cwd: directory } };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+test("stops a prompt after two failed reachability checks in a row, then accepts the next prompt", { timeout: 10_000 }, async () => {
+  const outcomes = [false, true, false, false];
+  let checks = 0;
+  const { acp, directory, session } = await startStallingConnection({
+    checkAfterMs: 30,
+    checkIntervalMs: 5,
+    reachable: async () => outcomes[checks++] ?? false
+  });
+  try {
+    await assert.rejects(
+      acp.prompt(session, [{ type: "text", text: "stall" }]),
+      (error: unknown) => error instanceof PromptStalledError &&
+        /can't reach GitHub Copilot/.test(error.message)
+    );
+    // A failure followed by a successful check must not stop the prompt; the two failures after it do.
+    assert.ok(checks >= 4);
+    assert.equal(await acp.prompt(session, [{ type: "text", text: "after stall" }]), "end_turn");
+    // The fake handles requests in order, so the cancel is logged before the next prompt completes.
+    assert.match(
+      await readFile(path.join(directory, "stalling-requests.jsonl"), "utf8"),
+      /"method":"session\/cancel"/
+    );
+  } finally {
+    await acp.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("does not stop a turn that keeps streaming, even when Copilot is unreachable", { timeout: 10_000 }, async () => {
+  const { acp, directory, session } = await startStallingConnection({
+    checkAfterMs: 200,
+    checkIntervalMs: 5,
+    reachable: async () => false
+  });
+  try {
+    // Chunks arrive every 20 ms for 400 ms: the turn outlasts the silence limit but is never silent that long.
+    assert.equal(await acp.prompt(session, [{ type: "text", text: "stream" }]), "end_turn");
+  } finally {
+    await acp.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("does not stop a turn while it waits for a permission answer or a running tool", { timeout: 10_000 }, async () => {
+  const { acp, directory, session } = await startStallingConnection({
+    checkAfterMs: 20,
+    checkIntervalMs: 5,
+    reachable: async () => false
+  });
+  try {
+    const permissionRequested = new Promise<void>((resolve) => acp.events.once("permissionRequest", () => resolve()));
+    const permissionTurn = acp.prompt(session, [{ type: "text", text: "permission" }]);
+    await permissionRequested;
+    // Well past the silence limit, the turn is still waiting on the user, not on the network.
+    await delay(100);
+    await acp.respondToPermission(500, { outcome: "selected", optionId: "allow" });
+    assert.equal(await permissionTurn, "end_turn");
+
+    const toolStarted = new Promise<void>((resolve) => {
+      acp.events.on("sessionUpdate", (params: unknown) => {
+        if (isRecord(params) && isRecord(params.update) && params.update.sessionUpdate === "tool_call") {
+          resolve();
+        }
+      });
+    });
+    let settled = false;
+    const toolTurn = acp.prompt(session, [{ type: "text", text: "tool" }]).finally(() => {
+      settled = true;
+    });
+    await toolStarted;
+    await delay(100);
+    assert.equal(settled, false);
+    await acp.cancel(session.sessionId);
+    assert.equal(await toolTurn, "cancelled");
+  } finally {
+    await acp.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a permission left open by a cancelled turn does not keep the next turn from stopping", { timeout: 10_000 }, async () => {
+  const { acp, directory, session } = await startStallingConnection({
+    checkAfterMs: 20,
+    checkIntervalMs: 5,
+    reachable: async () => false
+  });
+  try {
+    const permissionRequested = new Promise<void>((resolve) => acp.events.once("permissionRequest", () => resolve()));
+    const cancelledTurn = acp.prompt(session, [{ type: "text", text: "permission" }]);
+    await permissionRequested;
+    await acp.cancel(session.sessionId);
+    assert.equal(await cancelledTurn, "cancelled");
+    await assert.rejects(acp.prompt(session, [{ type: "text", text: "stall" }]), PromptStalledError);
+  } finally {
+    await acp.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("counts silence from a permission answer, not from the wait for it", { timeout: 10_000 }, async () => {
+  const { acp, directory, session } = await startStallingConnection({
+    checkAfterMs: 20,
+    checkIntervalMs: 5,
+    stopAfterMs: 300,
+    reachable: async () => true
+  });
+  try {
+    const permissionRequested = new Promise<void>((resolve) => acp.events.once("permissionRequest", () => resolve()));
+    const turn = acp.prompt(session, [{ type: "text", text: "permission-slow" }]);
+    await permissionRequested;
+    // The wait for the user runs past the stop limit; it must not count as silence after the answer.
+    await delay(500);
+    await acp.respondToPermission(500, { outcome: "selected", optionId: "allow" });
+    assert.equal(await turn, "end_turn");
+  } finally {
+    await acp.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("stops a silent prompt after the stop limit even when Copilot is reachable", { timeout: 10_000 }, async () => {
+  const { acp, directory, session } = await startStallingConnection({
+    checkAfterMs: 20,
+    checkIntervalMs: 5,
+    stopAfterMs: 150,
+    reachable: async () => true
+  });
+  try {
+    await assert.rejects(
+      acp.prompt(session, [{ type: "text", text: "stall" }]),
+      (error: unknown) => error instanceof PromptStalledError &&
+        /Copilot stopped responding/.test(error.message)
+    );
+    assert.equal(await acp.prompt(session, [{ type: "text", text: "after silence" }]), "end_turn");
   } finally {
     await acp.stop();
     await rm(directory, { recursive: true, force: true });

@@ -88,10 +88,25 @@ interface PendingRequest {
   timer?: NodeJS.Timeout;
 }
 
+interface PromptWatch {
+  stalled: Promise<never>;
+  stall: (error: PromptStalledError) => void;
+  lastActivityAt: number;
+  toolCalls: Set<string>;
+  unreachableChecks: number;
+  checking: boolean;
+  timer: NodeJS.Timeout;
+}
+
 const defaultRequestTimeoutMs = 120_000;
 const processShutdownTimeoutMs = 2_000;
 const commandAdvertisementTimeoutMs = 5_000;
 const copilotSessionEventMethod = "github.com/copilot/sessionEvent";
+const copilotEndpointUrl = "https://api.githubcopilot.com/";
+// Two failed checks in a row, so a Wi-Fi reconnect after sleep does not stop a prompt.
+const unreachableChecksBeforeStop = 2;
+const unreachableMessage = "Copilot can't reach GitHub Copilot, so this prompt was stopped. Check your internet connection, then send your message again.";
+const silentMessage = "Copilot stopped responding, so this prompt was stopped. Send your message again to retry.";
 
 export class AcpError extends Error {
   public readonly code: number | undefined;
@@ -102,6 +117,35 @@ export class AcpError extends Error {
     this.name = "AcpError";
     this.code = code;
     this.data = data;
+  }
+}
+
+/** Thrown when a prompt is stopped because Copilot stopped responding. */
+export class PromptStalledError extends Error {}
+
+export interface PromptStallOptions {
+  /** Silence after which the prompt checks whether GitHub Copilot is reachable. */
+  checkAfterMs: number;
+  checkIntervalMs: number;
+  /** Silence after which the prompt is stopped without checking. */
+  stopAfterMs: number;
+  reachable: () => Promise<boolean>;
+}
+
+const defaultPromptStallOptions: PromptStallOptions = {
+  checkAfterMs: 60_000,
+  checkIntervalMs: 10_000,
+  stopAfterMs: 10 * 60_000,
+  reachable: isCopilotEndpointReachable
+};
+
+/** Any HTTP response shows the network works; only a failed connection counts as unreachable. */
+async function isCopilotEndpointReachable(): Promise<boolean> {
+  try {
+    await fetch(copilotEndpointUrl, { method: "HEAD", signal: AbortSignal.timeout(5_000) });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -139,12 +183,14 @@ export class AcpConnection {
   private stopping = false;
   private agentCapabilities: AgentCapabilities | undefined;
   private readonly pending = new Map<string, PendingRequest>();
-  private readonly permissionRequests = new Set<string>();
+  private readonly permissionRequests = new Map<string, string | undefined>();
   private readonly activeSessions = new Set<string>();
   private readonly busySessions = new Set<string>();
   private readonly loadingSessions = new Map<string, Promise<SessionSetup>>();
   private readonly sessionConfigOptions = new Map<string, JsonObject[]>();
   private readonly sessionCommands = new Map<string, Set<string>>();
+  private readonly promptWatches = new Map<string, PromptWatch>();
+  private readonly promptStall: PromptStallOptions;
 
   public constructor(options: {
     command: string;
@@ -154,6 +200,7 @@ export class AcpConnection {
     allowAll?: boolean;
     context?: ContextTier;
     model?: string;
+    promptStall?: Partial<PromptStallOptions>;
   }) {
     this.command = options.command;
     this.spawnCwd = options.cwd;
@@ -162,6 +209,7 @@ export class AcpConnection {
     this.allowAll = options.allowAll === true;
     this.context = options.context ?? "default";
     this.model = options.model;
+    this.promptStall = { ...defaultPromptStallOptions, ...options.promptStall };
   }
 
   public async start(): Promise<void> {
@@ -383,14 +431,31 @@ export class AcpConnection {
         await this.loadSession(session);
       }
 
-      const result = await this.sendRequest<unknown>(
-        "session/prompt",
-        {
-          sessionId: session.sessionId,
-          prompt
-        },
-        0
-      );
+      const watch = this.watchPrompt(session.sessionId);
+      let result: unknown;
+      try {
+        const request = this.sendRequest<unknown>(
+          "session/prompt",
+          {
+            sessionId: session.sessionId,
+            prompt
+          },
+          0
+        );
+        result = await Promise.race([request, watch.stalled]);
+      } catch (error) {
+        if (error instanceof PromptStalledError) {
+          try {
+            // The CLI may still be running the stopped turn, so ask it to stop.
+            this.sendNotification("session/cancel", { sessionId: session.sessionId });
+          } catch {
+            // The process has already exited, so there is nothing left to cancel.
+          }
+        }
+        throw error;
+      } finally {
+        this.unwatchPrompt(session.sessionId, watch);
+      }
 
       if (!isRecord(result)) {
         throw new Error("Copilot returned an invalid session/prompt response");
@@ -425,7 +490,10 @@ export class AcpConnection {
       throw new AcpError("That permission request is no longer pending");
     }
 
+    const sessionId = this.permissionRequests.get(key);
     this.permissionRequests.delete(key);
+    // Silence is counted from the answer, not from the wait for it.
+    this.noteSessionActivity(sessionId);
     this.writeMessage({
       jsonrpc: "2.0",
       id: requestId,
@@ -718,6 +786,7 @@ export class AcpConnection {
     const method = message.method;
     if (method === copilotSessionEventMethod) {
       if (isRecord(message.params)) {
+        this.noteSessionActivity(message.params.sessionId);
         this.events.emit("sessionEvent", message.params);
       } else {
         this.events.emit("protocolError", new Error("Copilot session event omitted params"));
@@ -750,6 +819,7 @@ export class AcpConnection {
           ));
           this.events.emit("commandsAvailable", sessionId);
         }
+        this.noteSessionActivity(sessionId, update);
         this.events.emit("sessionUpdate", message.params);
       } else {
         this.events.emit("protocolError", new Error("ACP session/update omitted params"));
@@ -763,7 +833,10 @@ export class AcpConnection {
         return;
       }
 
-      this.permissionRequests.add(String(message.id));
+      this.permissionRequests.set(
+        String(message.id),
+        typeof message.params.sessionId === "string" ? message.params.sessionId : undefined
+      );
       const event: PermissionRequestEvent = {
         requestId: message.id,
         params: message.params
@@ -884,6 +957,97 @@ export class AcpConnection {
       pending.reject(error);
     }
     this.pending.clear();
+  }
+
+  private watchPrompt(sessionId: string): PromptWatch {
+    let stall!: (error: PromptStalledError) => void;
+    const stalled = new Promise<never>((_resolve, reject) => {
+      stall = reject;
+    });
+    const watch: PromptWatch = {
+      stalled,
+      stall,
+      lastActivityAt: Date.now(),
+      toolCalls: new Set(),
+      unreachableChecks: 0,
+      checking: false,
+      timer: setInterval(() => {
+        void this.checkPromptStall(sessionId, watch);
+      }, this.promptStall.checkIntervalMs)
+    };
+    watch.timer.unref();
+    this.promptWatches.set(sessionId, watch);
+    return watch;
+  }
+
+  private unwatchPrompt(sessionId: string, watch: PromptWatch): void {
+    clearInterval(watch.timer);
+    this.promptWatches.delete(sessionId);
+    // A turn that has ended cannot still be waiting on a permission answer.
+    for (const [requestKey, requestSessionId] of this.permissionRequests) {
+      if (requestSessionId === sessionId) {
+        this.permissionRequests.delete(requestKey);
+      }
+    }
+  }
+
+  private noteSessionActivity(sessionId: unknown, update?: unknown): void {
+    const watch = typeof sessionId === "string" ? this.promptWatches.get(sessionId) : undefined;
+    if (!watch) {
+      return;
+    }
+    watch.lastActivityAt = Date.now();
+    if (
+      isRecord(update) &&
+      (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+      typeof update.toolCallId === "string"
+    ) {
+      if (update.status === "completed" || update.status === "failed") {
+        watch.toolCalls.delete(update.toolCallId);
+      } else {
+        watch.toolCalls.add(update.toolCallId);
+      }
+    }
+  }
+
+  /** Milliseconds since the agent last spoke; 0 while a tool call or permission request holds the prompt, or once it has ended. */
+  private silentFor(sessionId: string, watch: PromptWatch): number {
+    if (
+      this.promptWatches.get(sessionId) !== watch ||
+      watch.toolCalls.size > 0 ||
+      [...this.permissionRequests.values()].includes(sessionId)
+    ) {
+      return 0;
+    }
+    return Date.now() - watch.lastActivityAt;
+  }
+
+  private async checkPromptStall(sessionId: string, watch: PromptWatch): Promise<void> {
+    if (watch.checking) {
+      return;
+    }
+    const silentMs = this.silentFor(sessionId, watch);
+    if (silentMs < this.promptStall.checkAfterMs) {
+      watch.unreachableChecks = 0;
+      return;
+    }
+    if (silentMs >= this.promptStall.stopAfterMs) {
+      watch.stall(new PromptStalledError(silentMessage));
+      return;
+    }
+
+    watch.checking = true;
+    const reachable = await this.promptStall.reachable().catch(() => false);
+    watch.checking = false;
+    if (this.silentFor(sessionId, watch) < this.promptStall.checkAfterMs) {
+      // The agent spoke, or the prompt ended, while the check was running.
+      watch.unreachableChecks = 0;
+      return;
+    }
+    watch.unreachableChecks = reachable ? 0 : watch.unreachableChecks + 1;
+    if (watch.unreachableChecks >= unreachableChecksBeforeStop) {
+      watch.stall(new PromptStalledError(unreachableMessage));
+    }
   }
 
   private parseSessionInfo(value: unknown): SessionInfo | undefined {

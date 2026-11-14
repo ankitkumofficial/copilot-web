@@ -521,7 +521,10 @@ Reloading the page restores the screen of a running terminal.
   not shown again.
 - Long-running prompt turns remain active until Copilot completes, the user
   cancels them, or a new prompt requests an interruption; they are not cut off
-  by the bridge's short request timeout.
+  by the bridge's short request timeout. A turn is stopped with a message when
+  it has been silent for 60 seconds and GitHub Copilot cannot be reached on two
+  checks in a row, or when it has been silent for 10 minutes. Turns waiting on a
+  running tool call or a permission request are not stopped.
 - Native persisted-message history is experimental and depends on the installed
   SDK and Copilot CLI supporting `sessions.readPersistedEvents`. If it is
   unavailable or unreadable, ACP replay remains available, but older messages
