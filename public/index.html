@@ -225,6 +225,21 @@
                   </span>
                 </button>
                 <div id="composer-more-menu" class="composer-more-menu" hidden>
+                  <button id="eye-care-toggle" class="composer-more-item" type="button" aria-pressed="true" aria-label="Eye care" title="Remind me to rest my eyes every 20 minutes, 9:20 to 16:40 on weekdays" data-keep-menu-open>
+                    <span class="eye-care-icon">
+                      <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z"></path>
+                        <circle cx="12" cy="12" r="3"></circle>
+                      </svg>
+                      <svg class="eye-care-badge" viewBox="0 0 12 12" aria-hidden="true">
+                        <circle class="eye-care-badge-disc" cx="6" cy="6" r="5"></circle>
+                        <path class="eye-care-badge-mark eye-care-badge-check" d="M3.7 6.1 5.3 7.7 8.3 4.9"></path>
+                        <path class="eye-care-badge-mark eye-care-badge-cross" d="M4.4 4.4 7.6 7.6M7.6 4.4 4.4 7.6"></path>
+                      </svg>
+                    </span>
+                    <span>Eye care</span>
+                    <span id="eye-care-state" class="eye-care-state">On</span>
+                  </button>
                   <button id="reconnect-tools" class="composer-more-item" type="button" aria-label="Reconnect tools" title="Reload MCP connections without rerunning your prompt" disabled>
                     <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
                       <path d="M20 7v5h-5M4 17v-5h5"></path>
@@ -480,6 +495,16 @@
         <div class="rename-dialog-actions">
           <button class="secondary-button" value="cancel" type="submit" formnovalidate>Cancel</button>
           <button id="rename-confirm" class="send-button" value="confirm" type="submit">Rename</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="eye-care-dialog" class="delete-dialog" aria-labelledby="eye-care-title" aria-describedby="eye-care-description">
+      <form id="eye-care-form" method="dialog">
+        <h2 id="eye-care-title">Time to rest your eyes</h2>
+        <p id="eye-care-description">Look at something about 20 feet (6 meters) away for 20 seconds.</p>
+        <div class="delete-dialog-actions">
+          <button id="eye-care-dismiss" class="send-button" value="dismiss" type="submit">Dismiss</button>
         </div>
       </form>
     </dialog>

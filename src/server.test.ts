@@ -3146,7 +3146,12 @@ const chromePath = process.env.CHROME_BIN ?? (
     : "/usr/bin/google-chrome"
 );
 
-async function startTestBrowser(t: TestContext, baseUrl: string, preloadScript?: string) {
+async function startTestBrowser(
+  t: TestContext,
+  baseUrl: string,
+  preloadScript?: string,
+  options: { eyeCareDefault?: boolean } = {}
+) {
   const profile = await mkdtemp(path.join(tmpdir(), "copilot-web-browser-test-"));
   const browser = spawn(chromePath, [
     "--headless=new",
@@ -3248,6 +3253,16 @@ async function startTestBrowser(t: TestContext, baseUrl: string, preloadScript?:
       window.addEventListener("error", (event) => window.testBrowserErrors.push(event.message));
       window.addEventListener("unhandledrejection", (event) => window.testBrowserErrors.push(String(event.reason)));`
   }, sessionId);
+  if (!options.eyeCareDefault) {
+    // Eye care pop-ups would cover unrelated tests that run during its weekday schedule.
+    await command("Page.addScriptToEvaluateOnNewDocument", {
+      source: `try {
+        if (window.localStorage.getItem("copilot-web-eye-care") === null) {
+          window.localStorage.setItem("copilot-web-eye-care", "false");
+        }
+      } catch {}`
+    }, sessionId);
+  }
   if (preloadScript) {
     await command("Page.enable", {}, sessionId);
     await command("Page.addScriptToEvaluateOnNewDocument", { source: preloadScript }, sessionId);
@@ -3386,6 +3401,30 @@ const mockScreenWakeLock = `
     }
   });
 `;
+
+const mockEyeCareClock = `
+  (() => {
+    const NativeDate = window.Date;
+    let offset = 0;
+    class ControlledDate extends NativeDate {
+      constructor(...args) {
+        super(...(args.length === 0 ? [ControlledDate.now()] : args));
+      }
+      static now() {
+        return NativeDate.now() + offset;
+      }
+    }
+    window.Date = ControlledDate;
+    window.setEyeCareClock = (year, monthIndex, day, hours, minutes, seconds = 0) => {
+      offset = new NativeDate(year, monthIndex, day, hours, minutes, seconds).getTime() - NativeDate.now();
+    };
+  })();
+`;
+
+// Sets the eye care clock to a local time, then fires visibilitychange so the reminder check runs.
+function moveEyeCareClock(...time: number[]): string {
+  return `window.setEyeCareClock(${time.join(", ")}); document.dispatchEvent(new Event("visibilitychange"))`;
+}
 
 const mockSpeechRecognition = `
   window.speechRecognitionTest = { instances: [], startErrorName: null };
@@ -4103,6 +4142,135 @@ test("keeps the screen wake lock toggle usable and reports unavailable preferenc
   await evaluate(`${button}.click()`);
   await waitFor(`${button}.dataset.status === 'off' && !${button}.disabled`);
   assert.equal(await evaluate(`window.wakeLockTest.sentinels[0].released`), true);
+});
+
+test("eye care is on by default, toggles in place in More actions, and persists across reloads", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { command, sessionId, evaluate, waitFor, reload } = await startTestBrowser(t, server.baseUrl, `
+    ${mockEyeCareClock}
+    window.setEyeCareClock(2026, 10, 14, 10, 0);
+  `, { eyeCareDefault: true });
+  const toggle = `document.querySelector('#eye-care-toggle')`;
+  const menuHidden = `document.querySelector('#composer-more-menu').hidden`;
+  const indicator = `[
+    ${toggle}.querySelector('.eye-care-state').textContent,
+    getComputedStyle(${toggle}.querySelector('.eye-care-badge-check')).display,
+    getComputedStyle(${toggle}.querySelector('.eye-care-badge-cross')).display
+  ]`;
+  const openMoreActions = `document.querySelector('#composer-more-button').click()`;
+  await waitFor(`document.querySelector('#keep-awake')?.dataset.status === 'off'`);
+  assert.equal(await evaluate(`localStorage.getItem('copilot-web-eye-care')`), null);
+  assert.equal(await evaluate(`${toggle}.getAttribute('aria-pressed')`), "true");
+  assert.deepEqual(await evaluate(indicator), ["On", "inline", "none"]);
+  await evaluate(openMoreActions);
+  await evaluate(`${toggle}.click()`);
+  assert.equal(await evaluate(menuHidden), false);
+  assert.equal(await evaluate(`${toggle}.getAttribute('aria-pressed')`), "false");
+  assert.deepEqual(await evaluate(indicator), ["Off", "none", "inline"]);
+  assert.equal(await evaluate(`localStorage.getItem('copilot-web-eye-care')`), "false");
+  await evaluate(`${toggle}.focus()`);
+  await pressBrowserKey(command, sessionId, "Enter");
+  assert.equal(await evaluate(`${toggle}.getAttribute('aria-pressed')`), "true");
+  assert.equal(await evaluate(menuHidden), false);
+  assert.equal(await evaluate(`document.activeElement.id`), "eye-care-toggle");
+  assert.equal(await evaluate(`localStorage.getItem('copilot-web-eye-care')`), "true");
+  await evaluate(`${toggle}.click()`);
+  await reload();
+  await waitFor(`document.querySelector('#keep-awake')?.dataset.status === 'off'`);
+  assert.equal(await evaluate(`${toggle}.getAttribute('aria-pressed')`), "false");
+  assert.deepEqual(await evaluate(indicator), ["Off", "none", "inline"]);
+});
+
+test("eye care shows a Dismiss-only reminder at each weekday 20-minute slot, closed by Enter or Escape", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    ${mockEyeCareClock}
+    window.setEyeCareClock(2026, 10, 16, 10, 5);
+  `, { eyeCareDefault: true });
+  const dialog = `document.querySelector('#eye-care-dialog')`;
+  await waitFor(`document.querySelector('#keep-awake')?.dataset.status === 'off'`);
+  // Moving the clock after load leaves the page's own timer two seconds before the 10:20 reminder.
+  await evaluate(moveEyeCareClock(2026, 10, 16, 10, 19, 58));
+  await waitFor(`${dialog}?.open === true`);
+  assert.deepEqual(await evaluate(`[
+    document.querySelector('#eye-care-title').textContent,
+    document.querySelector('#eye-care-description').textContent,
+    Array.from(${dialog}.querySelectorAll('button'), (button) => button.textContent.trim()),
+    document.activeElement.id
+  ]`), [
+    "Time to rest your eyes",
+    "Look at something about 20 feet (6 meters) away for 20 seconds.",
+    ["Dismiss"],
+    "eye-care-dismiss"
+  ]);
+  await pressBrowserKey(command, sessionId, "Enter");
+  await waitFor(`!${dialog}.open`);
+  assert.equal(await evaluate(`${dialog}.returnValue`), "dismiss");
+  await evaluate(moveEyeCareClock(2026, 10, 16, 10, 30));
+  assert.equal(await evaluate(`${dialog}.open`), false);
+  await evaluate(moveEyeCareClock(2026, 10, 16, 10, 40));
+  await waitFor(`${dialog}.open`);
+  await pressBrowserKey(command, sessionId, "Escape");
+  await waitFor(`!${dialog}.open`);
+});
+
+test("eye care reminders stay within 9:20 to 16:40 on weekdays", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    ${mockEyeCareClock}
+    window.setEyeCareClock(2026, 10, 16, 9, 0);
+  `, { eyeCareDefault: true });
+  const dialog = `document.querySelector('#eye-care-dialog')`;
+  await waitFor(`document.querySelector('#keep-awake')?.dataset.status === 'off'`);
+  const reminderOpensAt = async (...time: number[]) => {
+    await evaluate(moveEyeCareClock(...time));
+    const open = await evaluate(`${dialog}.open`);
+    if (open === true) {
+      await evaluate(`document.querySelector('#eye-care-dismiss').click()`);
+    }
+    return open;
+  };
+  assert.equal(await reminderOpensAt(2026, 10, 16, 9, 19), false);
+  assert.equal(await reminderOpensAt(2026, 10, 16, 9, 20), true);
+  assert.equal(await reminderOpensAt(2026, 10, 16, 9, 39), false);
+  assert.equal(await reminderOpensAt(2026, 10, 16, 9, 40), true);
+  assert.equal(await reminderOpensAt(2026, 10, 16, 16, 40), true);
+  assert.equal(await reminderOpensAt(2026, 10, 16, 17, 0), false);
+  assert.equal(await reminderOpensAt(2026, 10, 14, 10, 0), false);
+  assert.equal(await reminderOpensAt(2026, 10, 15, 16, 40), false);
+});
+
+test("turning eye care on starts reminders at the next 20-minute slot and off stops them", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    ${mockEyeCareClock}
+    window.setEyeCareClock(2026, 10, 16, 10, 10);
+  `, { eyeCareDefault: true });
+  const dialog = `document.querySelector('#eye-care-dialog')`;
+  const toggle = `document.querySelector('#eye-care-toggle')`;
+  await waitFor(`document.querySelector('#keep-awake')?.dataset.status === 'off'`);
+  await evaluate(`document.querySelector('#composer-more-button').click()`);
+  await evaluate(`${toggle}.click()`);
+  assert.equal(await evaluate(`${toggle}.getAttribute('aria-pressed')`), "false");
+  await evaluate(moveEyeCareClock(2026, 10, 16, 10, 20));
+  assert.equal(await evaluate(`${dialog}.open`), false);
+  await evaluate(`${toggle}.click()`);
+  assert.equal(await evaluate(`${toggle}.getAttribute('aria-pressed')`), "true");
+  assert.equal(await evaluate(`${dialog}.open`), false);
+  await evaluate(moveEyeCareClock(2026, 10, 16, 10, 40));
+  assert.equal(await evaluate(`${dialog}.open`), true);
 });
 
 test("uses untimed ACP replay when native history is unavailable", {
@@ -5177,7 +5345,7 @@ test("changes view lists staged and unstaged files, stages and unstages them, re
     document.querySelector("#composer-more-menu").hidden,
     document.querySelector("#composer-more-button").getAttribute("aria-expanded"),
     Array.from(document.querySelectorAll("#composer-more-menu > button")).map((button) => button.id)
-  ]`), [false, "true", ["reconnect-tools", "attach-files", "terminal-action", "changes-toggle"]]);
+  ]`), [false, "true", ["eye-care-toggle", "reconnect-tools", "attach-files", "terminal-action", "changes-toggle"]]);
 
   await evaluate(`document.querySelector("#changes-toggle").click()`);
   await evaluate(`document.querySelector("#repository-tab-changes").click()`);
@@ -12355,7 +12523,7 @@ test("terminal opens from More actions for the selected repository and keeps its
   assert.deepEqual(await evaluate(`[
     document.querySelector("#composer-more-button").click(),
     Array.from(document.querySelectorAll("#composer-more-menu > button")).map((button) => button.id)
-  ][1]`), ["reconnect-tools", "attach-files", "terminal-action", "changes-toggle"]);
+  ][1]`), ["eye-care-toggle", "reconnect-tools", "attach-files", "terminal-action", "changes-toggle"]);
   await evaluate(`document.querySelector("#changes-toggle").click()`);
 
   await waitFor(`document.querySelector("#changes-repository").dataset.root !== undefined`);
