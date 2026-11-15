@@ -519,8 +519,19 @@
       <form id="eye-care-form" method="dialog">
         <h2 id="eye-care-title">Time to rest your eyes</h2>
         <p id="eye-care-description">Look at something about 20 feet (6 meters) away for 20 seconds.</p>
+        <div class="eye-care-counter">
+          <button id="eye-care-sound" class="eye-care-sound" type="button" data-sound="on" aria-label="Sound enabled" title="Sound enabled">
+            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"></path>
+              <path class="eye-care-sound-on" d="M15.5 9a4 4 0 0 1 0 6m2.5-8.5a7.5 7.5 0 0 1 0 11"></path>
+              <path class="eye-care-sound-off" d="m16 9 5 6m0-6-5 6"></path>
+            </svg>
+          </button>
+          <button id="eye-care-start" class="secondary-button" type="button">Start counter</button>
+          <span id="eye-care-count" class="eye-care-count" role="timer" hidden></span>
+        </div>
         <div class="delete-dialog-actions">
-          <button id="eye-care-dismiss" class="send-button" value="dismiss" type="submit">Dismiss</button>
+          <button id="eye-care-dismiss" class="send-button" value="dismiss" type="submit" autofocus>Dismiss</button>
         </div>
       </form>
     </dialog>

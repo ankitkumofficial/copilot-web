@@ -163,14 +163,17 @@ remote service.
   show a disabled button. Manual and company-enforced locks are unaffected.
 - **Eye care** in the **More actions** (⋯) menu is on by default. Its row shows a
   check or cross on the eye icon with **On** or **Off** beside it, and toggling it
-  keeps the menu open. While it is on, a Dismiss-only reminder appears every 20
-  minutes from 9:20 through 16:40 (9:20, 9:40, 10:00, and so on to 16:40), Monday
-  to Friday, in local time. It suggests the
+  keeps the menu open. While it is on, a reminder appears every 20 minutes from
+  9:20 through 16:40 (9:20, 9:40, 10:00, and so on to 16:40), Monday to Friday,
+  in local time. It suggests the
   [20-20-20 rule](https://www.aoa.org/healthy-eyes/eye-and-vision-conditions/computer-vision-syndrome)
   from the American Optometric Association: look at something about 20 feet away
-  for 20 seconds. Enter or Escape dismisses it. Reminders appear while this page
-  is open; turning Eye care on does not show the 20-minute slot already under way.
-  Your choice is stored in the browser.
+  for 20 seconds. **Start counter** counts down from 20 to 0, ticking each second
+  and playing a different chime at 0; the speaker icon beside it turns that sound
+  on or off. Dismiss closes the reminder and stops the counter. Escape dismisses
+  it, and Enter does too unless a counter control has focus. Reminders appear
+  while this page is open; turning Eye care on does not show the 20-minute slot
+  already under way. Your choices are stored in the browser.
 - Reload MCP connections using **Reconnect tools** in the **More actions** (⋯)
   menu, even when Copilot says a
   tool is unavailable without attempting a call, or after refreshing the page.
