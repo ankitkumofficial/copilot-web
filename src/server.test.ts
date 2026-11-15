@@ -4324,6 +4324,7 @@ test("turning eye care on starts reminders at the next 20-minute slot and off st
   assert.equal(await evaluate(`${dialog}.open`), true);
 });
 
+// Do not add tests that wait for the 20-second counter to finish: it runs in real time, so each one adds 20 seconds to the suite.
 test("eye care sound toggle silences the counter, and Enter on counter controls keeps the dialog open", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000

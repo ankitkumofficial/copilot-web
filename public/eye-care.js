@@ -14,6 +14,7 @@ export function initEyeCare() {
   const soundToggle = document.querySelector("#eye-care-sound");
   const startButton = document.querySelector("#eye-care-start");
   const countLabel = document.querySelector("#eye-care-count");
+  const finishedIcon = document.querySelector("#eye-care-finished");
   let enabled = readPreference(eyeCareStorageKey);
   let soundEnabled = readPreference(eyeCareSoundStorageKey);
   let lastReminderWindow = null;
@@ -63,8 +64,10 @@ export function initEyeCare() {
   }
 
   function showCount(value) {
-    countLabel.hidden = false;
-    countLabel.textContent = String(value);
+    const finished = value === 0;
+    countLabel.hidden = finished;
+    countLabel.textContent = finished ? "" : String(value);
+    finishedIcon.hidden = !finished;
     if (!soundEnabled) {
       return;
     }
@@ -80,6 +83,9 @@ export function initEyeCare() {
     if (soundEnabled) {
       prepareAudio();
     }
+    startButton.hidden = true;
+    // Hiding the focused Start counter button would drop focus to the page, so focus moves to the speaker button in the same row.
+    soundToggle.focus();
     let remaining = countdownSeconds;
     showCount(remaining);
     countdownTimer = setInterval(() => {
@@ -100,6 +106,8 @@ export function initEyeCare() {
     stopCountdown();
     countLabel.hidden = true;
     countLabel.textContent = "";
+    finishedIcon.hidden = true;
+    startButton.hidden = false;
   }
 
   toggle.addEventListener("click", () => {

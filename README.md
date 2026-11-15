@@ -169,9 +169,11 @@ remote service.
   [20-20-20 rule](https://www.aoa.org/healthy-eyes/eye-and-vision-conditions/computer-vision-syndrome)
   from the American Optometric Association: look at something about 20 feet away
   for 20 seconds. **Start counter** counts down from 20 to 0, ticking each second
-  and playing a different chime at 0; the speaker icon beside it turns that sound
-  on or off. Dismiss closes the reminder and stops the counter. Escape dismisses
-  it, and Enter does too unless a counter control has focus. Reminders appear
+  and playing a different chime at 0. Starting it hides the button, and a green
+  tick replaces the 0 when the count finishes. The speaker icon turns that sound
+  on or off. Dismiss closes the reminder and stops the counter, which brings the
+  button back. Escape dismisses it, and Enter
+  does too unless a counter control has focus. Reminders appear
   while this page is open; turning Eye care on does not show the 20-minute slot
   already under way. Your choices are stored in the browser.
 - Reload MCP connections using **Reconnect tools** in the **More actions** (⋯)
