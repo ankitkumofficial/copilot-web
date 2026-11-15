@@ -166,7 +166,7 @@
                 <span class="visually-hidden">Context</span>
                 <select id="context-select">
                   <option value="default">Default</option>
-                  <option value="long_context">Long context</option>
+                  <option value="long_context">Long</option>
                 </select>
               </label>
               <label class="setting-control composer-setting" title="Reasoning effort">
@@ -208,11 +208,6 @@
               </div>
             </div>
             <div class="composer-actions" aria-label="Conversation actions">
-              <button id="keep-awake" class="secondary-button icon-button" type="button" aria-label="Keep awake: Off" aria-pressed="false" aria-describedby="keep-awake-status" title="Keep awake: Off">
-                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M5 8h12v7a5 5 0 0 1-5 5h-2a5 5 0 0 1-5-5ZM17 8h2a3 3 0 0 1 0 6h-2M8 3v2m4-2v2m4-2v2"></path>
-                </svg>
-              </button>
               <div class="composer-more">
                 <button id="composer-more-button" class="secondary-button icon-button" type="button" aria-label="More actions" title="More actions" aria-haspopup="true" aria-expanded="false" aria-controls="composer-more-menu">
                   <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -225,20 +220,32 @@
                   </span>
                 </button>
                 <div id="composer-more-menu" class="composer-more-menu" hidden>
-                  <button id="eye-care-toggle" class="composer-more-item" type="button" aria-pressed="true" aria-label="Eye care" title="Remind me to rest my eyes every 20 minutes, 9:20 to 16:40 on weekdays" data-keep-menu-open>
-                    <span class="eye-care-icon">
+                  <button id="eye-care-toggle" class="composer-more-item composer-more-toggle" type="button" aria-pressed="true" aria-label="Eye care" title="Remind me to rest my eyes every 20 minutes, 9:20 to 16:40 on weekdays" data-keep-menu-open>
+                    <span class="composer-more-icon">
                       <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
                         <path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z"></path>
                         <circle cx="12" cy="12" r="3"></circle>
                       </svg>
-                      <svg class="eye-care-badge" viewBox="0 0 12 12" aria-hidden="true">
-                        <circle class="eye-care-badge-disc" cx="6" cy="6" r="5"></circle>
-                        <path class="eye-care-badge-mark eye-care-badge-check" d="M3.7 6.1 5.3 7.7 8.3 4.9"></path>
-                        <path class="eye-care-badge-mark eye-care-badge-cross" d="M4.4 4.4 7.6 7.6M7.6 4.4 4.4 7.6"></path>
+                      <svg class="composer-more-badge" viewBox="0 0 12 12" aria-hidden="true">
+                        <circle class="composer-more-badge-disc" cx="6" cy="6" r="5"></circle>
+                        <path class="composer-more-badge-mark composer-more-badge-check" d="M3.7 6.1 5.3 7.7 8.3 4.9"></path>
+                        <path class="composer-more-badge-mark composer-more-badge-cross" d="M4.4 4.4 7.6 7.6M7.6 4.4 4.4 7.6"></path>
                       </svg>
                     </span>
                     <span>Eye care</span>
-                    <span id="eye-care-state" class="eye-care-state">On</span>
+                  </button>
+                  <button id="keep-awake" class="composer-more-item composer-more-toggle" type="button" aria-pressed="false" aria-label="Keep awake: Off" aria-describedby="keep-awake-status" title="Keep awake: Off" data-keep-menu-open>
+                    <span class="composer-more-icon">
+                      <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M5 8h12v7a5 5 0 0 1-5 5h-2a5 5 0 0 1-5-5ZM17 8h2a3 3 0 0 1 0 6h-2M8 3v2m4-2v2m4-2v2"></path>
+                      </svg>
+                      <svg class="composer-more-badge" viewBox="0 0 12 12" aria-hidden="true">
+                        <circle class="composer-more-badge-disc" cx="6" cy="6" r="5"></circle>
+                        <path class="composer-more-badge-mark composer-more-badge-check" d="M3.7 6.1 5.3 7.7 8.3 4.9"></path>
+                        <path class="composer-more-badge-mark composer-more-badge-cross" d="M4.4 4.4 7.6 7.6M7.6 4.4 4.4 7.6"></path>
+                      </svg>
+                    </span>
+                    <span>Keep awake</span>
                   </button>
                   <button id="reconnect-tools" class="composer-more-item" type="button" aria-label="Reconnect tools" title="Reload MCP connections without rerunning your prompt" disabled>
                     <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
