@@ -5928,6 +5928,86 @@ test("changes view resets unstaged files only after confirmation, deleting new f
   assert.equal(await evaluate(`document.querySelector("#changes-badge").textContent`), "1");
   assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
 });
+
+test("the diff's Reset button and Cmd+J reset the open file after confirmation, even when the list filter hides it", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 30_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "diff-reset-app"), {
+    "tracked.txt": "base\n",
+    "other.txt": "base\n",
+    "staged.txt": "before\n"
+  });
+  await writeFile(path.join(repo, "tracked.txt"), "changed\n");
+  await writeFile(path.join(repo, "other.txt"), "changed\n");
+  await writeFile(path.join(repo, "staged.txt"), "after\n");
+  testGit(repo, "add", "staged.txt");
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+  // The first reset runs in the narrow layout, where the list is hidden while a diff is open.
+  await command("Emulation.setDeviceMetricsOverride", { width: 600, height: 900, deviceScaleFactor: 1, mobile: false }, sessionId);
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await evaluate(`document.querySelector("#repository-tab-changes").click()`);
+  await waitFor(`document.querySelectorAll("#changes-repository-menu [role=treeitem]").length === 1`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`document.querySelector("#changes-repository-menu").hidden === false`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelectorAll("#changes-list [role=option]").length === 3`);
+
+  const dialog = `document.querySelector("#changes-reset-dialog")`;
+  // The diff's Reset button sits just after Stage for unstaged files, and focus returns to the list once the file is clean.
+  await evaluate(`document.querySelector('[data-key="unstaged:tracked.txt"]').click()`);
+  await waitFor(`document.querySelector("#changes-diff-title").textContent === "tracked.txt"`);
+  assert.deepEqual(await evaluate(`(() => {
+    const reset = document.querySelector("#changes-reset");
+    return { hidden: reset.hidden, label: reset.textContent, after: reset.previousElementSibling.id, title: reset.title };
+  })()`), { hidden: false, label: "Reset", after: "changes-stage", title: "Reset changes (⌘J)" });
+  await evaluate(`document.querySelector("#changes-reset").focus()`);
+  await evaluate(`document.querySelector("#changes-reset").click()`);
+  await waitFor(`${dialog}.open === true`);
+  assert.equal(await evaluate(`document.querySelector("#changes-reset-title").textContent`), "Reset tracked.txt?");
+  await evaluate(`document.querySelector("#changes-reset-confirm").click()`);
+  await waitFor(`!document.querySelector('[data-key="unstaged:tracked.txt"]')`);
+  assert.equal(await readFile(path.join(repo, "tracked.txt"), "utf8"), "base\n");
+  assert.equal(await evaluate(`document.querySelector("#changes-reset").hidden`), true);
+  assert.equal(await evaluate(`document.activeElement.id`), "changes-diff-back");
+  await command("Emulation.setDeviceMetricsOverride", { width: 1200, height: 900, deviceScaleFactor: 1, mobile: false }, sessionId);
+
+  // The filter hides other.txt's row, yet its open diff still offers Reset, and Cmd+J on that button resets the file.
+  await evaluate(`document.querySelector('[data-key="unstaged:other.txt"]').click()`);
+  await waitFor(`document.querySelector("#changes-diff-title").textContent === "other.txt"`);
+  await evaluate(`(() => {
+    const filter = document.querySelector("#changes-filter");
+    filter.value = "staged";
+    filter.dispatchEvent(new Event("input"));
+  })()`);
+  await waitFor(`document.querySelectorAll("#changes-list [role=option]").length === 1`);
+  assert.equal(await evaluate(`document.querySelector("#changes-reset").hidden`), false);
+  await evaluate(`document.querySelector("#changes-reset").focus()`);
+  await command("Input.dispatchKeyEvent", { type: "keyDown", modifiers: 4, key: "j", code: "KeyJ", windowsVirtualKeyCode: 74 }, sessionId);
+  await command("Input.dispatchKeyEvent", { type: "keyUp", modifiers: 4, key: "j", code: "KeyJ", windowsVirtualKeyCode: 74 }, sessionId);
+  await waitFor(`${dialog}.open === true`);
+  assert.equal(await evaluate(`document.querySelector("#changes-reset-title").textContent`), "Reset other.txt?");
+  await evaluate(`document.querySelector("#changes-reset-confirm").click()`);
+  await waitFor(`document.querySelector("#changes-diff-body").textContent.includes("No uncommitted changes")`);
+  assert.equal(await readFile(path.join(repo, "other.txt"), "utf8"), "base\n");
+  assert.equal(await evaluate(`document.activeElement.id`), "changes-list");
+
+  // A staged file's diff offers no reset, as its list row offers none.
+  await evaluate(`(() => {
+    const filter = document.querySelector("#changes-filter");
+    filter.value = "";
+    filter.dispatchEvent(new Event("input"));
+  })()`);
+  await evaluate(`document.querySelector('[data-key="staged:staged.txt"]').click()`);
+  await waitFor(`document.querySelector("#changes-diff-title").textContent === "staged.txt"`);
+  assert.equal(await evaluate(`document.querySelector("#changes-reset").hidden`), true);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
 });
 
 test("a repository chosen when a conversation is created becomes its working directory", {

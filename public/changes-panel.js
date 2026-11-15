@@ -168,6 +168,7 @@ export function initChangesPanel({
     // Created from a template only while the terminal is enabled, so a disabled server leaves no menu entry.
     terminalAction: null,
     stage: query("#changes-stage"),
+    reset: query("#changes-reset"),
     summary: query("#changes-summary-text"),
     filter: query("#changes-filter"),
     warnings: query("#changes-warnings"),
@@ -913,6 +914,12 @@ export function initChangesPanel({
     return s.status?.files?.find((file) => file.path === s.openFile.path && file.section === s.openFile.section) ?? null;
   }
 
+  // The open file as a list item, so the diff's Reset button and ⌘J still work when the list filter hides its row.
+  function openFileItem() {
+    const file = statusIsCurrent() ? openFileEntry() : null;
+    return file ? fileItem(file) : null;
+  }
+
   async function loadDiff() {
     const file = s.openFile;
     const repository = s.repository;
@@ -1436,9 +1443,8 @@ export function initChangesPanel({
     return !s.filter || filePath.toLowerCase().includes(s.filter.toLowerCase());
   }
 
-  function buildListModel() {
-    const files = statusIsCurrent() && Array.isArray(s.status.files) ? s.status.files : [];
-    const fileItem = (file) => ({
+  function fileItem(file) {
+    return {
       kind: "file",
       key: `${file.section}:${file.path}`,
       path: file.path,
@@ -1447,7 +1453,11 @@ export function initChangesPanel({
       section: file.section,
       file,
       selectable: true
-    });
+    };
+  }
+
+  function buildListModel() {
+    const files = statusIsCurrent() && Array.isArray(s.status.files) ? s.status.files : [];
     const groups = [
       {
         id: "unstaged",
@@ -1482,13 +1492,17 @@ export function initChangesPanel({
     return item.status === "untracked" || item.status === "added";
   }
 
+  function resetButtonTitle(item) {
+    return isNewFile(item) ? "Reset (deletes new file) (⌘J)" : "Reset changes (⌘J)";
+  }
+
   function resetButton(item) {
     const deletesFile = isNewFile(item);
     const button = element("button", "changes-file-action changes-file-action-reset");
     button.type = "button";
     button.tabIndex = -1;
     button.disabled = s.staging.has(item.key);
-    button.title = deletesFile ? "Reset (deletes new file) (⌘J)" : "Reset changes (⌘J)";
+    button.title = resetButtonTitle(item);
     button.setAttribute("aria-label", deletesFile ? `Delete new file ${item.path}` : `Reset changes to ${item.path}`);
     button.append(iconElement(resetIconPaths));
     button.addEventListener("click", (event) => {
@@ -1693,6 +1707,12 @@ export function initChangesPanel({
       ? "Unstage file (S)"
       : entry?.status === "conflicted" ? "Mark conflicts as resolved by staging (S)" : "Stage file (S)";
     el.stage.disabled = !entry || s.staging.has(file.key);
+    const resetTarget = openFileItem();
+    el.reset.hidden = !resetTarget || !canReset(resetTarget);
+    el.reset.disabled = s.staging.has(file.key);
+    if (resetTarget) {
+      el.reset.title = resetButtonTitle(resetTarget);
+    }
     el.wrap.setAttribute("aria-pressed", String(s.wrap));
     el.full.setAttribute("aria-pressed", String(s.full));
     el.diffBody.classList.toggle("diff-wrap", s.wrap);
@@ -1903,6 +1923,7 @@ export function initChangesPanel({
     s.staging.add(item.key);
     if (s.openFile?.key === item.key) {
       el.stage.disabled = true;
+      el.reset.disabled = true;
     }
     renderList();
     try {
@@ -2009,6 +2030,7 @@ export function initChangesPanel({
     const repository = s.repository;
     const repoToken = s.repoToken;
     const focusInList = el.list.contains(document.activeElement);
+    const focusOnReset = el.reset === document.activeElement;
     if (!(await confirmReset(item)) || repoToken !== s.repoToken) {
       return;
     }
@@ -2048,6 +2070,13 @@ export function initChangesPanel({
       render();
       if (focusInList) {
         el.list.focus();
+      } else if (focusOnReset) {
+        // Focus stays on the diff's Reset button while it is offered; otherwise it moves to the list, or to Back where the narrow layout hides the list.
+        if (!el.reset.hidden) {
+          el.reset.focus();
+        } else {
+          (el.list.offsetParent ? el.list : el.diffBack).focus();
+        }
       }
     }
   }
@@ -2061,8 +2090,7 @@ export function initChangesPanel({
 
   // Same confirmed reset as the row's Reset button, for the highlighted row or the file open in the diff.
   function resetActive(inList) {
-    const key = inList ? s.activeKey : s.openFile?.key;
-    const target = s.navigableItems.find((item) => item.key === key);
+    const target = inList ? s.navigableItems.find((item) => item.key === s.activeKey) : openFileItem();
     if (target) {
       void resetItem(target);
     }
@@ -2216,6 +2244,7 @@ export function initChangesPanel({
       void setStaged(target);
     }
   });
+  el.reset.addEventListener("click", () => resetActive(false));
   el.filter.addEventListener("input", () => {
     s.filter = el.filter.value.trim();
     renderList();

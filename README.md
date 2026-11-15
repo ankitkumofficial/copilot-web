@@ -232,8 +232,9 @@ remote service.
   Stage or unstage a file with its row button, the diff's **Stage** or
   **Unstage** button, or `S` on the highlighted row. After staging, the diff
   moves to the first unstaged file, or closes when none is left. An unstaged
-  file's row also has a **Reset** button: after confirmation it discards that file's unstaged
-  changes, or deletes the file if Git doesn't track it yet. The panel shows status,
+  file's row and its diff (beside **Stage**) also have a **Reset** button: after
+  confirmation it discards that file's unstaged changes, or deletes the file if Git
+  doesn't track it yet. The panel shows status,
   line counts, renames, and renders unified diffs with line numbers. It offers
   **Ask Copilot** (inserts a reference into the message without sending),
   **Attach diff**, copy actions, a wrap toggle, and a full-file view. The
@@ -265,10 +266,11 @@ remote service.
   working-directory note. The panel refreshes after Copilot tool activity and prompt
   completion, on window focus, and on demand (`R`). Inside the panel, `↑`/`↓` and
   `Enter` select and open files, `N`/`P` move between hunks, `W` toggles wrapping,
-  `⌘J` resets the highlighted file (with the same confirmation as its **Reset** button),
-  and `Escape` returns to the list or closes the panel. **Expand** in the panel
-  header fills the window with the panel by hiding the sidebar and conversation;
-  Ask and Attach restore the previous width, since they insert into the composer.
+  `⌘J` resets the highlighted file or the file open in the diff (with the same
+  confirmation as its **Reset** button), and `Escape` returns to the list or closes
+  the panel. **Expand** in the panel header fills the window with the panel by hiding
+  the sidebar and conversation; Ask and Attach restore the previous width, since they
+  insert into the composer.
 
 New conversations start in the repository picked before their first message, or
 in `~/projects` otherwise. Copilot can then navigate to repositories below
