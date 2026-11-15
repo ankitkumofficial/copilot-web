@@ -8370,6 +8370,119 @@ test("keeps multi-block selections, Ask Copilot, and highlights through re-rende
   `), ["Selection 1", "Selection 2"]);
 });
 
+test("diff selections can be asked about, reopen their passage with a highlight, and survive a refresh", {
+  skip: !existsSync(chromePath)
+    ? "Chrome is not installed; set CHROME_BIN to run browser tests"
+    : gitAvailable ? false : "git is not on PATH",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), {
+    "src/a.txt": "one\ntwo\nthree\nfour\n"
+  });
+  await writeFile(path.join(repo, "src", "a.txt"), "one\nTWO\nthree\nfour\nfive\n");
+  const { command, sessionId, evaluate, waitFor, reload } = await startTestBrowser(t, server.baseUrl);
+  await command("Emulation.setDeviceMetricsOverride", {
+    width: 1400, height: 1000, deviceScaleFactor: 1, mobile: false
+  }, sessionId);
+  // The panel's width is clamped to the viewport when the page loads, so reload once the wide viewport is set.
+  await reload();
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await evaluate(`document.querySelector("#repository-tab-changes").click()`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]")).some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await waitFor(`document.querySelector("#changes-list").textContent.includes("Choose a repository")`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`document.querySelectorAll("#changes-list [role=option]").length === 1`);
+  await evaluate(`document.querySelector('[data-key="unstaged:src/a.txt"]').click()`);
+  await waitFor(`document.querySelectorAll("#changes-diff-body .diff-line").length === 6`);
+
+  // Select from the added "TWO" line through the added "five" line, starting and ending inside their code.
+  await evaluate(`(() => {
+    const code = (text) => [...document.querySelectorAll("#changes-diff-body .diff-code")]
+      .find((cell) => cell.textContent === text).firstChild;
+    const range = document.createRange();
+    range.setStart(code("TWO"), 0);
+    range.setEnd(code("five"), 4);
+    document.querySelector("#changes-diff-body").dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+  })()`);
+  await waitFor(`!document.querySelector("#changes-selection-actions").hidden`);
+  await evaluate(`document.querySelector("#changes-ask-selection").click()`);
+  await waitFor(`document.querySelectorAll(".selection-card").length === 1`);
+  assert.deepEqual(await evaluate(`[...document.querySelectorAll(".selection-card-text")].map((text) => text.textContent)`), [
+    "TWO\nthree\nfour\nfive"
+  ]);
+  assert.equal(await evaluate(`document.querySelector("#changes-selection-actions").hidden`), true);
+
+  // The composer card brings the passage back into the diff, which is highlighted just as conversation text is.
+  const highlightedText = `JSON.stringify([...(window.CSS.highlights?.get("copilot-web-diff-selection") ?? [])]
+    .map((range) => range.toString()))`;
+  const passage = JSON.stringify(["TWO", "three", "four", "five"]);
+  await evaluate(`document.querySelector("#changes-diff-close").click()`);
+  await waitFor(`document.querySelector("#changes-diff").hidden === true`);
+  await evaluate(`document.querySelector('[aria-label="Jump to Selection 1 at its source"]').click()`);
+  await waitFor(`document.querySelector("#changes-diff-title")?.textContent === "src/a.txt" &&
+    Boolean(window.CSS.highlights?.get("copilot-web-diff-selection"))`);
+  assert.equal(await evaluate(highlightedText), passage);
+  assert.equal(await evaluate(`document.querySelector("#selection-status").hidden`), true);
+  await waitFor(`!window.CSS.highlights.has("copilot-web-diff-selection")`);
+
+  // The card travels with the message, and the sent selection opens the same passage after a refresh.
+  await evaluate(`document.querySelector("#composer").requestSubmit()`);
+  await waitFor(`document.querySelector("#messages").textContent.includes("Done.")`);
+  await waitFor(`Boolean(document.querySelector(".message.user .message-selection-summary"))`);
+  await evaluate(`document.querySelector("#changes-diff-close").click()`);
+  await waitFor(`document.querySelector("#changes-diff").hidden === true`);
+  await evaluate(`document.querySelector(".message.user .message-selection-summary").click()`);
+  await waitFor(`Boolean(window.CSS.highlights?.get("copilot-web-diff-selection"))`);
+  assert.equal(await evaluate(highlightedText), passage);
+  await waitFor(`!window.CSS.highlights.has("copilot-web-diff-selection")`);
+
+  await reload();
+  await waitFor(`document.querySelector("#messages")?.getAttribute("aria-busy") === "false" &&
+    Boolean(document.querySelector(".message.user .message-selection-summary")) &&
+    document.querySelector("#changes-badge")?.textContent === "1"`);
+  await evaluate(`document.querySelector(".message.user .message-selection-summary").click()`);
+  await waitFor(`Boolean(window.CSS.highlights?.get("copilot-web-diff-selection"))`);
+  assert.equal(await evaluate(highlightedText), passage);
+
+  // A closed panel opens again for the passage.
+  await waitFor(`!window.CSS.highlights.has("copilot-web-diff-selection")`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await waitFor(`document.querySelector("#changes-panel").hidden === true`);
+  await evaluate(`document.querySelector(".message.user .message-selection-summary").click()`);
+  await waitFor(`!document.querySelector("#changes-panel").hidden &&
+    Boolean(window.CSS.highlights?.get("copilot-web-diff-selection"))`);
+  assert.equal(await evaluate(highlightedText), passage);
+
+  // Without the CSS Highlight API, the browser's own selection marks the passage instead.
+  await waitFor(`!window.CSS.highlights.has("copilot-web-diff-selection")`);
+  await evaluate(`window.Highlight = undefined`);
+  await evaluate(`document.querySelector(".message.user .message-selection-summary").click()`);
+  await waitFor(`document.querySelector("#changes-diff-body").classList.contains("selection-flash")`);
+  assert.equal(await evaluate(`window.getSelection().toString().includes("TWO") &&
+    window.getSelection().toString().includes("five")`), true);
+  await waitFor(`!document.querySelector("#changes-diff-body").classList.contains("selection-flash") &&
+    window.getSelection().isCollapsed`);
+
+  // Once the file is back to unchanged, the sent passage cannot be shown and the user is told why.
+  testGit(repo, "checkout", "--", "src/a.txt");
+  await evaluate(`document.querySelector("#changes-diff-close")?.click()`);
+  await evaluate(`document.querySelector(".message.user .message-selection-summary").click()`);
+  await waitFor(`document.querySelector("#selection-status").textContent.includes("no uncommitted changes")`);
+  assert.equal(await evaluate(`document.querySelector("#changes-diff").hidden`), true);
+  assert.deepEqual(await evaluate(`window.testBrowserErrors`), []);
+});
+
 test("restores sent selection chips and source links after a page refresh", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000

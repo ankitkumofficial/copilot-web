@@ -387,6 +387,21 @@
                 </div>
               </div>
               <div id="changes-diff-body" class="changes-diff-body"></div>
+              <div id="changes-selection-actions" class="selection-actions" role="group" aria-label="Selected text actions" hidden>
+                <button
+                  id="changes-ask-selection"
+                  class="ask-selection selection-action"
+                  type="button"
+                  aria-label="Ask Copilot about selected text"
+                  title="Start a follow-up using the selected text"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="m12 3 1.7 6.3L20 11l-6.3 1.7L12 19l-1.7-6.3L4 11l6.3-1.7L12 3Z"></path>
+                    <path d="m19 16 .6 2.4L22 19l-2.4.6L19 22l-.6-2.4L16 19l2.4-.6L19 16Z"></path>
+                  </svg>
+                  <span>Ask Copilot</span>
+                </button>
+              </div>
             </section>
             <p id="changes-diff-empty" class="changes-diff-empty">Select a file to see its diff.</p>
             </div>
