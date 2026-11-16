@@ -3341,6 +3341,58 @@ function removeBlockToolbars(html) {
   return container.innerHTML;
 }
 
+function messageSelectionClipboardContent(range) {
+  const container = document.createElement("div");
+  container.append(range.cloneContents());
+  container.querySelectorAll(".block-toolbar").forEach((toolbar) => toolbar.remove());
+  for (const element of container.querySelectorAll("[style], [bgcolor], [background]")) {
+    for (const property of Array.from(element.style)) {
+      if (property.startsWith("background")) {
+        element.style.removeProperty(property);
+      }
+    }
+    if (element.style.length === 0) {
+      element.removeAttribute("style");
+    }
+    element.removeAttribute("bgcolor");
+    element.removeAttribute("background");
+  }
+
+  container.setAttribute("aria-hidden", "true");
+  container.style.position = "fixed";
+  container.style.top = "0";
+  container.style.left = "-9999px";
+  document.body.append(container);
+  try {
+    return {
+      text: container.innerText || container.textContent || "",
+      html: container.innerHTML
+    };
+  } finally {
+    container.remove();
+  }
+}
+
+function handleMessageCopy(event) {
+  if (!event.clipboardData) {
+    return;
+  }
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount !== 1) {
+    return;
+  }
+  const range = selection.getRangeAt(0);
+  const body = messageBodyForSelectionNode(range.startContainer);
+  if (!body || messageBodyForSelectionNode(range.endContainer) !== body) {
+    return;
+  }
+
+  const { text, html } = messageSelectionClipboardContent(range);
+  event.clipboardData.setData("text/plain", text);
+  event.clipboardData.setData("text/html", html);
+  event.preventDefault();
+}
+
 function messageClipboardContent(message, button) {
   const fallbackText = messageClipboardText(message);
   if (message.role !== "assistant") {
@@ -9760,6 +9812,7 @@ elements.messages.addEventListener("scroll", () => {
   }
 }, { passive: true });
 elements.messages.addEventListener("keydown", handleMessageSelectionKeydown);
+document.addEventListener("copy", handleMessageCopy);
 elements.messages.addEventListener("scroll", updateAskSelection, { passive: true });
 elements.messages.addEventListener("load", updateScrollToBottomButton, true);
 elements.messages.addEventListener("toggle", updateScrollToBottomButton, true);
