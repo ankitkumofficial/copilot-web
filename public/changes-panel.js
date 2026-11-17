@@ -1636,7 +1636,15 @@ export function initChangesPanel({
       section.setAttribute("role", "group");
       section.setAttribute("aria-label", group.title);
       const header = element("div", "changes-group-title");
-      header.append(element("span", "", group.title), element("span", "changes-group-count", sectionTotals(group.items)));
+      const headerMeta = element("span", "changes-group-meta");
+      headerMeta.append(element("span", "changes-group-count", sectionTotals(group.items)));
+      // Conflicted files stay out of Stage all; each one is still staged from its own row.
+      const bulkAction = group.id === "unstaged" ? "stage" : group.id === "staged" ? "unstage" : null;
+      const bulkItems = bulkAction ? group.items.filter((item) => item.status !== "conflicted") : [];
+      if (bulkItems.length > 0) {
+        headerMeta.append(bulkButton(bulkAction, bulkItems));
+      }
+      header.append(element("span", "", group.title), headerMeta);
       section.append(header);
       if (group.items.length === 0) {
         section.append(element("p", "changes-group-empty", s.filter ? "No matching files" : `No ${group.id} changes`));
@@ -2387,6 +2395,86 @@ export function initChangesPanel({
         } else {
           (el.list.offsetParent ? el.list : el.diffBack).focus();
         }
+      }
+    }
+  }
+
+  // Stage all and Unstage all change the listed files in one request, so new files are included without a click per row.
+  function bulkButton(action, items) {
+    const stages = action === "stage";
+    const button = element("button", "changes-group-action", stages ? "Stage all" : "Unstage all");
+    button.type = "button";
+    button.dataset.bulkAction = action;
+    button.disabled = items.some((item) => s.staging.has(item.key));
+    button.title = stages ? "Stage all listed unstaged files, including new files" : "Unstage all listed staged files";
+    button.addEventListener("click", () => void setListedStaged(items, action));
+    return button;
+  }
+
+  async function setListedStaged(items, action) {
+    const pending = items.filter((item) => !s.staging.has(item.key));
+    if (!s.repository || pending.length === 0) {
+      return;
+    }
+    const repository = s.repository;
+    const repoToken = s.repoToken;
+    const statusKey = currentStatusKey();
+    const staging = action === "stage";
+    const movedSection = staging ? "staged" : "unstaged";
+    const advanceDiff = staging && pending.some((item) => item.key === s.openFile?.key);
+    const activeItem = pending.find((item) => item.key === s.activeKey);
+    const focusedAction = document.activeElement?.dataset.bulkAction ?? null;
+    const focusInList = el.list.contains(document.activeElement);
+    for (const item of pending) {
+      s.staging.add(item.key);
+    }
+    renderList();
+    try {
+      const status = await api(staging ? "/api/git/stage-all" : "/api/git/unstage-all", {
+        method: "POST",
+        body: JSON.stringify({
+          repo: repository,
+          paths: pending.map((item) => item.path),
+          sessionId: changesSessionId()
+        })
+      });
+      if (repoToken === s.repoToken) {
+        s.mutations += 1;
+        if (statusKey !== currentStatusKey()) {
+          refreshStatusAndRender();
+        } else {
+          if (advanceDiff) {
+            // Clear the preview first so a staged file is not followed into the staged section.
+            resetDiff();
+          }
+          applyStatus(status);
+          if (activeItem) {
+            const movedKey = `${movedSection}:${activeItem.path}`;
+            s.activeKey = status.files.some((file) => `${file.section}:${file.path}` === movedKey) ? movedKey : null;
+          }
+          if (advanceDiff) {
+            openFirstUnstaged(status.files);
+          }
+        }
+        announce(`${pending.length} ${pending.length === 1 ? "file" : "files"} ${staging ? "staged" : "unstaged"}`);
+      }
+    } catch (error) {
+      if (repoToken === s.repoToken) {
+        s.mutations += 1;
+        const message = describeError(error).message;
+        notify(message);
+        announce(message);
+        refreshStatusAndRender();
+      }
+    } finally {
+      for (const item of pending) {
+        s.staging.delete(item.key);
+      }
+      render();
+      if (focusedAction) {
+        (el.list.querySelector(`[data-bulk-action="${focusedAction}"]`) ?? el.list).focus();
+      } else if (focusInList) {
+        el.list.focus();
       }
     }
   }

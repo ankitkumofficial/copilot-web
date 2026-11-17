@@ -11,7 +11,6 @@ export function initEyeCare() {
   const dialog = document.querySelector("#eye-care-dialog");
   const form = document.querySelector("#eye-care-form");
   const dismissButton = document.querySelector("#eye-care-dismiss");
-  const stateLabel = document.querySelector("#eye-care-state");
   const soundToggle = document.querySelector("#eye-care-sound");
   const startButton = document.querySelector("#eye-care-start");
   const countLabel = document.querySelector("#eye-care-count");
@@ -51,7 +50,6 @@ export function initEyeCare() {
 
   function applyEnabled() {
     toggle.setAttribute("aria-pressed", String(enabled));
-    stateLabel.textContent = enabled ? "On" : "Off";
     // The slot already under way counts as seen, so opening the page or turning Eye care on never pops up at once.
     lastReminderWindow = reminderWindowAt(new Date());
     scheduleNextCheck();

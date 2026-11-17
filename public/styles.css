@@ -2637,25 +2637,31 @@ button:disabled {
   color: var(--accent);
 }
 
-#eye-care-toggle {
+/* Toggle rows keep their label in the normal text color; the icon and its badge show the state. */
+.composer-more-toggle,
+.composer-more-toggle[aria-pressed="true"] {
   color: var(--text);
 }
 
-.eye-care-icon {
+.composer-more-icon {
   position: relative;
   display: inline-flex;
   flex: 0 0 auto;
 }
 
-#eye-care-toggle[aria-pressed="true"] .eye-care-icon .button-icon {
+.composer-more-toggle[aria-pressed="true"] .composer-more-icon .button-icon {
   color: var(--accent);
 }
 
-#eye-care-toggle[aria-pressed="false"] .eye-care-icon .button-icon {
+.composer-more-toggle[aria-pressed="false"] .composer-more-icon .button-icon {
   color: var(--muted);
 }
 
-.eye-care-badge {
+#keep-awake[data-status="error"] .composer-more-icon .button-icon {
+  color: var(--danger);
+}
+
+.composer-more-badge {
   position: absolute;
   right: -5px;
   bottom: -5px;
@@ -2663,25 +2669,25 @@ button:disabled {
   height: 12px;
 }
 
-.eye-care-badge-disc {
+.composer-more-badge-disc {
   stroke: var(--surface-raised);
   stroke-width: 2;
 }
 
-.composer-more-item:hover .eye-care-badge-disc,
-.composer-more-item:focus-visible .eye-care-badge-disc {
+.composer-more-item:hover .composer-more-badge-disc,
+.composer-more-item:focus-visible .composer-more-badge-disc {
   stroke: var(--surface-hover);
 }
 
-#eye-care-toggle[aria-pressed="true"] .eye-care-badge-disc {
+.composer-more-toggle[aria-pressed="true"] .composer-more-badge-disc {
   fill: var(--accent);
 }
 
-#eye-care-toggle[aria-pressed="false"] .eye-care-badge-disc {
+.composer-more-toggle[aria-pressed="false"] .composer-more-badge-disc {
   fill: var(--muted);
 }
 
-.eye-care-badge-mark {
+.composer-more-badge-mark {
   fill: none;
   stroke: var(--surface-raised);
   stroke-width: 1.5;
@@ -2689,27 +2695,16 @@ button:disabled {
   stroke-linejoin: round;
 }
 
-.eye-care-badge-check {
+.composer-more-badge-check {
   display: none;
 }
 
-#eye-care-toggle[aria-pressed="true"] .eye-care-badge-check {
+.composer-more-toggle[aria-pressed="true"] .composer-more-badge-check {
   display: inline;
 }
 
-#eye-care-toggle[aria-pressed="true"] .eye-care-badge-cross {
+.composer-more-toggle[aria-pressed="true"] .composer-more-badge-cross {
   display: none;
-}
-
-.eye-care-state {
-  margin-left: auto;
-  color: var(--muted);
-  font-size: 0.74rem;
-  font-weight: 700;
-}
-
-#eye-care-toggle[aria-pressed="true"] .eye-care-state {
-  color: var(--accent);
 }
 
 #eye-care-description {
@@ -2911,18 +2906,6 @@ button:disabled {
   font-size: 0.74rem;
 }
 
-#keep-awake[data-status="on"] {
-  border-color: var(--accent);
-  background: var(--user);
-  color: var(--accent-strong);
-}
-
-#keep-awake[data-status="paused"] {
-  border-color: var(--accent);
-  color: var(--accent-strong);
-}
-
-#keep-awake[data-status="error"],
 .keep-awake-status[data-error="true"] {
   color: var(--danger);
 }
@@ -3805,6 +3788,29 @@ button:disabled {
   font-variant-numeric: tabular-nums;
   letter-spacing: 0;
   text-transform: none;
+}
+
+.changes-group-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.changes-group-action {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.changes-group-action:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text);
 }
 
 .changes-empty {

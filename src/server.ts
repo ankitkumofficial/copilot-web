@@ -69,11 +69,14 @@ import {
   isWithinOrEqual,
   listProjectRepositories,
   listRepositoryFolder,
+  maximumStatusFiles,
   readFileDiff,
   readStatus,
   resetChangedFile,
   resolveToplevel,
   setChangeStaged,
+  stageChangedFiles,
+  unstageChangedFiles,
   validateRelativePath,
   type RepositoryEntry
 } from "./git-changes.js";
@@ -145,7 +148,7 @@ const contextOptions = [
   },
   {
     value: "long_context",
-    name: "Long context",
+    name: "Long",
     description: "Use Copilot's long_context profile."
   }
 ] as const;
@@ -670,6 +673,18 @@ function replayUpdateSignature(params: JsonObject): string {
     update.content,
     params.nativeCommand === true
   ]);
+}
+
+// Bulk stage and unstage requests name the files to change; each must be a valid path inside the repository.
+async function validateChangedPaths(repo: string, value: unknown): Promise<string[]> {
+  if (!Array.isArray(value) || value.length > maximumStatusFiles) {
+    throw new HttpError(400, "Paths must be a list of changed files", "invalid_paths");
+  }
+  const paths: string[] = [];
+  for (const entry of value) {
+    paths.push(await validateRelativePath(repo, entry));
+  }
+  return paths;
 }
 
 async function readJsonBody(request: IncomingMessage): Promise<JsonObject> {
@@ -3028,6 +3043,26 @@ async function main(): Promise<void> {
       const action = body.action;
       const scope = await conversationScope(body.sessionId, repo);
       await gitIndexWrites.enqueue(() => setChangeStaged(repo, filePath, action));
+      jsonResponse(response, 200, await computeStatus(repo, scope));
+      return true;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/api/git/stage-all") {
+      const body = await readJsonBody(request);
+      const repo = await resolveAllowedRepository(typeof body.repo === "string" ? body.repo : null);
+      const filePaths = await validateChangedPaths(repo, body.paths);
+      const scope = await conversationScope(body.sessionId, repo);
+      await gitIndexWrites.enqueue(() => stageChangedFiles(repo, filePaths));
+      jsonResponse(response, 200, await computeStatus(repo, scope));
+      return true;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/api/git/unstage-all") {
+      const body = await readJsonBody(request);
+      const repo = await resolveAllowedRepository(typeof body.repo === "string" ? body.repo : null);
+      const filePaths = await validateChangedPaths(repo, body.paths);
+      const scope = await conversationScope(body.sessionId, repo);
+      await gitIndexWrites.enqueue(() => unstageChangedFiles(repo, filePaths));
       jsonResponse(response, 200, await computeStatus(repo, scope));
       return true;
     }

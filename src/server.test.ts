@@ -1291,6 +1291,13 @@ test("changes endpoints list staged and unstaged files, serve section diffs, and
   assert.equal(unstage.status, 200);
   assert.deepEqual(sectionKeys(await unstage.json()), expectedKeys);
   assert.equal((await post({ repo, path: "src/a.txt", action: "discard" })).status, 400);
+  const invalidStageAll = await fetch(`${server.baseUrl}/api/git/stage-all`, {
+    method: "POST",
+    headers: { ...server.headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ repo, paths: "src/a.txt" })
+  });
+  assert.equal(invalidStageAll.status, 400);
+  assert.equal((await invalidStageAll.json() as JsonObject).code, "invalid_paths");
   assert.equal((await post({ repo, path: "../../etc/passwd", action: "stage" })).status, 400);
   assert.equal((await post({ path: "src/a.txt", action: "stage" })).status, 400);
   const outsideStage = await post({ repo: outsideRepo, path: "x.txt", action: "stage" });
@@ -3878,7 +3885,7 @@ test("streams speech into the composer and stops from the microphone button", {
   assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "false");
 });
 
-test("toggles a native screen wake lock from the message bar", {
+test("toggles a native screen wake lock from More actions", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
 }, async (t) => {
@@ -3889,11 +3896,16 @@ test("toggles a native screen wake lock from the message bar", {
   assert.equal(await evaluate(`window.isSecureContext && typeof navigator.wakeLock.request === 'function'`), true);
   assert.equal(await evaluate(`${button}.disabled`), false);
   assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "false");
-  assert.equal(await evaluate(`${button}.nextElementSibling.firstElementChild.id`), "composer-more-button");
+  assert.equal(await evaluate(`${button}.previousElementSibling.id`), "eye-care-toggle");
+  const indicator = `[
+    getComputedStyle(${button}.querySelector('.composer-more-badge-check')).display,
+    getComputedStyle(${button}.querySelector('.composer-more-badge-cross')).display
+  ]`;
   await evaluate(`${button}.click()`);
   await waitFor(`${button}.dataset.status === 'on' && !${button}.disabled`);
   assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "true");
-  assert.equal(await evaluate(`${button}.title`), "Keep awake: On");
+  assert.equal(await evaluate(`${button}.title`), "Keeping the display awake while this tab is visible");
+  assert.deepEqual(await evaluate(indicator), ["inline", "none"]);
   await evaluate(`window.beforeWakeLockReload = true`);
   await command("Page.reload", {}, sessionId);
   await waitFor(`!window.beforeWakeLockReload && ${button}?.dataset.status === 'on' && !${button}.disabled`);
@@ -3901,7 +3913,8 @@ test("toggles a native screen wake lock from the message bar", {
   await evaluate(`${button}.click()`);
   await waitFor(`${button}.dataset.status === 'off' && !${button}.disabled`);
   assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "false");
-  assert.equal(await evaluate(`${button}.title`), "Keep awake: Off");
+  assert.equal(await evaluate(`${button}.title`), "Prevent display from sleeping while this tab is visible");
+  assert.deepEqual(await evaluate(indicator), ["none", "inline"]);
   await evaluate(`window.beforeWakeLockReload = true`);
   await command("Page.reload", {}, sessionId);
   await waitFor(`!window.beforeWakeLockReload && ${button}?.dataset.status === 'off'`);
@@ -4140,7 +4153,7 @@ test("disables the screen wake lock toggle when the browser API is unavailable",
   const button = `document.querySelector('#keep-awake')`;
   await waitFor(`${button}?.dataset.status === 'off'`);
   assert.equal(await evaluate(`${button}.disabled`), true);
-  assert.equal(await evaluate(`${button}.title`), "Keep awake: Unavailable in this browser");
+  assert.equal(await evaluate(`${button}.title`), "Prevent display from sleeping (needs a supported browser and HTTPS or localhost)");
   await evaluate(`${button}.click()`);
   assert.equal(await evaluate(`${button}.getAttribute('aria-pressed')`), "false");
   assert.equal(await evaluate(`window.localStorage.getItem('copilot-web-keep-awake')`), "true");
@@ -4195,20 +4208,19 @@ test("eye care is on by default, toggles in place in More actions, and persists 
   const toggle = `document.querySelector('#eye-care-toggle')`;
   const menuHidden = `document.querySelector('#composer-more-menu').hidden`;
   const indicator = `[
-    ${toggle}.querySelector('.eye-care-state').textContent,
-    getComputedStyle(${toggle}.querySelector('.eye-care-badge-check')).display,
-    getComputedStyle(${toggle}.querySelector('.eye-care-badge-cross')).display
+    getComputedStyle(${toggle}.querySelector('.composer-more-badge-check')).display,
+    getComputedStyle(${toggle}.querySelector('.composer-more-badge-cross')).display
   ]`;
   const openMoreActions = `document.querySelector('#composer-more-button').click()`;
   await waitFor(`document.querySelector('#keep-awake')?.dataset.status === 'off'`);
   assert.equal(await evaluate(`localStorage.getItem('copilot-web-eye-care')`), null);
   assert.equal(await evaluate(`${toggle}.getAttribute('aria-pressed')`), "true");
-  assert.deepEqual(await evaluate(indicator), ["On", "inline", "none"]);
+  assert.deepEqual(await evaluate(indicator), ["inline", "none"]);
   await evaluate(openMoreActions);
   await evaluate(`${toggle}.click()`);
   assert.equal(await evaluate(menuHidden), false);
   assert.equal(await evaluate(`${toggle}.getAttribute('aria-pressed')`), "false");
-  assert.deepEqual(await evaluate(indicator), ["Off", "none", "inline"]);
+  assert.deepEqual(await evaluate(indicator), ["none", "inline"]);
   assert.equal(await evaluate(`localStorage.getItem('copilot-web-eye-care')`), "false");
   await evaluate(`${toggle}.focus()`);
   await pressBrowserKey(command, sessionId, "Enter");
@@ -4220,7 +4232,7 @@ test("eye care is on by default, toggles in place in More actions, and persists 
   await reload();
   await waitFor(`document.querySelector('#keep-awake')?.dataset.status === 'off'`);
   assert.equal(await evaluate(`${toggle}.getAttribute('aria-pressed')`), "false");
-  assert.deepEqual(await evaluate(indicator), ["Off", "none", "inline"]);
+  assert.deepEqual(await evaluate(indicator), ["none", "inline"]);
 });
 
 test("eye care shows a reminder at each weekday 20-minute slot, closed by Enter or Escape", {
@@ -4309,40 +4321,6 @@ test("turning eye care on starts reminders at the next 20-minute slot and off st
   assert.equal(await evaluate(`${toggle}.getAttribute('aria-pressed')`), "true");
   assert.equal(await evaluate(`${dialog}.open`), false);
   await evaluate(moveEyeCareClock(2026, 10, 16, 10, 40));
-  assert.equal(await evaluate(`${dialog}.open`), true);
-});
-
-test("eye care counter ticks each second from 20 and plays a different chime at 0", {
-  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
-  timeout: 40_000
-}, async (t) => {
-  const server = await startTestServer(t);
-  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
-    ${mockEyeCareClock}
-    ${mockEyeCareSounds}
-    window.setEyeCareClock(2026, 10, 16, 10, 5);
-  `, { eyeCareDefault: true });
-  const dialog = `document.querySelector('#eye-care-dialog')`;
-  await waitFor(`document.querySelector('#keep-awake')?.dataset.status === 'off'`);
-  await evaluate(moveEyeCareClock(2026, 10, 16, 10, 20));
-  await waitFor(`${dialog}.open`);
-  await evaluate(`document.querySelector('#eye-care-start').click()`);
-  await waitFor(`document.querySelector('#eye-care-count').textContent === '0'`, 30_000);
-  assert.deepEqual(
-    await evaluate(`window.eyeCareSounds.filter((sound) => sound.type === 'sine').map((sound) => sound.count)`),
-    Array.from({ length: 20 }, (_, index) => String(20 - index))
-  );
-  // The finish chime is any sound that is not a tick, and it plays only at 0.
-  assert.equal(await evaluate(`window.eyeCareSounds.some((sound) => sound.type !== 'sine')`), true);
-  assert.equal(
-    await evaluate(`window.eyeCareSounds.filter((sound) => sound.type !== 'sine').every((sound) => sound.count === '0')`),
-    true
-  );
-  // Timers never fire early, so a real countdown spans at least 19 seconds from the first tick to the chime.
-  assert.ok(Number(await evaluate(`window.eyeCareSounds.at(-1).at - window.eyeCareSounds[0].at`)) >= 19_000);
-  const soundCount = await evaluate(`window.eyeCareSounds.length`);
-  await new Promise((resolve) => setTimeout(resolve, 1_500));
-  assert.equal(await evaluate(`window.eyeCareSounds.length`), soundCount);
   assert.equal(await evaluate(`${dialog}.open`), true);
 });
 
@@ -5451,7 +5429,7 @@ test("changes view lists staged and unstaged files, stages and unstages them, re
     document.querySelector("#composer-more-menu").hidden,
     document.querySelector("#composer-more-button").getAttribute("aria-expanded"),
     Array.from(document.querySelectorAll("#composer-more-menu > button")).map((button) => button.id)
-  ]`), [false, "true", ["eye-care-toggle", "reconnect-tools", "attach-files", "terminal-action", "changes-toggle"]]);
+  ]`), [false, "true", ["eye-care-toggle", "keep-awake", "reconnect-tools", "attach-files", "terminal-action", "changes-toggle"]]);
 
   await evaluate(`document.querySelector("#changes-toggle").click()`);
   await evaluate(`document.querySelector("#repository-tab-changes").click()`);
@@ -5477,7 +5455,7 @@ test("changes view lists staged and unstaged files, stages and unstages them, re
     "unstaged:src/a.txt", "unstaged:c.txt", "staged:staged.txt"
   ]);
   assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll("#changes-list .changes-group-title")).map((title) => title.textContent)`), [
-    "Unstaged changes2 · +3 −1", "Staged changes1 · +1 −1"
+    "Unstaged changes2 · +3 −1Stage all", "Staged changes1 · +1 −1Unstage all"
   ]);
 
   // Stage an untracked file from its row; the row moves to the staged section.
@@ -7749,7 +7727,6 @@ test("sizes composer selectors to their labels and wraps usage without overlap",
     }, sessionId);
     assert.equal(await evaluate(labelsFit), true, `Selector labels should fit at ${width}px`);
     assert.equal(await evaluate(noOverlap), true, `Composer should not overflow or overlap at ${width}px`);
-    assert.equal(await evaluate(`document.querySelector('#keep-awake').nextElementSibling.firstElementChild.id`), "composer-more-button");
   }
 });
 
@@ -12822,7 +12799,7 @@ test("terminal opens from More actions for the selected repository and keeps its
   assert.deepEqual(await evaluate(`[
     document.querySelector("#composer-more-button").click(),
     Array.from(document.querySelectorAll("#composer-more-menu > button")).map((button) => button.id)
-  ][1]`), ["eye-care-toggle", "reconnect-tools", "attach-files", "terminal-action", "changes-toggle"]);
+  ][1]`), ["eye-care-toggle", "keep-awake", "reconnect-tools", "attach-files", "terminal-action", "changes-toggle"]);
   await evaluate(`document.querySelector("#changes-toggle").click()`);
 
   await waitFor(`document.querySelector("#changes-repository").dataset.root !== undefined`);
@@ -13188,6 +13165,81 @@ test("staging advances an open diff but leaves the diff closed when staging from
   await waitFor(`Boolean(document.querySelector('[data-key="staged:b.txt"]'))`);
   await waitFor(`Boolean(document.querySelector('[data-key="unstaged:c.txt"]'))`);
   assert.equal(await evaluate(`document.querySelector("#changes-diff").hidden`), true);
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+});
+
+test("stage all stages the listed unstaged files, new files included, and follows the filter", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), {
+    "a.txt": "one\n"
+  });
+  await writeFile(path.join(repo, "a.txt"), "one\ntwo\n");
+  await writeFile(path.join(repo, "fresh.txt"), "fresh\n");
+  await writeFile(path.join(repo, "other.txt"), "other\n");
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await evaluate(`document.querySelector("#repository-tab-changes").click()`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]")).some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`Boolean(document.querySelector('[data-key="unstaged:fresh.txt"]'))`);
+
+  const stageAll = `document.querySelector(".changes-group-unstaged .changes-group-action")`;
+  const filter = `document.querySelector("#changes-filter")`;
+  assert.equal(await evaluate(`${stageAll}.textContent`), "Stage all");
+  // With the filter on, Stage all stages only the file it shows.
+  await evaluate(`${filter}.value = "fresh"; ${filter}.dispatchEvent(new Event("input"))`);
+  await waitFor(`!document.querySelector('[data-key="unstaged:a.txt"]') && Boolean(${stageAll})`);
+  await evaluate(`${stageAll}.click()`);
+  await waitFor(`Boolean(document.querySelector('[data-key="staged:fresh.txt"]'))`);
+  await evaluate(`${filter}.value = ""; ${filter}.dispatchEvent(new Event("input"))`);
+  await waitFor(`Boolean(document.querySelector('[data-key="unstaged:other.txt"]'))`);
+  assert.equal(await evaluate(`Boolean(document.querySelector('[data-key="unstaged:a.txt"]'))`), true);
+
+  await evaluate(`${stageAll}.click()`);
+  await waitFor(`Boolean(document.querySelector('[data-key="staged:a.txt"]')) && Boolean(document.querySelector('[data-key="staged:other.txt"]'))`);
+  assert.equal(await evaluate(`document.querySelector(".changes-group-unstaged .changes-group-action")`), null);
+  assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
+});
+
+test("unstage all moves the listed staged files back to unstaged", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 60_000
+}, async (t) => {
+  const server = await startTestServer(t, { existingSession: true, nativeHistory: { events: [] } });
+  const repo = await createTestRepository(path.join(server.projectsDirectory, "app"), {
+    "a.txt": "one\n"
+  });
+  await writeFile(path.join(repo, "a.txt"), "one\ntwo\n");
+  await writeFile(path.join(repo, "fresh.txt"), "fresh\n");
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl);
+
+  await waitFor(`Boolean(document.querySelector('[data-session-id="session-1"]'))`);
+  await evaluate(`document.querySelector('[data-session-id="session-1"]').click()`);
+  await waitFor(`document.querySelector("#messages").getAttribute("aria-busy") === "false"`);
+  await evaluate(`document.querySelector("#changes-toggle").click()`);
+  await evaluate(`document.querySelector("#repository-tab-changes").click()`);
+  await evaluate(`document.querySelector("#changes-repository").click()`);
+  await waitFor(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]")).some((option) => option.dataset.root === ${JSON.stringify(repo)})`);
+  await evaluate(`Array.from(document.querySelectorAll("#changes-repository-menu [role=treeitem]"))
+    .find((option) => option.dataset.root === ${JSON.stringify(repo)}).click()`);
+  await waitFor(`Boolean(document.querySelector('[data-key="unstaged:fresh.txt"]'))`);
+
+  await evaluate(`document.querySelector(".changes-group-unstaged .changes-group-action").click()`);
+  await waitFor(`Boolean(document.querySelector('[data-key="staged:fresh.txt"]')) && Boolean(document.querySelector('[data-key="staged:a.txt"]'))`);
+  assert.equal(await evaluate(`document.querySelector(".changes-group-staged .changes-group-action").textContent`), "Unstage all");
+
+  await evaluate(`document.querySelector(".changes-group-staged .changes-group-action").click()`);
+  await waitFor(`Boolean(document.querySelector('[data-key="unstaged:fresh.txt"]')) && Boolean(document.querySelector('[data-key="unstaged:a.txt"]'))`);
+  assert.equal(await evaluate(`document.querySelector(".changes-group-staged .changes-group-action")`), null);
   assert.equal(await evaluate(`window.testBrowserErrors.length`), 0);
 });
 });

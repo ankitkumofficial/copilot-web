@@ -914,6 +914,54 @@ export async function setChangeStaged(
   await runIndexCommand(repo, args);
 }
 
+// Keeps each git command's arguments well under the operating system's argument-size limit.
+const maximumPathArgumentBytes = 64 * 1024;
+
+function pathChunks(paths: readonly string[]): string[][] {
+  const chunks: string[][] = [];
+  let chunk: string[] = [];
+  let chunkBytes = 0;
+  for (const filePath of paths) {
+    const size = Buffer.byteLength(filePath) + 1;
+    if (chunk.length > 0 && chunkBytes + size > maximumPathArgumentBytes) {
+      chunks.push(chunk);
+      chunk = [];
+      chunkBytes = 0;
+    }
+    chunk.push(filePath);
+    chunkBytes += size;
+  }
+  if (chunk.length > 0) {
+    chunks.push(chunk);
+  }
+  return chunks;
+}
+
+// Stages the listed files that are still unstaged. Conflicted files are left out: staging one marks its conflict
+// resolved, which stays a deliberate per-file action.
+export async function stageChangedFiles(repo: string, relativePaths: readonly string[]): Promise<void> {
+  const parsed = await readParsedStatus(repo);
+  const requested = new Set(relativePaths);
+  const paths = parsed.files
+    .filter((file) => file.section === "unstaged" && file.status !== "conflicted" && requested.has(file.path))
+    .map((file) => file.path);
+  for (const chunk of pathChunks(paths)) {
+    await runIndexCommand(repo, ["add", "--all", "--", ...chunk]);
+  }
+}
+
+// Unstages the listed files that are staged. A renamed file also restores its source path, as the per-file unstage does.
+export async function unstageChangedFiles(repo: string, relativePaths: readonly string[]): Promise<void> {
+  const parsed = await readParsedStatus(repo);
+  const requested = new Set(relativePaths);
+  const paths = parsed.files
+    .filter((file) => file.section === "staged" && requested.has(file.path))
+    .flatMap((file) => (file.oldPath ? [file.path, file.oldPath] : [file.path]));
+  for (const chunk of pathChunks(paths)) {
+    await runIndexCommand(repo, ["reset", "--quiet", "--", ...chunk]);
+  }
+}
+
 // A Git process holding the index makes the command fail with index.lock; report that as busy.
 async function runIndexCommand(repo: string, args: readonly string[]): Promise<void> {
   try {

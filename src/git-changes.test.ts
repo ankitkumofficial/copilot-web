@@ -21,7 +21,9 @@ import {
   resolveToplevel,
   runGit,
   setChangeStaged,
+  stageChangedFiles,
   truncateDiff,
+  unstageChangedFiles,
   validateRelativePath,
   validateRelativePathSyntax
 } from "./git-changes.js";
@@ -625,6 +627,66 @@ test("rejects stale stage requests and reports a busy index without changing any
   await assert.rejects(setChangeStaged(repo, "modified.txt", "stage"), (error: unknown) => (
     error instanceof GitChangesError && error.status === 409 && error.code === "file_not_changed"
   ));
+});
+
+test("stages listed unstaged files, new files included, and leaves other files alone", { skip: skipWithoutGit }, async (t) => {
+  const repo = await temporaryRepository(t);
+  await writeFile(path.join(repo, "staged.txt"), "after\n");
+  git(repo, "add", "staged.txt");
+  await writeFile(path.join(repo, "modified.txt"), "one\nTWO\nthree\n");
+  await rm(path.join(repo, "deleted.txt"));
+  await writeFile(path.join(repo, "fresh.txt"), "fresh\n");
+  await writeFile(path.join(repo, "other.txt"), "other\n");
+
+  await stageChangedFiles(repo, ["staged.txt", "modified.txt", "deleted.txt", "fresh.txt", "missing.txt"]);
+  assert.deepEqual(entryKeys((await readStatus(repo)).files), [
+    "staged:deleted.txt", "staged:fresh.txt", "staged:modified.txt", "staged:staged.txt", "unstaged:other.txt"
+  ]);
+});
+
+test("staging all leaves conflicted files for an explicit per-file resolve", { skip: skipWithoutGit }, async (t) => {
+  const repo = await temporaryRepository(t);
+  git(repo, "checkout", "-q", "-b", "other");
+  await writeFile(path.join(repo, "modified.txt"), "other\n");
+  git(repo, "commit", "-qam", "other");
+  git(repo, "checkout", "-q", "main");
+  await writeFile(path.join(repo, "modified.txt"), "main\n");
+  git(repo, "commit", "-qam", "main");
+  assert.throws(() => git(repo, "merge", "--no-edit", "other"));
+
+  await stageChangedFiles(repo, ["modified.txt"]);
+  assert.deepEqual(entryKeys((await readStatus(repo)).files), ["unstaged:modified.txt"]);
+  assert.match(await readFile(path.join(repo, "modified.txt"), "utf8"), /^<<<<<<< /m);
+});
+
+test("staging all handles lists too long for a single git command", { skip: skipWithoutGit }, async (t) => {
+  const repo = await temporaryRepository(t);
+  const names = Array.from({ length: 300 }, (_, index) => `${"n".repeat(240)}-${index}.txt`);
+  await Promise.all(names.map((name) => writeFile(path.join(repo, name), "new\n")));
+
+  await stageChangedFiles(repo, names);
+  const files = (await readStatus(repo)).files;
+  assert.equal(files.length, names.length);
+  assert.ok(files.every((file) => file.section === "staged"));
+});
+
+test("unstages listed staged files, renamed sources included, and leaves other staged files alone", { skip: skipWithoutGit }, async (t) => {
+  const repo = await temporaryRepository(t);
+  await writeFile(path.join(repo, "modified.txt"), "one\nTWO\nthree\n");
+  await rm(path.join(repo, "deleted.txt"));
+  git(repo, "mv", "renamed-old.txt", "renamed-new.txt");
+  await writeFile(path.join(repo, "fresh.txt"), "fresh\n");
+  await writeFile(path.join(repo, "other.txt"), "other\n");
+  git(repo, "add", "-A");
+  assert.deepEqual(entryKeys((await readStatus(repo)).files), [
+    "staged:deleted.txt", "staged:fresh.txt", "staged:modified.txt", "staged:other.txt", "staged:renamed-new.txt"
+  ]);
+
+  await unstageChangedFiles(repo, ["modified.txt", "deleted.txt", "renamed-new.txt", "fresh.txt"]);
+  assert.deepEqual(entryKeys((await readStatus(repo)).files), [
+    "staged:other.txt", "unstaged:deleted.txt", "unstaged:fresh.txt", "unstaged:modified.txt",
+    "unstaged:renamed-new.txt", "unstaged:renamed-old.txt"
+  ]);
 });
 
 test("resets unstaged changes per file, keeps staged changes, and deletes new files", { skip: skipWithoutGit }, async (t) => {

@@ -980,6 +980,12 @@ function renderScreenWakeLock() {
     : screenWakeLock.busy ? "Keep awake: Updating..."
     : active ? "Keep awake: On"
     : screenWakeLock.enabled ? "Keep awake: On (paused)" : "Keep awake: Off";
+  const hint = !supported ? "Prevent display from sleeping (needs a supported browser and HTTPS or localhost)"
+    : screenWakeLock.error ? `Prevent display from sleeping. ${screenWakeLock.error}`
+    : screenWakeLock.busy ? "Prevent display from sleeping (updating...)"
+    : active ? "Keeping the display awake while this tab is visible"
+    : screenWakeLock.enabled ? "Paused: the display can sleep until this tab is visible again"
+    : "Prevent display from sleeping while this tab is visible";
   const message = !supported ? "Screen Wake Lock requires a supported browser and HTTPS or localhost."
     : screenWakeLock.error ?? (screenWakeLock.busy ? "Updating screen wake lock..."
       : active ? "Keep awake is on while this tab is visible."
@@ -990,7 +996,7 @@ function renderScreenWakeLock() {
   elements.keepAwake.dataset.status = status;
   elements.keepAwake.setAttribute("aria-pressed", String(screenWakeLock.enabled));
   elements.keepAwake.setAttribute("aria-label", label);
-  elements.keepAwake.title = label;
+  elements.keepAwake.title = hint;
   elements.keepAwakeStatus.textContent = message;
   elements.keepAwakeStatus.dataset.error = String(screenWakeLock.error !== null);
   elements.keepAwakeStatus.classList.toggle(

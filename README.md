@@ -145,14 +145,14 @@ remote service.
   event is missing, without replacing newer descriptive live metadata.
   If cached activity exceeds its display budget, large tool output is omitted
   before reasoning and tool progress, and a history warning explains any loss.
-- Toggle **Keep awake** using the coffee-cup button immediately before the
-  **More actions** (⋯) menu in the message bar. It uses the browser's Screen Wake Lock
-  API to prevent the display from sleeping and normal display-sleep-triggered
-  locking while this tab is visible, without starting a native process or video.
-  The button is highlighted while the wake lock is active. It pauses when the
-  tab is hidden or the browser releases the lock, and automatically requests a
-  new lock when you return to the tab. Request failures are shown below the
-  message bar; toggle Off and On to retry a browser-released lock.
+- Toggle **Keep awake** in the **More actions** (⋯) menu, directly below **Eye
+  care**. Its row shows a check or cross on the coffee-cup icon, and toggling it
+  keeps the menu open. It uses the browser's Screen Wake Lock API to prevent the
+  display from sleeping and normal display-sleep-triggered locking while this tab
+  is visible, without starting a native process or video. It pauses when the tab
+  is hidden or the browser releases the lock, and automatically requests a new
+  lock when you return to the tab. Request failures are shown below the message
+  bar; toggle Off and On to retry a browser-released lock.
   Keep awake defaults to Off until enabled. Your On/Off choice is stored in the
   browser and restored after a page reload, requesting a new wake lock once the
   tab is visible. It remains independent of the selected conversation and
@@ -162,8 +162,8 @@ remote service.
   It requires a supported browser and HTTPS or localhost; unsupported browsers
   show a disabled button. Manual and company-enforced locks are unaffected.
 - **Eye care** in the **More actions** (⋯) menu is on by default. Its row shows a
-  check or cross on the eye icon with **On** or **Off** beside it, and toggling it
-  keeps the menu open. While it is on, a reminder appears every 20 minutes from
+  check or cross on the eye icon, and toggling it keeps the menu open. While it
+  is on, a reminder appears every 20 minutes from
   9:20 through 16:40 (9:20, 9:40, 10:00, and so on to 16:40), Monday to Friday,
   in local time. It suggests the
   [20-20-20 rule](https://www.aoa.org/healthy-eyes/eye-and-vision-conditions/computer-vision-syndrome)
@@ -190,7 +190,7 @@ remote service.
 - Cancel an in-progress prompt.
 - Switch the active model when Copilot exposes model choices.
 - Select the available reasoning effort levels.
-- Choose between the standard and long context tiers.
+- Choose between the default and long tiers.
 - Attach files of any type to prompts by pasting, dragging and dropping, or
   using the attachment picker.
 - Preview internal files linked from messages with syntax coloring based on
@@ -235,7 +235,11 @@ remote service.
   listed in separate sections; a file with both kinds of change appears in each.
   Stage or unstage a file with its row button, the diff's **Stage** or
   **Unstage** button, or `S` on the highlighted row. After staging, the diff
-  moves to the first unstaged file, or closes when none is left. An unstaged
+  moves to the first unstaged file, or closes when none is left. **Stage all** in
+  the Unstaged changes heading stages every unstaged file listed under it, new files
+  included. Conflicted files are left out, so resolve those per file. With a filter
+  on, only the matching files are staged. **Unstage all** in the Staged changes
+  heading moves the staged files listed there back to unstaged. An unstaged
   file's row and its diff (beside **Stage**) also have a **Reset** button: after
   confirmation it discards that file's unstaged changes, or deletes the file if Git
   doesn't track it yet. The panel shows status,
