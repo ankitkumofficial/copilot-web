@@ -3781,6 +3781,10 @@ button:disabled {
   color: var(--accent-strong);
 }
 
+.changes-action-reset:hover:not(:disabled) {
+  color: var(--danger);
+}
+
 .changes-split-resizer {
   flex: 0 0 auto;
   height: 7px;
