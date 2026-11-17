@@ -1163,6 +1163,11 @@ button:disabled {
   color: #1d2230;
 }
 
+::highlight(copilot-web-diff-selection) {
+  background: #f5d77e;
+  color: #1d2230;
+}
+
 .message-body p,
 .message-body ul,
 .message-body ol,
@@ -4004,6 +4009,11 @@ button:disabled {
   min-height: 0;
   overflow: auto;
   padding: 0 6px 12px;
+}
+
+.changes-diff-body.selection-flash ::selection {
+  background: #f5d77e;
+  color: #1d2230;
 }
 
 .changes-diff-state {

@@ -301,6 +301,9 @@ function createConversationState(sessionId = null) {
 }
 
 function copySelectionReference(selection) {
+  if (selection.kind === "diff") {
+    return { ...selection, segments: selection.segments.map((segment) => ({ ...segment })) };
+  }
   return {
     ...selection,
     startPath: [...selection.startPath],
@@ -309,6 +312,9 @@ function copySelectionReference(selection) {
 }
 
 function isStoredSelectionReference(value) {
+  if (value?.kind === "diff") {
+    return isStoredDiffSelectionReference(value);
+  }
   return Boolean(
     value &&
     typeof value === "object" &&
@@ -333,6 +339,29 @@ function isStoredSelectionReference(value) {
       value.sourceOrdinal === undefined ||
       (Number.isInteger(value.sourceOrdinal) && value.sourceOrdinal >= 0)
     )
+  );
+}
+
+function isStoredDiffSelectionReference(value) {
+  return Boolean(
+    typeof value.id === "string" &&
+    Number.isInteger(value.number) &&
+    value.number > 0 &&
+    typeof value.text === "string" &&
+    typeof value.repository === "string" &&
+    typeof value.path === "string" &&
+    (value.section === "staged" || value.section === "unstaged") &&
+    (value.tab === "current" || value.tab === "all") &&
+    typeof value.full === "boolean" &&
+    Array.isArray(value.segments) &&
+    value.segments.length > 0 &&
+    value.segments.every((segment) => (
+      Number.isInteger(segment?.hunkIndex) && segment.hunkIndex >= 0 &&
+      Number.isInteger(segment.lineIndex) && segment.lineIndex >= 0 &&
+      Number.isInteger(segment.start) && segment.start >= 0 &&
+      Number.isInteger(segment.end) && segment.end >= segment.start &&
+      typeof segment.text === "string"
+    ))
   );
 }
 
@@ -5088,25 +5117,27 @@ function updateAskSelection() {
   elements.selectionActions.style.visibility = "";
 }
 
-function attachSelectedText() {
-  if (!pendingMessageSelection) {
-    return;
-  }
-
+function addComposerSelection(reference) {
   const conversation = currentComposerConversation();
   const number = conversation.nextSelectionNumber;
   conversation.nextSelectionNumber += 1;
   conversation.selections.push({
-    ...pendingMessageSelection,
+    ...copySelectionReference(reference),
     id: `selection-${number}`,
-    number,
-    startPath: [...pendingMessageSelection.startPath],
-    endPath: [...pendingMessageSelection.endPath]
+    number
   });
-  hideAskSelection();
-  window.getSelection()?.removeAllRanges();
   renderSelectionList();
   elements.input.focus();
+}
+
+function attachSelectedText() {
+  if (!pendingMessageSelection) {
+    return;
+  }
+  const reference = pendingMessageSelection;
+  hideAskSelection();
+  window.getSelection()?.removeAllRanges();
+  addComposerSelection(reference);
 }
 
 function selectionNodeAtPath(root, path) {
@@ -5520,6 +5551,13 @@ function restoreMessageSelectionHighlight() {
 }
 
 async function jumpToSelection(reference) {
+  if (reference.kind === "diff") {
+    const notice = await changesPanel.revealSelection(reference);
+    if (notice) {
+      showSelectionNotice(notice);
+    }
+    return;
+  }
   const conversation = currentComposerConversation();
   if (reference.sessionId && reference.sessionId !== conversation.sessionId) {
     if (!state.sessions.some((session) => session.sessionId === reference.sessionId)) {
@@ -10170,6 +10208,7 @@ changesPanel = initChangesPanel({
   terminal: terminalPanel,
   filesPanel,
   insertIntoComposer,
+  addSelection: addComposerSelection,
   changeWorkingDirectory,
   onDecisionChange: setMoreActionsDecisionAttention,
   attachFiles: async (files) => {

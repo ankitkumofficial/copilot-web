@@ -95,12 +95,13 @@ remote service.
   Prompts are sent as Markdown and retain their formatting in conversation
   history, including after a page reload. Literal Markdown characters in rich
   text are escaped on send so they do not become unintended formatting.
-- Select text in a user or Copilot message and choose **Ask Copilot** to attach
-  it as a numbered selection card; add multiple selections to one follow-up.
-  Composer cards and sent-message selection chips return to their source and
-  briefly highlight the selected text; sent-message formatting is restored
-  after a browser refresh. This formatting is stored in browser storage, capped
-  to recent entries, and pruned when a conversation no longer exists.
+- Select text in a user or Copilot message, or in a file's diff, and choose
+  **Ask Copilot** to attach it as a numbered selection card; add multiple
+  selections to one follow-up. Composer cards and sent-message selection chips
+  return to their source (the message, or the file's diff) and briefly highlight
+  the selected text; sent-message formatting is restored after a browser
+  refresh. This formatting is stored in browser storage, capped to recent
+  entries, and pruned when a conversation no longer exists.
 - Next to **Ask Copilot**, choose the **EN** or **DE** speaker to read the
   selected text aloud in English or German. Click the same speaker again to
   stop; choosing the other one switches language. Playback uses the browser's
@@ -237,7 +238,9 @@ remote service.
   doesn't track it yet. The panel shows status,
   line counts, renames, and renders unified diffs with line numbers. It offers
   **Ask Copilot** (inserts a reference into the message without sending),
-  **Attach diff**, copy actions, a wrap toggle, and a full-file view. The
+  **Attach diff**, copy actions, a wrap toggle, and a full-file view. Selected
+  diff text can be asked about too; its selection card reopens the diff and
+  highlights those lines. The
   repository is the one containing the conversation's newest successful `edit` or
   `create`. That is found by replaying the conversation's history once, then followed
   live as Copilot edits files, whether the panel is open or closed. Without such an edit, it is

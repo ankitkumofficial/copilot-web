@@ -221,12 +221,14 @@ export function renderDiff(container, parsed, options = {}) {
       headerRow.append(headerCell);
       body.append(headerRow);
       rendered += 1;
-      for (const line of hunk.lines) {
+      for (const [lineIndex, line] of hunk.lines.entries()) {
         if (rendered >= maxLines) {
           remaining += 1;
           continue;
         }
-        body.append(lineRow(line));
+        const row = lineRow(line);
+        row.dataset.lineIndex = String(lineIndex);
+        body.append(row);
         rendered += 1;
       }
       table.append(body);

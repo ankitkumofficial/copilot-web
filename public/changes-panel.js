@@ -14,6 +14,8 @@ const toolRefreshDelayMs = 750;
 const focusRefreshAgeMs = 2_000;
 const projectRepositoriesMaxAgeMs = 30_000;
 const filterThreshold = 20;
+const diffHighlightDurationMs = 2_000;
+const diffSelectionHighlightName = "copilot-web-diff-selection";
 
 const statusLabels = {
   added: ["A", "Added"],
@@ -133,6 +135,7 @@ function editorUrl(template, absolutePath, line) {
 export function initChangesPanel({
   api,
   insertIntoComposer,
+  addSelection = () => {},
   attachFiles,
   changeWorkingDirectory,
   terminal = null,
@@ -180,6 +183,8 @@ export function initChangesPanel({
     diffTitle: query("#changes-diff-title"),
     diffMeta: query("#changes-diff-meta"),
     diffBody: query("#changes-diff-body"),
+    selectionActions: query("#changes-selection-actions"),
+    askSelection: query("#changes-ask-selection"),
     ask: query("#changes-ask"),
     attach: query("#changes-attach"),
     copy: query("#changes-copy"),
@@ -244,6 +249,8 @@ export function initChangesPanel({
     diffLoading: false,
     diffError: null,
     diffNotChanged: false,
+    // The selected lines of the diff being shown, painted until the highlight timer clears them.
+    diffHighlight: null,
     full: false,
     renderLimit: initialRenderLines,
     currentHunk: -1,
@@ -270,6 +277,10 @@ export function initChangesPanel({
   const unsavedRecordChanges = new Map();
   // Expanded view lists both sections, even when empty, with a draggable divider between Unstaged and Staged.
   let listExpanded = false;
+  // The diff text selection offered for Ask Copilot, whether the pointer is selecting in the diff, and the timer that clears a revealed passage.
+  let pendingDiffSelection = null;
+  let diffSelectionPointer = false;
+  let diffHighlightTimer = null;
   const groupDivider = element("div", "changes-group-divider");
   groupDivider.setAttribute("aria-hidden", "true");
   groupDivider.title = "Drag to resize the Unstaged and Staged sections";
@@ -969,6 +980,8 @@ export function initChangesPanel({
 
   function resetDiff() {
     s.diffToken += 1;
+    clearDiffSelectionHighlight();
+    hideDiffSelectionActions();
     s.openFile = null;
     s.diff = null;
     s.parsedDiff = null;
@@ -980,12 +993,13 @@ export function initChangesPanel({
     s.currentHunk = -1;
   }
 
-  function openItem(item) {
+  function openItem(item, { full = false } = {}) {
     if (!item?.selectable) {
       return;
     }
     s.activeKey = item.key;
     resetDiff();
+    s.full = full;
     s.openFile = {
       key: item.key,
       path: item.path,
@@ -995,7 +1009,7 @@ export function initChangesPanel({
     };
     el.panel.dataset.view = "diff";
     render();
-    void loadDiff();
+    return loadDiff();
   }
 
   function closeDiff() {
@@ -1682,6 +1696,7 @@ export function initChangesPanel({
   }
 
   function renderDiffArea() {
+    hideDiffSelectionActions();
     const file = s.openFile;
     el.diff.hidden = !file;
     syncSplitResizer();
@@ -1791,6 +1806,7 @@ export function initChangesPanel({
         renderDiffArea();
       }
     });
+    paintDiffSelectionHighlight();
   }
 
   function renderEditorLink() {
@@ -1805,6 +1821,300 @@ export function initChangesPanel({
     const firstChange = firstHunk?.lines.find((line) => line.type === "add")?.newLine ?? firstHunk?.newStart ?? 1;
     el.openEditor.href = editorUrl(template, joinPath(s.repository, file.path), firstChange);
     el.openEditor.hidden = false;
+  }
+
+  // ---- diff text selection ---------------------------------------------
+
+  // Characters of a code cell before a boundary point. Points before the cell count as 0 and points after it count as its full length.
+  function diffCodeOffset(code, container, offset) {
+    const cell = document.createRange();
+    cell.selectNodeContents(code);
+    const position = cell.comparePoint(container, offset);
+    if (position < 0) {
+      return 0;
+    }
+    if (position > 0) {
+      return code.textContent.length;
+    }
+    const before = document.createRange();
+    before.setStart(code, 0);
+    before.setEnd(container, offset);
+    return before.toString().length;
+  }
+
+  // One segment per selected line with the code it covers. Meta lines such as "No newline at end of file" are not file text.
+  function diffSegmentsFromRange(range) {
+    const hunks = s.parsedDiff.files.flatMap((file) => file.hunks);
+    const segments = [];
+    for (const row of el.diffBody.querySelectorAll("tr.diff-line")) {
+      if (!range.intersectsNode(row)) {
+        continue;
+      }
+      const hunkIndex = Number(row.parentElement.dataset.hunkIndex);
+      const lineIndex = Number(row.dataset.lineIndex);
+      const line = hunks[hunkIndex]?.lines[lineIndex];
+      if (!line || line.type === "meta") {
+        continue;
+      }
+      // An empty line renders a zero-width space, so offsets stay within the line's own text.
+      const code = row.querySelector(".diff-code");
+      const start = Math.min(diffCodeOffset(code, range.startContainer, range.startOffset), line.text.length);
+      const end = Math.max(start, Math.min(diffCodeOffset(code, range.endContainer, range.endOffset), line.text.length));
+      segments.push({ hunkIndex, lineIndex, start, end, text: line.text.slice(start, end) });
+    }
+    // A selection that only touches the edge of a line covers none of its text.
+    while (segments[0]?.text === "") {
+      segments.shift();
+    }
+    while (segments.at(-1)?.text === "") {
+      segments.pop();
+    }
+    const text = segments.map((segment) => segment.text).join("\n");
+    return text.trim() ? { text, segments } : null;
+  }
+
+  // Finds a selection's lines in the diff as it is now. The recorded position wins when its text still matches; otherwise the first identical passage is used.
+  function locateDiffSegments(parsed, segments) {
+    if (segments.length === 0) {
+      return null;
+    }
+    const lines = parsed.files
+      .flatMap((file) => file.hunks)
+      .flatMap((hunk, hunkIndex) => hunk.lines.map((line, lineIndex) => ({ hunkIndex, lineIndex, line })))
+      .filter(({ line }) => line.type !== "meta");
+    const matchesAt = (index) => segments.every((segment, offset) => (
+      lines[index + offset]?.line.text.slice(segment.start, segment.end) === segment.text
+    ));
+    const [first] = segments;
+    let match = -1;
+    for (let index = 0; index < lines.length; index += 1) {
+      if (!matchesAt(index)) {
+        continue;
+      }
+      if (lines[index].hunkIndex === first.hunkIndex && lines[index].lineIndex === first.lineIndex) {
+        match = index;
+        break;
+      }
+      match = match < 0 ? index : match;
+    }
+    if (match < 0) {
+      return null;
+    }
+    return segments.map((segment, offset) => ({
+      hunkIndex: lines[match + offset].hunkIndex,
+      lineIndex: lines[match + offset].lineIndex,
+      start: segment.start,
+      end: segment.end,
+      text: segment.text
+    }));
+  }
+
+  function diffRowFor(segment) {
+    return el.diffBody.querySelector(
+      `tbody[data-hunk-index="${segment.hunkIndex}"] > tr.diff-line[data-line-index="${segment.lineIndex}"]`
+    );
+  }
+
+  // Paints the highlighted passage. Returns false while one of its lines is not rendered, which the render limit can cause.
+  function paintDiffSelectionHighlight() {
+    const highlight = s.diffHighlight;
+    if (!highlight) {
+      return true;
+    }
+    if (highlight.diff !== s.diff) {
+      // A reloaded diff can move its lines, so the recorded positions no longer mark the passage.
+      clearDiffSelectionHighlight();
+      return true;
+    }
+    const rows = new Map(Array.from(el.diffBody.querySelectorAll("tr.diff-line"), (row) => [
+      `${row.parentElement.dataset.hunkIndex}:${row.dataset.lineIndex}`,
+      row
+    ]));
+    const ranges = [];
+    for (const segment of highlight.segments) {
+      const text = rows.get(`${segment.hunkIndex}:${segment.lineIndex}`)?.querySelector(".diff-code")?.firstChild;
+      if (!text) {
+        return false;
+      }
+      if (segment.end > segment.start) {
+        const range = document.createRange();
+        range.setStart(text, segment.start);
+        range.setEnd(text, segment.end);
+        ranges.push(range);
+      }
+    }
+    if (typeof window.Highlight === "function" && window.CSS?.highlights) {
+      window.CSS.highlights.set(diffSelectionHighlightName, new window.Highlight(...ranges));
+      return true;
+    }
+    // Without the CSS Highlight API, the browser's own selection marks the passage, as it does in the conversation.
+    const selection = window.getSelection();
+    if (selection && ranges.length > 0) {
+      const span = document.createRange();
+      span.setStart(ranges[0].startContainer, ranges[0].startOffset);
+      span.setEnd(ranges.at(-1).endContainer, ranges.at(-1).endOffset);
+      selection.removeAllRanges();
+      selection.addRange(span);
+      highlight.range = span;
+      el.diffBody.classList.add("selection-flash");
+    }
+    return true;
+  }
+
+  function clearDiffSelectionHighlight() {
+    window.clearTimeout(diffHighlightTimer);
+    diffHighlightTimer = null;
+    const highlight = s.diffHighlight;
+    s.diffHighlight = null;
+    window.CSS?.highlights?.delete(diffSelectionHighlightName);
+    el.diffBody.classList.remove("selection-flash");
+    if (highlight?.range) {
+      window.getSelection()?.removeAllRanges();
+    }
+  }
+
+  function showDiffSelectionHighlight(segments) {
+    clearDiffSelectionHighlight();
+    s.diffHighlight = { segments, diff: s.diff };
+    if (!paintDiffSelectionHighlight()) {
+      s.renderLimit = Number.POSITIVE_INFINITY;
+      renderDiffArea();
+    }
+    const row = diffRowFor(segments[0]);
+    if (row) {
+      const body = el.diffBody.getBoundingClientRect();
+      const target = row.getBoundingClientRect();
+      el.diffBody.scrollTop += target.top - body.top - (el.diffBody.clientHeight - target.height) / 2;
+    }
+    diffHighlightTimer = window.setTimeout(clearDiffSelectionHighlight, diffHighlightDurationMs);
+  }
+
+  // Opens the diff a selection came from and highlights its lines. Returns a notice when they cannot be shown.
+  async function revealDiffSelection(reference) {
+    const otherRepository = "This selected text is from a repository that is not open in Changes.";
+    if (reference.repository !== s.repository) {
+      return otherRepository;
+    }
+    if (!s.open) {
+      toggle(true);
+    }
+    setTab(reference.tab);
+    try {
+      await refreshStatus();
+    } catch (error) {
+      return describeError(error).message;
+    }
+    if (reference.repository !== s.repository) {
+      return otherRepository;
+    }
+    const file = statusIsCurrent()
+      ? s.status.files.find((entry) => entry.path === reference.path && entry.section === reference.section)
+      : null;
+    if (!file) {
+      return "The selected text's file has no uncommitted changes now.";
+    }
+    const key = `${file.section}:${file.path}`;
+    await openItem({
+      key,
+      path: file.path,
+      oldPath: file.oldPath,
+      status: file.status,
+      section: file.section,
+      selectable: true
+    }, { full: reference.full });
+    if (s.openFile?.key !== key) {
+      return null;
+    }
+    const segments = s.parsedDiff ? locateDiffSegments(s.parsedDiff, reference.segments) : null;
+    if (!segments) {
+      return s.diffError?.message ?? "The selected text is no longer in this diff.";
+    }
+    showDiffSelectionHighlight(segments);
+    return null;
+  }
+
+  // The diff code under the page selection, with its range, or null when the selection is not diff code.
+  function diffSelectionOnPage() {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !s.openFile || !s.repository || !s.parsedDiff) {
+      return null;
+    }
+    const range = selection.getRangeAt(0);
+    if (!el.diffBody.contains(range.commonAncestorContainer)) {
+      return null;
+    }
+    const picked = diffSegmentsFromRange(range);
+    if (!picked) {
+      return null;
+    }
+    return {
+      range,
+      reference: {
+        kind: "diff",
+        text: picked.text,
+        repository: s.repository,
+        tab: s.tab,
+        path: s.openFile.path,
+        section: s.openFile.section,
+        full: s.full,
+        segments: picked.segments
+      }
+    };
+  }
+
+  function placeDiffSelectionActions(selectionBounds) {
+    const actions = el.selectionActions;
+    actions.hidden = false;
+    actions.style.visibility = "hidden";
+    const actionBounds = actions.getBoundingClientRect();
+    const edge = 8;
+    const gap = 9;
+    const maxLeft = Math.max(edge, window.innerWidth - actionBounds.width - edge);
+    const left = Math.min(
+      Math.max(selectionBounds.left + selectionBounds.width / 2 - actionBounds.width / 2, edge),
+      maxLeft
+    );
+    let top = selectionBounds.top - actionBounds.height - gap;
+    if (top < edge) {
+      top = selectionBounds.bottom + gap;
+    }
+    const maxTop = Math.max(edge, window.innerHeight - actionBounds.height - edge);
+    top = Math.min(Math.max(top, edge), maxTop);
+    actions.style.left = `${Math.round(left)}px`;
+    actions.style.top = `${Math.round(top)}px`;
+    actions.style.visibility = "";
+  }
+
+  function hideDiffSelectionActions() {
+    pendingDiffSelection = null;
+    el.selectionActions.hidden = true;
+    el.selectionActions.style.removeProperty("left");
+    el.selectionActions.style.removeProperty("top");
+    el.selectionActions.style.removeProperty("visibility");
+  }
+
+  function updateDiffSelectionActions() {
+    const selected = (s.diffHighlight || diffSelectionPointer) ? null : diffSelectionOnPage();
+    if (!selected) {
+      hideDiffSelectionActions();
+      return;
+    }
+    const bounds = selected.range.getBoundingClientRect();
+    const body = el.diffBody.getBoundingClientRect();
+    if (
+      (bounds.width === 0 && bounds.height === 0) ||
+      bounds.bottom < body.top ||
+      bounds.top > body.bottom
+    ) {
+      hideDiffSelectionActions();
+      return;
+    }
+    pendingDiffSelection = selected.reference;
+    placeDiffSelectionActions(bounds);
+  }
+
+  function scheduleDiffSelectionUpdate() {
+    window.setTimeout(updateDiffSelectionActions, 0);
   }
 
   function render() {
@@ -2251,6 +2561,43 @@ export function initChangesPanel({
   });
   el.diffBack.addEventListener("click", closeDiff);
   el.diffClose.addEventListener("click", closeDiff);
+  el.selectionActions.addEventListener("mousedown", (event) => {
+    // Keeps the diff selection while the Ask button is pressed.
+    event.preventDefault();
+  });
+  el.askSelection.addEventListener("click", () => {
+    const reference = pendingDiffSelection;
+    if (!reference) {
+      return;
+    }
+    hideDiffSelectionActions();
+    window.getSelection()?.removeAllRanges();
+    restoreWidth();
+    addSelection(reference);
+  });
+  el.diffBody.addEventListener("scroll", updateDiffSelectionActions, { passive: true });
+  window.addEventListener("resize", updateDiffSelectionActions);
+  document.addEventListener("pointerdown", (event) => {
+    if (el.selectionActions.contains(event.target)) {
+      return;
+    }
+    diffSelectionPointer = el.diffBody.contains(event.target);
+    hideDiffSelectionActions();
+    if (diffSelectionPointer) {
+      clearDiffSelectionHighlight();
+    }
+  });
+  document.addEventListener("pointerup", () => {
+    if (diffSelectionPointer) {
+      diffSelectionPointer = false;
+      scheduleDiffSelectionUpdate();
+    }
+  });
+  document.addEventListener("pointercancel", () => {
+    diffSelectionPointer = false;
+    hideDiffSelectionActions();
+  });
+  document.addEventListener("keyup", scheduleDiffSelectionUpdate);
   el.ask.addEventListener("click", () => askCopilot());
   el.attach.addEventListener("click", () => void attachDiff(s.diff?.diff ?? ""));
   el.copy.addEventListener("click", () => void copyText(s.diff?.diff ?? "", "Diff"));
@@ -2425,6 +2772,7 @@ export function initChangesPanel({
   render();
 
   return {
+    revealSelection: revealDiffSelection,
     get open() {
       return s.open;
     },
