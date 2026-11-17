@@ -2712,6 +2712,57 @@ button:disabled {
   color: var(--accent);
 }
 
+#eye-care-description {
+  margin-bottom: 12px;
+}
+
+.eye-care-counter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 18px;
+}
+
+.eye-care-sound {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--accent);
+}
+
+.eye-care-sound:hover {
+  background: var(--surface-hover);
+}
+
+.eye-care-sound[data-sound="off"] {
+  color: var(--muted);
+}
+
+.eye-care-sound .button-icon {
+  width: 16px;
+  height: 16px;
+}
+
+.eye-care-sound[data-sound="on"] .eye-care-sound-off,
+.eye-care-sound[data-sound="off"] .eye-care-sound-on {
+  display: none;
+}
+
+.eye-care-count {
+  min-width: 2ch;
+  color: var(--accent);
+  font-size: 1.1rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
 .changes-decision-icon {
   display: inline-flex;
   flex: 0 0 auto;

@@ -3426,6 +3426,45 @@ function moveEyeCareClock(...time: number[]): string {
   return `window.setEyeCareClock(${time.join(", ")}); document.dispatchEvent(new Event("visibilitychange"))`;
 }
 
+// Records each sound as it starts, with the counter text shown at that moment.
+const mockEyeCareSounds = `
+  window.eyeCareSounds = [];
+  window.AudioContext = class {
+    constructor() {
+      this.currentTime = 0;
+      this.destination = {};
+      this.state = "running";
+    }
+    resume() {
+      return Promise.resolve();
+    }
+    createGain() {
+      return {
+        gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} },
+        connect: (node) => node
+      };
+    }
+    createOscillator() {
+      const sounds = window.eyeCareSounds;
+      let frequency = 0;
+      return {
+        type: "sine",
+        frequency: { setValueAtTime: (value) => { frequency = value; } },
+        connect: (node) => node,
+        start() {
+          sounds.push({
+            type: this.type,
+            frequency,
+            count: document.querySelector("#eye-care-count").textContent,
+            at: performance.now()
+          });
+        },
+        stop() {}
+      };
+    }
+  };
+`;
+
 const mockSpeechRecognition = `
   window.speechRecognitionTest = { instances: [], startErrorName: null };
   window.SpeechRecognition = class {
@@ -4184,7 +4223,7 @@ test("eye care is on by default, toggles in place in More actions, and persists 
   assert.deepEqual(await evaluate(indicator), ["Off", "none", "inline"]);
 });
 
-test("eye care shows a Dismiss-only reminder at each weekday 20-minute slot, closed by Enter or Escape", {
+test("eye care shows a reminder at each weekday 20-minute slot, closed by Enter or Escape", {
   skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
   timeout: 20_000
 }, async (t) => {
@@ -4201,12 +4240,12 @@ test("eye care shows a Dismiss-only reminder at each weekday 20-minute slot, clo
   assert.deepEqual(await evaluate(`[
     document.querySelector('#eye-care-title').textContent,
     document.querySelector('#eye-care-description').textContent,
-    Array.from(${dialog}.querySelectorAll('button'), (button) => button.textContent.trim()),
+    Array.from(${dialog}.querySelectorAll('button'), (button) => button.getAttribute('aria-label') ?? button.textContent.trim()),
     document.activeElement.id
   ]`), [
     "Time to rest your eyes",
     "Look at something about 20 feet (6 meters) away for 20 seconds.",
-    ["Dismiss"],
+    ["Sound enabled", "Start counter", "Dismiss"],
     "eye-care-dismiss"
   ]);
   await pressBrowserKey(command, sessionId, "Enter");
@@ -4271,6 +4310,73 @@ test("turning eye care on starts reminders at the next 20-minute slot and off st
   assert.equal(await evaluate(`${dialog}.open`), false);
   await evaluate(moveEyeCareClock(2026, 10, 16, 10, 40));
   assert.equal(await evaluate(`${dialog}.open`), true);
+});
+
+test("eye care counter ticks each second from 20 and plays a different chime at 0", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 40_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    ${mockEyeCareClock}
+    ${mockEyeCareSounds}
+    window.setEyeCareClock(2026, 10, 16, 10, 5);
+  `, { eyeCareDefault: true });
+  const dialog = `document.querySelector('#eye-care-dialog')`;
+  await waitFor(`document.querySelector('#keep-awake')?.dataset.status === 'off'`);
+  await evaluate(moveEyeCareClock(2026, 10, 16, 10, 20));
+  await waitFor(`${dialog}.open`);
+  await evaluate(`document.querySelector('#eye-care-start').click()`);
+  await waitFor(`document.querySelector('#eye-care-count').textContent === '0'`, 30_000);
+  assert.deepEqual(
+    await evaluate(`window.eyeCareSounds.filter((sound) => sound.type === 'sine').map((sound) => sound.count)`),
+    Array.from({ length: 20 }, (_, index) => String(20 - index))
+  );
+  // The finish chime is any sound that is not a tick, and it plays only at 0.
+  assert.equal(await evaluate(`window.eyeCareSounds.some((sound) => sound.type !== 'sine')`), true);
+  assert.equal(
+    await evaluate(`window.eyeCareSounds.filter((sound) => sound.type !== 'sine').every((sound) => sound.count === '0')`),
+    true
+  );
+  // Timers never fire early, so a real countdown spans at least 19 seconds from the first tick to the chime.
+  assert.ok(Number(await evaluate(`window.eyeCareSounds.at(-1).at - window.eyeCareSounds[0].at`)) >= 19_000);
+  const soundCount = await evaluate(`window.eyeCareSounds.length`);
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  assert.equal(await evaluate(`window.eyeCareSounds.length`), soundCount);
+  assert.equal(await evaluate(`${dialog}.open`), true);
+});
+
+test("eye care sound toggle silences the counter, and Enter on counter controls keeps the dialog open", {
+  skip: existsSync(chromePath) ? false : "Chrome is not installed; set CHROME_BIN to run browser tests",
+  timeout: 20_000
+}, async (t) => {
+  const server = await startTestServer(t);
+  const { command, sessionId, evaluate, waitFor } = await startTestBrowser(t, server.baseUrl, `
+    ${mockEyeCareClock}
+    ${mockEyeCareSounds}
+    window.setEyeCareClock(2026, 10, 16, 10, 5);
+  `, { eyeCareDefault: true });
+  const dialog = `document.querySelector('#eye-care-dialog')`;
+  const count = `document.querySelector('#eye-care-count')`;
+  await waitFor(`document.querySelector('#keep-awake')?.dataset.status === 'off'`);
+  await evaluate(moveEyeCareClock(2026, 10, 16, 10, 20));
+  await waitFor(`${dialog}.open`);
+  await evaluate(`document.querySelector('#eye-care-sound').focus()`);
+  await pressBrowserKey(command, sessionId, "Enter");
+  assert.equal(await evaluate(`document.querySelector('#eye-care-sound').getAttribute('aria-label')`), "Sound disabled");
+  assert.equal(await evaluate(`localStorage.getItem('copilot-web-eye-care-sound')`), "false");
+  assert.equal(await evaluate(`${dialog}.open`), true);
+  await evaluate(`document.querySelector('#eye-care-start').focus()`);
+  await pressBrowserKey(command, sessionId, "Enter");
+  await waitFor(`${count}.textContent === '19'`);
+  assert.equal(await evaluate(`${dialog}.open`), true);
+  assert.equal(await evaluate(`window.eyeCareSounds.length`), 0);
+  await pressBrowserKey(command, sessionId, "Escape");
+  await waitFor(`!${dialog}.open`);
+  // Closing the dialog must stop the counter, so its text stays cleared after the next second.
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  assert.deepEqual(await evaluate(`[${count}.hidden, ${count}.textContent]`), [true, ""]);
+  assert.equal(await evaluate(`window.eyeCareSounds.length`), 0);
 });
 
 test("uses untimed ACP replay when native history is unavailable", {
