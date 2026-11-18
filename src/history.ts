@@ -68,14 +68,36 @@ interface CopilotSdkClient {
   };
 }
 
+interface CopilotSdkRuntimeOptions {
+  path: string;
+  args: string[];
+  workingDirectory: string;
+}
+
 interface CopilotSdkModule {
-  CopilotClient: new (options: {
-    connection: unknown;
-    workingDirectory: string;
-    logLevel: "error";
-  }) => CopilotSdkClient;
+  CopilotClient: new (options: Record<string, unknown>) => CopilotSdkClient;
   RuntimeConnection: {
-    forStdio(options: { path: string; args: string[] }): unknown;
+    forSpawnedStdio?(options: CopilotSdkRuntimeOptions): unknown;
+    forStdio?(options: Omit<CopilotSdkRuntimeOptions, "workingDirectory">): unknown;
+  };
+}
+
+// CLI 1.0.114+ SDKs use forSpawnedStdio/runtime; older SDKs use forStdio/connection.
+function copilotSdkClientOptions(
+  runtimeConnection: CopilotSdkModule["RuntimeConnection"],
+  options: CopilotSdkRuntimeOptions
+): Record<string, unknown> {
+  if (typeof runtimeConnection.forSpawnedStdio === "function") {
+    return {
+      mode: "coding-agent",
+      runtime: runtimeConnection.forSpawnedStdio(options),
+      observability: { logLevel: "error" }
+    };
+  }
+  return {
+    connection: runtimeConnection.forStdio?.({ path: options.path, args: options.args }),
+    workingDirectory: options.workingDirectory,
+    logLevel: "error"
   };
 }
 
@@ -764,19 +786,17 @@ export class CopilotHistoryReader {
       if (
         typeof sdk.CopilotClient !== "function" ||
         !isRecord(sdk.RuntimeConnection) ||
-        typeof sdk.RuntimeConnection.forStdio !== "function"
+        (typeof sdk.RuntimeConnection.forSpawnedStdio !== "function" &&
+          typeof sdk.RuntimeConnection.forStdio !== "function")
       ) {
         throw new Error("The installed Copilot SDK does not expose its stdio client");
       }
 
-      this.client = new sdk.CopilotClient({
-        connection: sdk.RuntimeConnection.forStdio({
-          path: this.options.command,
-          args: this.options.allowAll ? ["--allow-all"] : []
-        }),
-        workingDirectory: this.options.cwd,
-        logLevel: "error"
-      });
+      this.client = new sdk.CopilotClient(copilotSdkClientOptions(sdk.RuntimeConnection, {
+        path: this.options.command,
+        args: this.options.allowAll ? ["--allow-all"] : [],
+        workingDirectory: this.options.cwd
+      }));
       await this.client.start();
       const readPage = this.currentPageReader();
 

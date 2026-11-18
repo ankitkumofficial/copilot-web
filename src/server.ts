@@ -121,13 +121,16 @@ import { pathToFileURL } from "node:url";
 const [sdkPath, command, cwd, sessionId, allowAll] = process.argv.slice(1);
 process.chdir(cwd);
 const { CopilotClient, RuntimeConnection } = await import(pathToFileURL(sdkPath).href);
-const client = new CopilotClient({
-  connection: RuntimeConnection.forStdio({
-    path: command,
-    args: allowAll === "true" ? ["--allow-all"] : []
-  }),
-  logLevel: "error"
-});
+const runtimeOptions = { path: command, args: allowAll === "true" ? ["--allow-all"] : [] };
+// CLI 1.0.114+ SDKs use forSpawnedStdio/runtime; older SDKs use forStdio/connection.
+const clientOptions = typeof RuntimeConnection.forSpawnedStdio === "function"
+  ? {
+    mode: "coding-agent",
+    runtime: RuntimeConnection.forSpawnedStdio({ ...runtimeOptions, workingDirectory: cwd }),
+    observability: { logLevel: "error" }
+  }
+  : { connection: RuntimeConnection.forStdio(runtimeOptions), logLevel: "error" };
+const client = new CopilotClient(clientOptions);
 
 try {
   await client.start();

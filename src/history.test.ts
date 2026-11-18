@@ -76,6 +76,33 @@ export class CopilotClient {
 }
 `;
 
+const spawnedStdioSdk = `
+export const RuntimeConnection = {
+  forSpawnedStdio: (options) => ({ kind: "spawned-stdio", ...options })
+};
+
+export class CopilotClient {
+  constructor(options) {
+    if (options.mode !== "coding-agent" || "connection" in options || "workingDirectory" in options) {
+      throw new Error("Unsupported client options");
+    }
+    globalThis.historyReaderClientOptions = options;
+  }
+
+  async start() {}
+
+  get rpc() {
+    return {
+      sessions: {
+        readPersistedEvents: async () => ({ events: [], cursor: "", cursorStatus: "ok", hasMore: false })
+      }
+    };
+  }
+
+  async stop() {}
+}
+`;
+
 test("resolves persisted-history RPC bindings again after the SDK reconnects", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-history-sdk-"));
   const sdkPath = path.join(directory, "index.mjs");
@@ -97,6 +124,33 @@ test("resolves persisted-history RPC bindings again after the SDK reconnects", a
     client.disconnect();
 
     assert.equal((await reader.read("session-1"))[0]?.id, "event-2");
+  } finally {
+    await reader.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("starts the persisted-history reader through the SDK's spawned stdio runtime", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "copilot-web-history-runtime-"));
+  const sdkPath = path.join(directory, "index.mjs");
+  await writeFile(sdkPath, spawnedStdioSdk);
+  const reader = new CopilotHistoryReader({
+    sdkPath,
+    command: "copilot",
+    cwd: directory,
+    allowAll: true
+  });
+  try {
+    await reader.initialize();
+    assert.equal(reader.available, true);
+    assert.deepEqual(
+      (globalThis as unknown as { historyReaderClientOptions: unknown }).historyReaderClientOptions,
+      {
+        mode: "coding-agent",
+        runtime: { kind: "spawned-stdio", path: "copilot", args: ["--allow-all"], workingDirectory: directory },
+        observability: { logLevel: "error" }
+      }
+    );
   } finally {
     await reader.stop();
     await rm(directory, { recursive: true, force: true });
