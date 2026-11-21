@@ -728,26 +728,33 @@ const fakeCopilotSdk = `import { appendFileSync, readFileSync, writeFileSync } f
 import path from "node:path";
 
 export const RuntimeConnection = {
-  forStdio(options) {
-    return options;
+  forSpawnedStdio(options) {
+    return { kind: "spawned-stdio", ...options };
   }
 };
 
 export class CopilotClient {
   constructor(options) {
+    if (options?.mode !== "coding-agent") {
+      throw new Error("mode is required and must be 'coding-agent' or 'empty'");
+    }
+    if ("connection" in options || "workingDirectory" in options) {
+      throw new Error("Configure workingDirectory on RuntimeConnection.forSpawnedStdio");
+    }
     this.options = options;
+    const workingDirectory = options.runtime.workingDirectory;
     writeFileSync(
-      path.join(options.workingDirectory, "native-sdk-connection.json"),
+      path.join(workingDirectory, "native-sdk-connection.json"),
       JSON.stringify({
-        path: options.connection.path,
-        args: options.connection.args,
-        workingDirectory: options.workingDirectory
+        path: options.runtime.path,
+        args: options.runtime.args,
+        workingDirectory
       })
     );
     this.rpc = {
       sessions: {
         readPersistedEvents: async ({ sessionId, cursor, max, direction }) => {
-          const requestPath = path.join(options.workingDirectory, "native-history-requests.jsonl");
+          const requestPath = path.join(workingDirectory, "native-history-requests.jsonl");
           appendFileSync(requestPath, JSON.stringify({ sessionId, cursor, ...(direction ? { direction, max } : {}) }) + "\\n");
           if (process.env.TEST_HISTORY_UNSUPPORTED === "true") {
             const error = new Error("Method not found: sessions.readPersistedEvents");
@@ -756,7 +763,7 @@ export class CopilotClient {
           }
           let historyReadFailed = process.env.TEST_HISTORY_READ_ERROR === "true";
           try {
-            readFileSync(path.join(options.workingDirectory, "native-history-failure.flag"), "utf8");
+            readFileSync(path.join(workingDirectory, "native-history-failure.flag"), "utf8");
             historyReadFailed = true;
           } catch (error) {
             if (error.code !== "ENOENT") throw error;
@@ -764,7 +771,7 @@ export class CopilotClient {
           if (sessionId === "session-1" && historyReadFailed) {
             throw new Error("Persisted event journal is unavailable for session session-1");
           }
-          const historyPath = path.join(options.workingDirectory, "native-history.json");
+          const historyPath = path.join(workingDirectory, "native-history.json");
           let history = {};
           try {
             history = JSON.parse(readFileSync(historyPath, "utf8"));
@@ -803,6 +810,12 @@ export class CopilotClient {
   }
 
   async start() {}
+  async deleteSession(sessionId) {
+    appendFileSync(
+      path.join(this.options.runtime.workingDirectory, "native-sdk-deletions.jsonl"),
+      JSON.stringify({ sessionId }) + "\\n"
+    );
+  }
   async stop() {}
 }
 `;
@@ -1121,6 +1134,12 @@ async function startTestServer(t: TestContext, options: {
     },
     sdkConnection: () => readFile(path.join(projects, "native-sdk-connection.json"), "utf8")
       .then((content) => JSON.parse(content) as unknown),
+    sdkDeletions: () => readFile(path.join(projects, "native-sdk-deletions.jsonl"), "utf8")
+      .then((content) => content.trim().split("\n").map((line) => JSON.parse(line) as unknown))
+      .catch((error: unknown) => {
+        if (isRecord(error) && error.code === "ENOENT") return [];
+        throw error;
+      }),
     removeSdk: () => rm(path.join(copilotSdk, "index.js"), { force: true }),
     async nativeCliRequests(): Promise<string[][]> {
       try {
@@ -1677,6 +1696,22 @@ test("uses native CLI deletion when the cached Copilot SDK disappears", async (t
     "-i",
     `/session delete ${server.sessionId} --yes --local-only`
   ]]);
+});
+
+test("deletes conversations through the Copilot SDK runtime without the native CLI fallback", async (t) => {
+  const server = await startTestServer(t, {
+    nativeHistory: {},
+    nativeSessionDelete: true
+  });
+
+  const response = await fetch(
+    `${server.baseUrl}/api/sessions/${encodeURIComponent(server.sessionId)}`,
+    { method: "DELETE", headers: server.headers }
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { deleted: true });
+  assert.deepEqual(await server.sdkDeletions(), [{ sessionId: server.sessionId }]);
+  assert.deepEqual(await server.nativeCliRequests(), []);
 });
 
 test("updates empty-session IDs through the API and preserves metadata and selected context", async (t) => {
